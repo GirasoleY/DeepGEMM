@@ -13,6 +13,13 @@ static constexpr int kMaxCandidateBlockM = 192;
 static constexpr int kMinCandidateBlockM = 8;
 static constexpr int kLCMCandidateBlockM = 384;
 
+// The first GIN prototype reuses the existing four MegaMoE dispatch warps and
+// supports the agreed completion sweep up to B=8.  The outbox remains bounded
+// while reserving enough row capacity for any runtime-selected BLOCK_M.
+static constexpr uint32_t kMegaMoeGinNumDispatchWarps = 4;
+static constexpr uint32_t kMegaMoeGinMaxCompletionBatch = 8;
+static constexpr uint32_t kMegaMoeGinMaxOutboxBlockM = kMaxCandidateBlockM;
+
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_tokens_per_rank, T num_topk,
@@ -328,6 +335,125 @@ struct Buffer {
     }
 };
 
+// Registered transport-only storage appended after the existing MegaMoE
+// layout.  Appending keeps every legacy offset unchanged.  The extension is
+// absent unless the opt-in GIN path is requested by the host.
+struct MegaMoeGinWorkspace {
+    void* base;
+    uint32_t num_ranks;
+    uint32_t num_sms;
+    uint32_t completion_batch;
+    uint32_t outbox_depth;
+
+    Buffer route_staging_buffer;
+    Buffer scale_scratch_buffer;
+    Buffer combine_outbox_buffer;
+
+    MegaMoeGinWorkspace() = default;
+
+    CUTLASS_HOST_DEVICE
+    MegaMoeGinWorkspace(void* base,
+                        const uint32_t& hidden,
+                        const uint32_t& num_ranks,
+                        const uint32_t& num_experts,
+                        const uint32_t& num_max_tokens_per_rank,
+                        const uint32_t& num_sms,
+                        const uint32_t& completion_batch,
+                        const uint32_t& outbox_depth):
+        base(base), num_ranks(num_ranks), num_sms(num_sms),
+        completion_batch(completion_batch), outbox_depth(outbox_depth) {
+        DG_UNIFIED_ASSERT(completion_batch > 0 and
+                          completion_batch <= kMegaMoeGinMaxCompletionBatch);
+        DG_UNIFIED_ASSERT(outbox_depth > 0);
+
+        const auto route_layout = Data(sizeof(uint32_t), false);
+        const auto scale_layout = Data(hidden / 32);
+        const auto combine_row_layout = Data(hidden * sizeof(uint16_t));
+
+        route_staging_buffer = Buffer(
+            route_layout, num_experts, num_max_tokens_per_rank,
+            get_control_end_ptr());
+        scale_scratch_buffer = Buffer(
+            scale_layout,
+            num_sms * kMegaMoeGinNumDispatchWarps * completion_batch, 1,
+            route_staging_buffer.get_end_ptr());
+        combine_outbox_buffer = Buffer(
+            combine_row_layout, outbox_depth,
+            static_cast<uint32_t>(kMegaMoeGinMaxOutboxBlockM),
+            scale_scratch_buffer.get_end_ptr());
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_control_num_bytes() const {
+        // Per-world-peer owner-GET/context issue locks, followed by cumulative
+        // outbox full and empty generations.  Keep the appended data buffers
+        // 16-byte aligned for registered-window/TMA-friendly addressing.
+        const uint64_t bytes =
+            (static_cast<uint64_t>(num_ranks) + 2ull * outbox_depth) *
+            sizeof(uint32_t);
+        return math::align<uint64_t>(bytes, 16);
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_control_end_ptr() const {
+        return math::advance_ptr(base, get_control_num_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t get_num_bytes() const {
+        return static_cast<uint8_t*>(combine_outbox_buffer.get_end_ptr()) -
+               static_cast<uint8_t*>(base);
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_end_ptr() const {
+        return combine_outbox_buffer.get_end_ptr();
+    }
+
+#if defined(__CUDA_ARCH__) or defined(__CLION_IDE__)
+    CUTLASS_DEVICE
+    uint32_t* get_peer_issue_lock_ptr(const uint32_t& peer) const {
+        return static_cast<uint32_t*>(base) + peer;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_outbox_full_count_ptr(const uint32_t& slot) const {
+        return static_cast<uint32_t*>(base) + num_ranks + slot;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_outbox_empty_count_ptr(const uint32_t& slot) const {
+        return static_cast<uint32_t*>(base) + num_ranks + outbox_depth + slot;
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_route_staging_ptr(const uint32_t& expert_idx,
+                                    const uint32_t& slot_idx) const {
+        return route_staging_buffer.get_rank_buffer(expert_idx)
+            .get_data_buffer(slot_idx).template get_base_ptr<uint32_t>();
+    }
+
+    CUTLASS_DEVICE
+    void* get_scale_scratch_ptr(const uint32_t& sm_idx,
+                                const uint32_t& dispatch_warp_idx,
+                                const uint32_t& batch_idx = 0) const {
+        const uint32_t record =
+            (sm_idx * kMegaMoeGinNumDispatchWarps + dispatch_warp_idx) *
+                completion_batch +
+            batch_idx;
+        return scale_scratch_buffer.get_rank_buffer(record)
+            .get_data_buffer(0).get_base_ptr();
+    }
+
+    CUTLASS_DEVICE
+    void* get_combine_outbox_row_ptr(const uint32_t& slot,
+                                     const uint32_t& row) const {
+        return combine_outbox_buffer.get_rank_buffer(slot)
+            .get_data_buffer(row).get_base_ptr();
+    }
+#endif
+};
+
 struct MegaMoEBuffer {
     Workspace workspace;
 
@@ -350,6 +476,9 @@ struct MegaMoEBuffer {
            l2_sf_buffer,
            combine_token_buffer;
 
+    MegaMoeGinWorkspace gin_workspace;
+    bool with_gin;
+
     CUTLASS_HOST_DEVICE
     MegaMoEBuffer(void* base,
                   const uint32_t& hidden,
@@ -361,7 +490,12 @@ struct MegaMoEBuffer {
                   const uint32_t& num_ring_tokens,
                   const uint32_t& num_sf_ring_tokens,
                   const bool& with_sf,
-                  const uint32_t& num_shared_experts = 0) {
+                  const uint32_t& num_shared_experts = 0,
+                  const bool& with_gin = false,
+                  const uint32_t& num_sms = 0,
+                  const uint32_t& gin_completion_batch = 1,
+                  const uint32_t& gin_outbox_depth = 8):
+        with_gin(with_gin) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
                               num_max_tokens_per_rank, num_topk, num_ring_tokens);
@@ -433,11 +567,21 @@ struct MegaMoEBuffer {
         combine_token_buffer = Buffer(
             bf16_token_layout, num_topk + (num_shared_experts > 0 ? 1u : 0u), num_max_tokens_per_rank,
             with_sf ? l2_sf_buffer.get_end_ptr() : l2_token_buffer.get_end_ptr());
+
+        if (with_gin) {
+            DG_UNIFIED_ASSERT(with_sf);
+            DG_UNIFIED_ASSERT(num_sms > 0);
+            gin_workspace = MegaMoeGinWorkspace(
+                combine_token_buffer.get_end_ptr(), hidden, num_ranks,
+                num_experts, num_max_tokens_per_rank, num_sms,
+                gin_completion_batch, gin_outbox_depth);
+        }
     }
 
     CUTLASS_HOST_DEVICE
     int64_t get_num_bytes() const {
-        return static_cast<uint8_t*>(combine_token_buffer.get_end_ptr())
+        return static_cast<uint8_t*>(with_gin ? gin_workspace.get_end_ptr() :
+                                              combine_token_buffer.get_end_ptr())
                - static_cast<uint8_t*>(workspace.base);
     }
 };

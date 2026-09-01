@@ -22,8 +22,21 @@ class SymmBuffer:
                  hidden: int, intermediate_hidden: int,
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
-                 activation: str = 'swiglu'):
+                 activation: str = 'swiglu',
+                 enable_gin: bool = False,
+                 gin_completion_batch: int = 1,
+                 gin_combine_chunk_bytes: int = 7168,
+                 gin_outbox_depth: int = 8,
+                 gin_queue_depth: int = 64):
         assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+        if enable_gin:
+            if mma_type != 'fp8xfp4':
+                raise ValueError('the first fused MegaMoE GIN path requires mma_type=fp8xfp4')
+            if hidden % 512 != 0:
+                raise ValueError('MegaMoE GIN requires hidden to be divisible by 512')
+            if (2 * hidden) % gin_combine_chunk_bytes != 0:
+                raise ValueError(
+                    'MegaMoE GIN combine chunk bytes must divide one BF16 output row')
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
@@ -37,7 +50,8 @@ class SymmBuffer:
             num_max_tokens_per_rank, num_topk,
             hidden, intermediate_hidden,
             mma_type, activation,
-            num_shared_experts
+            num_shared_experts,
+            enable_gin, gin_completion_batch, gin_outbox_depth
         )
         allocator = torch if group.size() == 1 else symm_mem
         self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
@@ -58,7 +72,206 @@ class SymmBuffer:
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
 
+        # GIN owns an auxiliary NCCL communicator, a registered view of
+        # `self.buffer`, and a device communicator. Keep it after all tensor
+        # views so normal construction is byte-for-byte unchanged unless the
+        # caller explicitly opts in.
+        self._gin_context = None
+        self._gin_layout_enabled = enable_gin
+        self.gin_completion_batch = gin_completion_batch
+        self.gin_combine_chunk_bytes = gin_combine_chunk_bytes
+        self.gin_outbox_depth = gin_outbox_depth
+        self.gin_queue_depth = gin_queue_depth
+        if enable_gin:
+            self.enable_gin(queue_depth=gin_queue_depth)
+
+    @property
+    def gin_context(self):
+        return self._gin_context
+
+    @property
+    def gin_enabled(self) -> bool:
+        """Whether this buffer currently owns a live GIN transport context."""
+        return self._gin_context is not None and self._gin_context.active
+
+    def _require_launchable_transport(self, *, supports_gin: bool):
+        if self.buffer is None or self.handle is None or self.group is None:
+            raise RuntimeError('MegaMoE symmetric buffer has already been released')
+        if self._gin_layout_enabled and not supports_gin:
+            raise RuntimeError(
+                'BF16 MegaMoE has no GIN transport; refusing cross-host NVLink fallback')
+        if self._gin_layout_enabled and not self.gin_enabled:
+            raise RuntimeError(
+                'MegaMoE GIN context is inactive; refusing legacy NVLink fallback')
+
+    def _collective_validate_gin_config(
+            self, build_info, context_count, queue_depth,
+            world_barrier_count, expected_lsa_size, required_gin_type):
+        context_state = (
+            'none' if self._gin_context is None else
+            'active' if self._gin_context.active else 'inactive'
+        )
+        local_config = {
+            'protocol_version': 1,
+            'build_enabled': bool(build_info['enabled']),
+            'compiled_nccl_version': build_info.get('compiled_nccl_version'),
+            'required_nccl_version': build_info.get('required_nccl_version'),
+            'world_size': self.group.size(),
+            'buffer_bytes': self.buffer.numel() * self.buffer.element_size(),
+            'num_experts': self.num_experts,
+            'num_max_tokens_per_rank': self.num_max_tokens_per_rank,
+            'num_topk': self.num_topk,
+            'hidden': self.hidden,
+            'intermediate_hidden': self.intermediate_hidden,
+            'gin_layout_enabled': self._gin_layout_enabled,
+            'context_state': context_state,
+            'context_count': context_count,
+            'layout_queue_depth': self.gin_queue_depth,
+            'queue_depth': queue_depth,
+            'world_barrier_count': world_barrier_count,
+            'expected_lsa_size': expected_lsa_size,
+            'required_gin_type': required_gin_type,
+            'completion_batch': self.gin_completion_batch,
+            'combine_chunk_bytes': self.gin_combine_chunk_bytes,
+            'outbox_depth': self.gin_outbox_depth,
+        }
+        gathered = [None] * self.group.size()
+        dist.all_gather_object(gathered, local_config, group=self.group)
+        canonical = gathered[0]
+        mismatched_ranks = [
+            rank for rank, config in enumerate(gathered)
+            if config != canonical
+        ]
+        if mismatched_ranks:
+            raise RuntimeError(
+                'MegaMoE GIN configuration mismatch across ranks before '
+                'auxiliary communicator initialization; mismatched ranks: '
+                + ', '.join(map(str, mismatched_ranks)))
+
+        errors = []
+        if canonical['world_size'] != 16:
+            errors.append('world_size must be exactly 16')
+        if not canonical['gin_layout_enabled']:
+            errors.append('legacy-sized buffer has no registered GIN workspace')
+        if canonical['context_state'] == 'active':
+            errors.append('GIN is already enabled for this buffer')
+        elif canonical['context_state'] == 'inactive':
+            errors.append('destroyed GIN context cannot be re-enabled')
+        if canonical['context_count'] < 9:
+            errors.append('context_count must be at least 9')
+        if canonical['queue_depth'] != canonical['layout_queue_depth']:
+            errors.append('queue_depth differs from construction-time layout tuning')
+        if canonical['queue_depth'] < 0:
+            errors.append('queue_depth must be non-negative')
+        if canonical['world_barrier_count'] < 3:
+            errors.append('world_barrier_count must be at least 3')
+        if canonical['expected_lsa_size'] != 8:
+            errors.append('expected_lsa_size must be exactly 8')
+        if canonical['required_gin_type'] not in ('gdaki', 'proxy', 'gpi', 'any'):
+            errors.append('required_gin_type must be gdaki, proxy, gpi, or any')
+        if canonical['completion_batch'] not in (1, 2, 4, 8):
+            errors.append('completion_batch must be 1, 2, 4, or 8')
+        if canonical['combine_chunk_bytes'] not in (256, 1792, 3584, 7168):
+            errors.append('combine_chunk_bytes is unsupported')
+        if canonical['outbox_depth'] not in (4, 8, 16):
+            errors.append('outbox_depth must be 4, 8, or 16')
+        if errors:
+            raise RuntimeError(
+                'MegaMoE GIN collective configuration rejected: '
+                + '; '.join(errors))
+
+    def _collective_get_gin_unique_id(self):
+        local_unique_id = bytes(128)
+        local_error = None
+        try:
+            # Every rank validates its local NCCL runtime/header match. Only
+            # group rank zero's ID is subsequently broadcast and used.
+            local_unique_id = _C.get_megamoe_gin_unique_id()
+        except BaseException as exception:
+            local_error = f'{type(exception).__name__}: {exception}'
+
+        errors = [None] * self.group.size()
+        dist.all_gather_object(errors, local_error, group=self.group)
+        if any(error is not None for error in errors):
+            details = '; '.join(
+                f'rank {rank}: {error}' for rank, error in enumerate(errors)
+                if error is not None
+            )
+            raise RuntimeError(
+                'MegaMoE GIN local NCCL preflight failed collectively: ' + details)
+        return local_unique_id if self.group.rank() == 0 else bytes(128)
+
+    def enable_gin(self,
+                   context_count: int = 9,
+                   queue_depth: Optional[int] = None,
+                   world_barrier_count: int = 3,
+                   expected_lsa_size: int = 8,
+                   required_gin_type: str = 'gdaki'):
+        """Collectively enable the 2x8 direct-GIN transport for this buffer.
+
+        Every rank in ``self.group`` must call this method in the same order.
+        Unsupported NCCL, GIN, or rank/topology configurations fail explicitly;
+        this method never falls back to the existing NVLink path.
+        """
+        if queue_depth is None:
+            queue_depth = self.gin_queue_depth
+
+        build_info = _C.megamoe_gin_build_info()
+        self._collective_validate_gin_config(
+            build_info, context_count, queue_depth, world_barrier_count,
+            expected_lsa_size, required_gin_type)
+        if not build_info['enabled']:
+            # Use the extension stub so C++ and Python callers receive exactly
+            # the same actionable build-disabled diagnostic.
+            _C.get_megamoe_gin_unique_id()
+
+        rank = self.group.rank()
+        unique_id = self._collective_get_gin_unique_id()
+        unique_id_tensor = torch.tensor(
+            list(unique_id), dtype=torch.uint8, device=self.buffer.device)
+        try:
+            # PyTorch 2.13 provides group_src, which avoids ambiguity for
+            # subgroups whose group rank 0 is not global rank 0.
+            dist.broadcast(unique_id_tensor, group=self.group, group_src=0)
+        except TypeError:
+            # Compatibility for older PyTorch releases.
+            global_src = dist.get_global_rank(self.group, 0)
+            dist.broadcast(unique_id_tensor, src=global_src, group=self.group)
+
+        unique_id = unique_id_tensor.cpu().numpy().tobytes()
+        self._gin_context = _C.create_megamoe_gin_context(
+            self.buffer, unique_id, rank, self.group.size(),
+            context_count, queue_depth, world_barrier_count,
+            expected_lsa_size, required_gin_type,
+            self.gin_completion_batch, self.gin_combine_chunk_bytes,
+            self.gin_outbox_depth)
+        return self._gin_context
+
     def destroy(self):
+        if self._gin_context is not None:
+            # All kernels must be locally quiescent before all ranks enter the
+            # same teardown order. The barrier itself may be stream-backed, so
+            # synchronize after it as well.
+            torch.cuda.synchronize()
+            self.group.barrier()
+            torch.cuda.synchronize()
+            self._gin_context.destroy()
+            self._gin_context._release_buffer_registration()
+            self._gin_context = None
+        self.handle = None
+        self.buffer = None
+        self.group = None
+        self.x = None
+        self.x_sf = None
+
+    def abort(self):
+        """Release this buffer without collectives after a peer/rank failure."""
+        if self._gin_context is not None:
+            try:
+                self._gin_context.abort()
+            finally:
+                self._gin_context._release_buffer_registration()
+                self._gin_context = None
         self.handle = None
         self.buffer = None
         self.group = None
@@ -73,7 +286,12 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  num_shared_experts: int = 0,
                                  use_fp8_dispatch: Union[bool, None] = None,
                                  mma_type: str = 'fp8xfp4',
-                                 activation: str = 'swiglu') -> SymmBuffer:
+                                 activation: str = 'swiglu',
+                                 enable_gin: bool = False,
+                                 gin_completion_batch: int = 1,
+                                 gin_combine_chunk_bytes: int = 7168,
+                                 gin_outbox_depth: int = 8,
+                                 gin_queue_depth: int = 64) -> SymmBuffer:
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -90,7 +308,12 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         num_shared_experts,
-        mma_type=mma_type, activation=activation
+        mma_type=mma_type, activation=activation,
+        enable_gin=enable_gin,
+        gin_completion_batch=gin_completion_batch,
+        gin_combine_chunk_bytes=gin_combine_chunk_bytes,
+        gin_outbox_depth=gin_outbox_depth,
+        gin_queue_depth=gin_queue_depth
     )
 
 
@@ -161,6 +384,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
+    sym_buffer._require_launchable_transport(supports_gin=True)
     _C.fp8_fp4_mega_moe(
         y,
         l1_weights, l2_weights,
@@ -185,6 +409,7 @@ def bf16_mega_moe(y: torch.Tensor,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
                   fast_math: bool = True):
+    sym_buffer._require_launchable_transport(supports_gin=False)
     _C.bf16_mega_moe(
         y,
         l1_weights,

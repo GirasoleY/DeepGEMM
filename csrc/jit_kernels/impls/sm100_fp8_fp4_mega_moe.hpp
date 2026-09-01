@@ -10,6 +10,9 @@
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
+#ifdef DG_MEGAMOE_GIN
+#include <deep_gemm/comm/mega_moe_gin.cuh>
+#endif
 
 #include "../heuristics/mega_moe.hpp"
 
@@ -25,6 +28,7 @@ public:
         int num_ranks;
         float activation_clamp;
         bool fast_math;
+        bool use_gin;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -32,6 +36,9 @@ public:
         int* cumulative_local_expert_recv_stats;
         int num_tokens;
         layout::SymBuffer<> sym_buffer_ptrs;
+#ifdef DG_MEGAMOE_GIN
+        comm::MegaMoeGinTransport gin_transport;
+#endif
 
         // Tensormap
         CUtensorMap tensor_map_l1_acts;
@@ -79,6 +86,7 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
+        {},
         {}
     >);
 }};
@@ -96,7 +104,8 @@ static void __instantiate_kernel() {{
     args.config.num_dispatch_threads, args.config.num_non_epilogue_threads, args.config.num_epilogue_threads,
     args.launch_args.grid_dim.first, args.num_ranks,
     to_string(args.activation_clamp),
-    args.fast_math ? "true" : "false");
+    args.fast_math ? "true" : "false",
+    args.use_gin ? "true" : "false");
     }
 
     static void launch_impl(const KernelHandle& kernel, const LaunchConfigHandle& config, Args args) {
@@ -106,6 +115,9 @@ static void __instantiate_kernel() {{
             args.cumulative_local_expert_recv_stats,
             args.num_tokens,
             args.sym_buffer_ptrs,
+#ifdef DG_MEGAMOE_GIN
+            args.gin_transport,
+#endif
             args.tensor_map_l1_acts,
             args.tensor_map_l1_acts_sf,
             args.tensor_map_l1_weights,
@@ -147,6 +159,9 @@ static void sm100_fp8_fp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math
+#ifdef DG_MEGAMOE_GIN
+    , const std::optional<comm::MegaMoeGinTransport>& gin_transport_opt = std::nullopt
+#endif
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -283,11 +298,19 @@ static void sm100_fp8_fp4_mega_moe(
         .num_ranks = num_ranks,
         .activation_clamp = activation_clamp,
         .fast_math = fast_math,
+#ifdef DG_MEGAMOE_GIN
+        .use_gin = gin_transport_opt.has_value(),
+#else
+        .use_gin = false,
+#endif
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,
         .num_tokens = num_tokens,
         .sym_buffer_ptrs = layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+#ifdef DG_MEGAMOE_GIN
+        .gin_transport = gin_transport_opt.value_or(comm::MegaMoeGinTransport{}),
+#endif
         .tensor_map_l1_acts = tensor_map_l1_acts,
         .tensor_map_l1_acts_sf = tensor_map_l1_acts_sf,
         .tensor_map_l1_weights = tensor_map_l1_weights,

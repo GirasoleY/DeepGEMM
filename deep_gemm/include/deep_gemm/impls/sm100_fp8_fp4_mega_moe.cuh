@@ -8,6 +8,9 @@
 #include <deep_gemm/common/tma_copy.cuh>
 #include <deep_gemm/common/utils.cuh>
 #include <deep_gemm/comm/barrier.cuh>
+#ifdef DG_MEGAMOE_GIN
+#include <deep_gemm/comm/mega_moe_gin.cuh>
+#endif
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/mma/sm100.cuh>
@@ -35,6 +38,7 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kUseGin = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -57,6 +61,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+#ifdef DG_MEGAMOE_GIN
+                            const __grid_constant__ comm::MegaMoeGinTransport gin_transport,
+#endif
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
@@ -84,6 +91,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+#ifndef DG_MEGAMOE_GIN
+    DG_STATIC_ASSERT(not kUseGin, "GIN kernel instantiated without DG_MEGAMOE_GIN");
+#else
+    if constexpr (kUseGin) {
+        DG_STATIC_ASSERT(kNumDispatchWarps == layout::kMegaMoeGinNumDispatchWarps,
+                         "GIN workspace must match the four dispatch warps");
+        DG_STATIC_ASSERT(BLOCK_M <= layout::kMegaMoeGinMaxOutboxBlockM,
+                         "GIN combine outbox row capacity is too small");
+        DG_DEVICE_ASSERT(gin_transport.is_enabled());
+        DG_DEVICE_ASSERT(gin_transport.dev_comm.rank == sym_buffer.rank_idx);
+        DG_DEVICE_ASSERT(gin_transport.dev_comm.nRanks == kNumRanks);
+        DG_DEVICE_ASSERT(gin_transport.dev_comm.lsaSize == 8);
+        DG_DEVICE_ASSERT(gin_transport.dev_comm.ginContextCount >= 9);
+        DG_DEVICE_ASSERT(
+            gin_transport.outbox_depth == 4 or
+            gin_transport.outbox_depth == 8 or
+            gin_transport.outbox_depth == 16);
+        DG_DEVICE_ASSERT(
+            (gin_transport.combine_chunk_bytes == 256 or
+             gin_transport.combine_chunk_bytes == 1792 or
+             gin_transport.combine_chunk_bytes == 3584 or
+             gin_transport.combine_chunk_bytes == 7168) and
+            (kHidden * sizeof(nv_bfloat16)) %
+                gin_transport.combine_chunk_bytes == 0);
+        // The correctness-first fused path owns one request per route.  The
+        // standalone probe selects the first B>1 candidate before this guard
+        // is relaxed and a block-readiness scoreboard is enabled here.
+        DG_DEVICE_ASSERT(gin_transport.completion_batch == 1);
+    }
+#endif
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -122,7 +159,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumMaxTokensPerRank, kNumTopk,
         kNumRingTokens, kNumSFRingTokens,
         /*with_sf=*/ true,
-        kNumSharedExperts
+        kNumSharedExperts,
+        /*with_gin=*/ kUseGin,
+        /*num_sms=*/ kUseGin ? kNumSMs : 0u,
+#ifdef DG_MEGAMOE_GIN
+        /*gin_completion_batch=*/ kUseGin ? gin_transport.completion_batch : 1u,
+        /*gin_outbox_depth=*/ kUseGin ? gin_transport.outbox_depth : 8u
+#else
+        /*gin_completion_batch=*/ 1u,
+        /*gin_outbox_depth=*/ 8u
+#endif
     );
     const auto workspace = buffer.workspace;
 
@@ -371,9 +417,24 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
+            // Every token must route to a given expert at most once.  This is
+            // the existing top-k contract and bounds both the legacy route
+            // array and the appended cross-host staging array.
+            DG_DEVICE_ASSERT(dst_slot_idx < kNumMaxTokensPerRank);
             const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
                 expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+                if (gin_transport.is_same_lsa_peer(dst_rank_idx)) {
+                    *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+                } else {
+                    *buffer.gin_workspace.get_route_staging_ptr(
+                        expert_idx, dst_slot_idx) = token_topk_idx;
+                }
+#endif
+            } else {
+                *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            }
         });
 
         // Grid sync
@@ -384,29 +445,125 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         // Write expert count
         if (sm_idx == 0) {
-            #pragma unroll
-            for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
-                const auto dst_rank_idx = i / kNumExpertsPerRank;
-                const auto dst_local_expert_idx = i % kNumExpertsPerRank;
-                const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                *sym_buffer.map(
-                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+            if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+                // Same-LSA count cells retain direct stores.  One coordinated
+                // control issuer serializes all cross-host route ranges and
+                // count cells on context zero, avoiding interleaved aggregate
+                // chains from multiple CTAs.
+                #pragma unroll
+                for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                    const auto dst_rank_idx = i / kNumExpertsPerRank;
+                    if (gin_transport.is_same_lsa_peer(dst_rank_idx)) {
+                        const auto dst_local_expert_idx = i % kNumExpertsPerRank;
+                        const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                        *sym_buffer.map(
+                            workspace.get_expert_recv_count_ptr(
+                                sym_buffer.rank_idx, dst_local_expert_idx),
+                            dst_rank_idx) = static_cast<uint32_t>(expert_status);
+                    }
+                }
+                ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+                if (thread_idx == 0) {
+                    for (uint32_t i = 0; i < kNumExperts; ++i) {
+                        const uint32_t dst_rank_idx = i / kNumExpertsPerRank;
+                        if (gin_transport.is_same_lsa_peer(dst_rank_idx))
+                            continue;
+
+                        const uint32_t dst_local_expert_idx = i % kNumExpertsPerRank;
+                        const uint32_t count = static_cast<uint32_t>(
+                            *workspace.get_expert_send_count_ptr(i));
+                        if (count > 0) {
+                            comm::mega_moe_gin_put(
+                                gin_transport, dst_rank_idx,
+                                sym_buffer.get_base_ptr(),
+                                buffer.gin_workspace.get_route_staging_ptr(i, 0),
+                                workspace.get_src_token_topk_idx_ptr(
+                                    dst_local_expert_idx, sym_buffer.rank_idx, 0),
+                                count * sizeof(uint32_t),
+                                ncclGinOptFlagsAggregateRequests);
+                        }
+                        comm::mega_moe_gin_put_value(
+                            gin_transport, dst_rank_idx,
+                            sym_buffer.get_base_ptr(),
+                            workspace.get_expert_recv_count_ptr(
+                                sym_buffer.rank_idx, dst_local_expert_idx),
+                            count, sizeof(uint32_t), ncclGinOptFlagsDefault);
+                    }
+                    for (uint32_t peer = 0; peer < kNumRanks; ++peer) {
+                        if (not gin_transport.is_same_lsa_peer(peer))
+                            comm::mega_moe_gin_flush_peer(gin_transport, peer);
+                    }
+                }
+#endif
+            } else {
+                #pragma unroll
+                for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads) {
+                    const auto dst_rank_idx = i / kNumExpertsPerRank;
+                    const auto dst_local_expert_idx = i % kNumExpertsPerRank;
+                    const auto expert_status = *workspace.get_expert_send_count_ptr(i);
+                    *sym_buffer.map(
+                        workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                        dst_rank_idx) = expert_status & 0xffffffff;
+                    ptx::atomic_add_sys(
+                        sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+                        expert_status);
+                }
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
         // Barrier before pulling
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
-            /* After the NVLink barrier, there is a grid sync */ true
-        );
+        if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+            // Gather and system-publish route indices plus same-LSA count-cell
+            // stores before any rank enters the world barrier.
+            __threadfence_system();
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+            if (sm_idx == 0 and warp_idx == 0) {
+                comm::mega_moe_gin_world_barrier(
+                    gin_transport, kBeforeDispatchPullBarrierTag - 1,
+                    ncclGinFenceLevel::Put);
+                __threadfence_system();
+            }
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); });
+
+            // GIN publishes per-source cells.  The owner reconstructs the
+            // original tagged sum locally because GIN has no arbitrary-address
+            // fetch-add equivalent.  The scheduler's wait protocol is unchanged.
+            if (sm_idx == 0) {
+                for (uint32_t expert = thread_idx;
+                     expert < kNumExpertsPerRank;
+                     expert += kNumDispatchThreads) {
+                    uint32_t total = 0;
+                    #pragma unroll
+                    for (uint32_t source = 0; source < kNumRanks; ++source)
+                        total += static_cast<uint32_t>(
+                            *workspace.get_expert_recv_count_ptr(source, expert));
+                    const uint64_t tagged =
+                        (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) |
+                        total;
+                    auto* ptr = workspace.get_expert_recv_count_sum_ptr(expert);
+                    asm volatile("st.release.gpu.global.u64 [%0], %1;"
+                                 :: "l"(ptr), "l"(tagged) : "memory");
+                }
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+#endif
+        } else {
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
+                /* After the NVLink barrier, there is a grid sync */ true
+            );
+        }
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -426,8 +583,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
 
+        // In the GIN path SM0/warp0 drains combine output concurrently with
+        // owner pulls.  Reserving it removes a pull -> ring reuse -> epilogue
+        // -> outbox reuse -> drainer cycle; the remaining global warps cover
+        // every logical token with a compressed index.
+        const bool is_gin_outbox_drainer =
+            kUseGin and sm_idx == 0 and warp_idx == 0;
+        if (not is_gin_outbox_drainer) {
         constexpr uint32_t kNumGlobalWarps = kNumSMs * kNumDispatchWarps;
-        for (uint32_t token_idx = sm_idx * kNumDispatchWarps + warp_idx; ; token_idx += kNumGlobalWarps) {
+        constexpr uint32_t kNumGlobalPullWarps =
+            kNumGlobalWarps - (kUseGin ? 1u : 0u);
+        const uint32_t physical_global_warp_idx =
+            sm_idx * kNumDispatchWarps + warp_idx;
+        const uint32_t global_pull_warp_idx =
+            kUseGin ? physical_global_warp_idx - 1u : physical_global_warp_idx;
+        for (uint32_t token_idx = global_pull_warp_idx; ;
+             token_idx += kNumGlobalPullWarps) {
             // Advance expert until within the range
             int old_expert_idx = current_expert_idx;
             while (token_idx >= expert_end_idx) {
@@ -530,6 +701,82 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
+            if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+                if (not gin_transport.is_same_lsa_peer(current_rank_in_expert_idx)) {
+                    const auto remote_activation =
+                        buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr();
+                    const auto remote_scale =
+                        buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr();
+                    const auto remote_weight =
+                        buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx;
+                    const auto local_activation =
+                        buffer.l1_token_buffer.get_data_buffer(
+                            pool_token_idx % kNumRingTokens).get_base_ptr();
+                    const auto local_scale_scratch =
+                        buffer.gin_workspace.get_scale_scratch_ptr(sm_idx, warp_idx);
+                    const auto local_weight =
+                        buffer.l1_topk_weights_buffer.get_data_buffer(
+                            pool_token_idx % kNumRingTokens).template get_base_ptr<float>();
+
+                    ncclGinRequest_t request{};
+                    if (cute::elect_one_sync()) {
+                        auto* issue_lock = buffer.gin_workspace.get_peer_issue_lock_ptr(
+                            current_rank_in_expert_idx);
+                        while (atomicCAS(issue_lock, 0u, 1u) != 0u) {}
+                        comm::mega_moe_gin_issue_get_route(
+                            gin_transport, current_rank_in_expert_idx,
+                            sym_buffer.get_base_ptr(),
+                            remote_activation, local_activation, kHidden,
+                            remote_scale, local_scale_scratch, kHidden / 32,
+                            remote_weight, local_weight, sizeof(float), &request);
+                        __threadfence();
+                        atomicExch(issue_lock, 0u);
+                        comm::mega_moe_gin_wait_get_route(
+                            gin_transport, current_rank_in_expert_idx, request);
+                    }
+                    __syncwarp();
+
+                    // The contiguous 112-byte arrival is scattered into the
+                    // existing UTCCP SF layout by 28 lanes.  L1 readiness is
+                    // released only after activation, SF, and weight are final.
+                    constexpr uint32_t kNumSFUint32 = kHidden / 128;
+                    DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0,
+                                     "Invalid SF");
+                    const auto scratch =
+                        static_cast<const uint32_t*>(local_scale_scratch);
+                    const auto local_sf_ptr =
+                        buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
+                    const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
+                    const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
+                    const auto sf_ring_token_idx = ring_block_idx * SF_BLOCK_M +
+                        transform_sf_token_idx(token_idx_in_block);
+                    #pragma unroll
+                    for (uint32_t i = 0;
+                         i < math::constexpr_ceil_div(kNumSFUint32, 32u); ++i) {
+                        const uint32_t j = i * 32 + lane_idx;
+                        if (j < kNumSFUint32)
+                            local_sf_ptr[j * kNumSFRingTokens + sf_ring_token_idx] =
+                                scratch[j];
+                    }
+                    __syncwarp();
+
+                    if (cute::elect_one_sync()) {
+                        *workspace.get_token_src_metadata_ptr(pool_token_idx) =
+                            {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+                        const bool is_last_token = (token_idx == expert_end_idx - 1);
+                        ptx::red_add_rel(
+                            workspace.get_l1_full_count_ptr(
+                                pool_block_idx % kNumRingBlocks),
+                            is_last_token ?
+                                BLOCK_M - (token_idx_in_expert % BLOCK_M) : 1u);
+                    }
+                    __syncwarp();
+                    continue;
+                }
+#endif
+            }
+
             const auto src_base_ptr = sym_buffer.map(
                 buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
@@ -597,10 +844,100 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+        }
+
+        if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+            // One warp drains the bounded block outbox in logical pool order.
+            // Producers may run ahead by `outbox_depth` blocks; ordering the
+            // consumer by pool block makes each slot's generation monotonic
+            // and prevents a newer block from overwriting an in-flight PUT.
+            if (is_gin_outbox_drainer) {
+                constexpr uint32_t kNumL2BlockNs = L2_SHAPE_N / BLOCK_N;
+                constexpr uint32_t kCombineRowBytes =
+                    kHidden * sizeof(nv_bfloat16);
+                uint32_t pool_block_idx = 0;
+
+                for (uint32_t expert_idx = 0;
+                     expert_idx < kNumExpertsPerRank; ++expert_idx) {
+                    const uint32_t num_expert_tokens =
+                        scheduler.get_num_tokens(expert_idx);
+                    const uint32_t num_expert_blocks =
+                        math::ceil_div(num_expert_tokens, BLOCK_M);
+
+                    for (uint32_t expert_block_idx = 0;
+                         expert_block_idx < num_expert_blocks;
+                         ++expert_block_idx, ++pool_block_idx) {
+                        const uint32_t slot =
+                            pool_block_idx % gin_transport.outbox_depth;
+                        const uint32_t generation =
+                            pool_block_idx / gin_transport.outbox_depth;
+                        const uint32_t full_target =
+                            (generation + 1) * kNumL2BlockNs;
+
+                        if (lane_idx == 0) {
+                            const auto full_ptr =
+                                buffer.gin_workspace.get_outbox_full_count_ptr(slot);
+                            while (ptx::ld_acq(full_ptr) < full_target) {}
+
+                            const uint32_t row_base = expert_block_idx * BLOCK_M;
+                            const uint32_t valid_m = cute::min(
+                                num_expert_tokens - row_base, BLOCK_M);
+                            for (uint32_t row = 0; row < valid_m; ++row) {
+                                const auto src_metadata =
+                                    *workspace.get_token_src_metadata_ptr(
+                                        pool_block_idx * BLOCK_M + row);
+                                const uint32_t dst_rank_idx =
+                                    src_metadata.rank_idx;
+                                if (gin_transport.is_same_lsa_peer(dst_rank_idx))
+                                    continue;
+
+                                const auto local_source =
+                                    buffer.gin_workspace
+                                        .get_combine_outbox_row_ptr(slot, row);
+                                const auto remote_destination =
+                                    buffer.combine_token_buffer
+                                        .get_rank_buffer(src_metadata.topk_idx)
+                                        .get_data_buffer(src_metadata.token_idx)
+                                        .get_base_ptr();
+                                comm::mega_moe_gin_put_row_chunks(
+                                    gin_transport, dst_rank_idx,
+                                    sym_buffer.get_base_ptr(), local_source,
+                                    remote_destination, kCombineRowBytes);
+
+                                // A per-row flush bounds context-zero queue use
+                                // independently of BLOCK_M and chunk selection.
+                                // It is deliberately conservative for the first
+                                // correctness prototype.
+                                comm::mega_moe_gin_flush_peer(
+                                    gin_transport, dst_rank_idx);
+                            }
+
+                            // Every PUT sourced from this slot is complete.
+                            // Publish reuse only after the final flush wait.
+                            __threadfence();
+                            atomicExch(
+                                buffer.gin_workspace
+                                    .get_outbox_empty_count_ptr(slot),
+                                generation + 1);
+                        }
+                        __syncwarp();
+                    }
+                }
+            }
+#endif
+        }
 
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        if constexpr (kUseGin) {
+            // Phase 2 is driven by the epilogue below.  Do not let dispatch
+            // cleanup (and its phase-3 barrier) overtake that collective.
+            ptx::sync_unaligned(
+                kNumDispatchThreads + kNumEpilogueThreads,
+                kDispatchWithEpilogueBarrierIdx);
+        }
 
         DG_STATIC_ASSERT(kNumSMs > 1, "Invalid SM count");
         if (sm_idx == 0) {
@@ -658,14 +995,40 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 
-        // Wait for all ranks to finish cleaning
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* Before the NVLink barrier, there is a grid sync */ true,
-            /* At the end of kernel does not need to sync */ false
-        );
+        // Wait for all ranks to finish cleaning.  Reset the cumulative outbox
+        // generations only after every slot has been drained so graph replay
+        // begins from the same all-zero state as the first launch.
+        if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+            if (sm_idx == 0) {
+                for (uint32_t i = thread_idx;
+                     i < gin_transport.outbox_depth;
+                     i += kNumDispatchThreads) {
+                    *buffer.gin_workspace.get_outbox_full_count_ptr(i) = 0;
+                    *buffer.gin_workspace.get_outbox_empty_count_ptr(i) = 0;
+                }
+            }
+            __threadfence_system();
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() {
+                    ptx::sync_aligned(
+                        kNumDispatchThreads, kDispatchBarrierIdx);
+                });
+            if (sm_idx == 0 and warp_idx == 0) {
+                comm::mega_moe_gin_world_barrier(
+                    gin_transport, kAfterWorkspaceCleanBarrierTag - 1);
+            }
+#endif
+        } else {
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* Before the NVLink barrier, there is a grid sync */ true,
+                /* At the end of kernel does not need to sync */ false
+            );
+        }
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1202,7 +1565,23 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 DG_STATIC_ASSERT(STORE_BLOCK_M % 8 == 0, "Invalid store M");
                 constexpr uint32_t kNumRowsPerWarp = STORE_BLOCK_M / 8;
 
-                // L2 BF16 epilogue: write GEMM output to remote combine buffer via NVLink
+                uint32_t gin_outbox_slot = 0;
+                if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+                    if (not task_info.is_shared()) {
+                        gin_outbox_slot =
+                            pool_block_idx % gin_transport.outbox_depth;
+                        const uint32_t generation =
+                            pool_block_idx / gin_transport.outbox_depth;
+                        const auto empty_ptr = buffer.gin_workspace
+                            .get_outbox_empty_count_ptr(gin_outbox_slot);
+                        while (ptx::ld_acq(empty_ptr) < generation) {}
+                    }
+#endif
+                }
+
+                // L2 BF16 epilogue: same-LSA rows retain mapped NVLink stores;
+                // cross-LSA rows are staged in the bounded registered outbox.
                 #pragma unroll
                 for (uint32_t s = 0; s < WG_BLOCK_M / STORE_BLOCK_M; ++ s) {
                     // Early break if the entire store block is beyond the valid token range
@@ -1296,12 +1675,45 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const auto dst_ptr = math::advance_ptr<float4>(
                             dst_token.get_base_ptr(),
                             n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+                            if (gin_transport.is_same_lsa_peer(dst_rank_idx)) {
+                                *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                            } else {
+                                const auto outbox_ptr = math::advance_ptr<float4>(
+                                    buffer.gin_workspace
+                                        .get_combine_outbox_row_ptr(
+                                            gin_outbox_slot, m_idx_in_block),
+                                    n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) +
+                                        (lane_idx % 16) *
+                                            static_cast<uint32_t>(sizeof(float4)));
+                                *outbox_ptr = packed;
+                            }
+#endif
+                        } else {
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        }
                     }
                 }
 
                 // Ensure the next epilogue safe to use shared memory
                 ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+                if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+                    // One release increment per routed L2 N tile.  The block
+                    // drainer waits for all L2_SHAPE_N / BLOCK_N producers,
+                    // including tiles whose rows all remain on the local LSA.
+                    if (not task_info.is_shared() and
+                        epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        ptx::red_add_rel(
+                            buffer.gin_workspace
+                                .get_outbox_full_count_ptr(gin_outbox_slot),
+                            1u);
+                    }
+                    __syncwarp();
+#endif
+                }
             }
         }
 
@@ -1310,15 +1722,54 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (epilogue_warp_idx == 0)
             Allocator().free(0, kNumTmemCols);
 
-        // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
-                             kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
-            workspace, sym_buffer, sm_idx, epilogue_thread_idx,
-            [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
-        );
+        if constexpr (kUseGin) {
+#ifdef DG_MEGAMOE_GIN
+            // Publish every same-LSA mapped store before handing phase 2 to
+            // the world collective.  The first local barrier also proves that
+            // this CTA's dispatch drainer has flush-completed its GIN PUTs.
+            __threadfence_system();
+            ptx::sync_unaligned(
+                kNumDispatchThreads + kNumEpilogueThreads,
+                kDispatchWithEpilogueBarrierIdx);
 
-        // Barrier with dispatch warps, so that they can do clean workspace
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+            // All epilogue CTAs have completed their direct stores and every
+            // CTA has observed its dispatch side at the local handoff.  Only
+            // one converged warp per rank enters the NCCL world barrier.
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+            if (sm_idx == 0 and epilogue_warp_idx == 0) {
+                comm::mega_moe_gin_world_barrier(
+                    gin_transport, kBeforeCombineReduceBarrierTag - 1,
+                    ncclGinFenceLevel::Put);
+                __threadfence_system();
+            }
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+
+            // Release dispatch cleanup only after phase 2 is locally complete.
+            ptx::sync_unaligned(
+                kNumDispatchThreads + kNumEpilogueThreads,
+                kDispatchWithEpilogueBarrierIdx);
+#endif
+        } else {
+            // NVLink barrier (grid sync + cross-rank signal + grid sync): ~4 us
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumEpilogueThreads,
+                                 kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
+                workspace, sym_buffer, sm_idx, epilogue_thread_idx,
+                [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
+            );
+
+            // Barrier with dispatch warps, so that they can do clean workspace
+            ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        }
 
         // Combine: reduce top-k results and write back
         // NOTES: reuse shared memory from start up to the barriers

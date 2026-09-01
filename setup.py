@@ -17,18 +17,27 @@ from pathlib import Path
 from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 from scripts.generate_pyi import generate_pyi_file
+from scripts.gin_build_config import resolve_gin_nccl_config
 
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
 DG_JIT_USE_RUNTIME_API = int(os.environ.get('DG_JIT_USE_RUNTIME_API', '0')) == 1
+DG_MEGAMOE_GIN = int(os.environ.get('DG_MEGAMOE_GIN', '0')) == 1
+gin_nccl_config = resolve_gin_nccl_config(DG_MEGAMOE_GIN)
 
 # Compiler flags
 cxx_flags = ['-std=c++17', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
              f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
 if DG_JIT_USE_RUNTIME_API:
     cxx_flags.append('-DDG_JIT_USE_RUNTIME_API')
+if gin_nccl_config is not None:
+    cxx_flags.extend([
+        '-DDG_MEGAMOE_GIN=1',
+        f'-DDG_NCCL_VERSION_CODE={gin_nccl_config.version_code}',
+        f'-DDG_NCCL_HEADERS_FINGERPRINT=0x{gin_nccl_config.header_fingerprint:016x}ULL',
+    ])
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -42,10 +51,24 @@ build_include_dirs = [
 ]
 build_libraries = ['cudart', 'nvrtc']
 build_library_dirs = [f'{CUDA_HOME}/lib64']
+build_runtime_library_dirs = []
+build_extra_link_args = []
 third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
 ]
+if gin_nccl_config is not None:
+    build_include_dirs.append(str(gin_nccl_config.include_dir))
+    build_library_dirs.append(str(gin_nccl_config.library_dir))
+    build_runtime_library_dirs.append(str(gin_nccl_config.library_dir))
+    # Some NCCL Python packages only ship the SONAME, without an unversioned
+    # libnccl.so linker alias. Link the validated SONAME directly and retain it
+    # even before the first host-side GIN call lands in the prototype.
+    build_extra_link_args.extend([
+        '-Wl,--no-as-needed',
+        str(gin_nccl_config.library_path),
+        '-Wl,--as-needed',
+    ])
 
 # Release
 base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}'
@@ -103,12 +126,19 @@ def get_ext_modules():
     if DG_SKIP_CUDA_BUILD:
         return []
 
+    gin_extension_kwargs = {}
+    if gin_nccl_config is not None:
+        gin_extension_kwargs = {
+            'runtime_library_dirs': build_runtime_library_dirs,
+            'extra_link_args': build_extra_link_args,
+        }
     return [CUDAExtension(name='deep_gemm._C',
                           sources=sources,
                           include_dirs=build_include_dirs,
                           libraries=build_libraries,
                           library_dirs=build_library_dirs,
-                          extra_compile_args=cxx_flags)]
+                          extra_compile_args=cxx_flags,
+                          **gin_extension_kwargs)]
 
 
 class CustomBuildPy(build_py):
@@ -164,10 +194,19 @@ class CustomBuildPy(build_py):
             # Copy the directory
             shutil.copytree(src_dir, dst_dir)
 
+        # Keep the JIT independent of DG_NCCL_ROOT after installation. GIN JIT
+        # compilation uses this private copy, while the extension RUNPATH points
+        # at the matching libnccl.so.2 selected above.
+        nccl_dst_dir = os.path.join(build_include_dir, 'nccl')
+        if os.path.exists(nccl_dst_dir):
+            shutil.rmtree(nccl_dst_dir)
+        if gin_nccl_config is not None:
+            shutil.copytree(gin_nccl_config.include_dir, nccl_dst_dir)
+
 
 class CachedWheelsCommand(_bdist_wheel):
     def run(self):
-        if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
+        if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION or DG_MEGAMOE_GIN:
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
@@ -203,6 +242,7 @@ if __name__ == '__main__':
                 'include/deep_gemm/**/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',
+                'include/nccl/**/*',
             ]
         },
         ext_modules=get_ext_modules(),

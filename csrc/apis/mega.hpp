@@ -11,6 +11,9 @@
 #include "../jit/compiler.hpp"
 #endif
 #include "../jit/device_runtime.hpp"
+#ifdef DG_MEGAMOE_GIN
+#include "mega_gin.hpp"
+#endif
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
 
@@ -39,7 +42,10 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_max_tokens_per_rank, const int& num_topk,
     const int& hidden, const int& intermediate_hidden,
     const std::string& mma_type, const std::string& activation,
-    const int& num_shared_experts = 0) {
+    const int& num_shared_experts = 0,
+    const bool& enable_gin = false,
+    const int& gin_completion_batch = 1,
+    const int& gin_outbox_depth = 8) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(num_shared_experts >= 0);
@@ -83,7 +89,11 @@ get_symm_buffer_size_for_mega_moe(
         nullptr, hidden, intermediate_hidden,
         num_ranks, num_experts, num_max_tokens_per_rank,
         num_topk, num_ring_tokens, num_sf_ring_tokens, with_sf,
-        num_shared_experts
+        num_shared_experts,
+        enable_gin,
+        enable_gin ? static_cast<uint32_t>(num_sms) : 0u,
+        static_cast<uint32_t>(gin_completion_batch),
+        static_cast<uint32_t>(gin_outbox_depth)
     );
 
     // Check SF buffer requirements
@@ -91,6 +101,17 @@ get_symm_buffer_size_for_mega_moe(
         DG_HOST_ASSERT(hidden % 128 == 0 and intermediate_hidden % 128 == 0);
         DG_HOST_ASSERT(shared_intermediate_hidden % 128 == 0);
         DG_HOST_ASSERT(num_sf_ring_tokens % 4 == 0);
+    }
+    if (enable_gin) {
+        DG_HOST_ASSERT(mma_kind == MmaKind::MXFP8FP4);
+        // Chained SoA GET scatters one 112-byte K3 SF row through a scratch
+        // layout whose warp-transpose mapping advances in 512-element groups.
+        DG_HOST_ASSERT(hidden % 512 == 0);
+        DG_HOST_ASSERT(gin_completion_batch == 1 or gin_completion_batch == 2 or
+                       gin_completion_batch == 4 or gin_completion_batch == 8);
+        DG_HOST_ASSERT(gin_outbox_depth == 4 or gin_outbox_depth == 8 or
+                       gin_outbox_depth == 16);
+        DG_HOST_ASSERT(num_sms > 0);
     }
 
     // Slice function: creates tensor views from the raw buffer.
@@ -242,13 +263,61 @@ static void fp8_fp4_mega_moe(
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
+#ifdef DG_MEGAMOE_GIN
+    // Keep the public MegaMoE launch signature unchanged.  A GIN context is
+    // registered against the exact symmetric allocation at construction and
+    // held alive here until the asynchronous kernel launch has copied its
+    // trivially-copyable device descriptor.
+    const auto gin_context = gin::find_megamoe_gin_context(sym_buffer.data_ptr());
+    std::optional<comm::MegaMoeGinTransport> gin_transport_opt;
+    if (gin_context != nullptr) {
+        if (not gin_context->active())
+            throw std::runtime_error(
+                "MegaMoE GIN context is inactive; refusing legacy NVLink fallback");
+        DG_HOST_ASSERT(gin_context->rank() == rank_idx);
+        DG_HOST_ASSERT(gin_context->world_size() == num_ranks);
+        DG_HOST_ASSERT(gin_context->buffer_bytes() ==
+                       static_cast<int64_t>(sym_buffer.nbytes()));
+        // This first direct-GIN implementation deliberately targets one
+        // contiguous two-host, eight-GPU-per-host communicator.
+        DG_HOST_ASSERT(num_ranks == 16);
+        DG_HOST_ASSERT(gin_context->lsa_size() == 8);
+        gin_transport_opt = gin::get_launch_descriptor(gin_context);
+    }
+    const bool enable_gin = gin_transport_opt.has_value();
+    const auto gin_completion_batch = enable_gin ?
+        static_cast<int>(gin_transport_opt->completion_batch) : 1;
+    const auto gin_outbox_depth = enable_gin ?
+        static_cast<int>(gin_transport_opt->outbox_depth) : 8;
+    if (enable_gin) {
+        // The standalone probe owns the B=1/2/4/8 sweep.  The first fused
+        // prototype intentionally publishes one route per completion wave.
+        DG_HOST_ASSERT(gin_completion_batch == 1);
+        DG_HOST_ASSERT(hidden % 512 == 0);
+        DG_HOST_ASSERT(
+            (hidden * static_cast<int>(sizeof(uint16_t))) %
+                static_cast<int>(gin_transport_opt->combine_chunk_bytes) == 0);
+    }
+#else
+    constexpr bool enable_gin = false;
+    constexpr int gin_completion_batch = 1;
+    constexpr int gin_outbox_depth = 8;
+#endif
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
-        "fp8xfp4", activation, num_shared_experts
+        "fp8xfp4", activation, num_shared_experts,
+        enable_gin, gin_completion_batch, gin_outbox_depth
     );
+#ifdef DG_MEGAMOE_GIN
+    // The Python allocator returns an exact legacy or GIN-expanded layout. If
+    // the context was explicitly destroyed or garbage-collected, the expanded
+    // byte count must never be reinterpreted as a valid legacy allocation.
+    DG_HOST_ASSERT(sym_buffer.nbytes() == static_cast<size_t>(num_required_bytes));
+#else
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
+#endif
     DG_HOST_ASSERT(num_experts == num_experts_);
 
     // Already registered tensors
@@ -274,7 +343,11 @@ static void fp8_fp4_mega_moe(
                                num_shared_experts,
                                num_tokens, num_topk,
                                hidden, intermediate_hidden,
-                               activation_clamp, fast_math);
+                               activation_clamp, fast_math
+#ifdef DG_MEGAMOE_GIN
+                               , gin_transport_opt
+#endif
+        );
     } else {
         DG_HOST_UNREACHABLE("Unsupported architecture");
     }

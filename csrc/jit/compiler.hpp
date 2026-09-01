@@ -20,6 +20,15 @@
 
 namespace deep_gemm {
 
+#ifdef DG_MEGAMOE_GIN
+#ifndef DG_NCCL_VERSION_CODE
+#error "DG_MEGAMOE_GIN requires DG_NCCL_VERSION_CODE from setup.py"
+#endif
+#ifndef DG_NCCL_HEADERS_FINGERPRINT
+#error "DG_MEGAMOE_GIN requires DG_NCCL_HEADERS_FINGERPRINT from setup.py"
+#endif
+#endif
+
 class Compiler {
 public:
     static std::filesystem::path library_root_path;
@@ -55,6 +64,21 @@ public:
         flags = fmt::format("-std=c++{} --diag-suppress=39,161,174,177,186,940 "
                             "--ptxas-options=--register-usage-level=10",
                             get_env<int>("DG_JIT_CPP_STANDARD", 20));
+#ifdef DG_MEGAMOE_GIN
+        // GIN headers are copied into the installed package at build time. The
+        // version and content fingerprint participate in `flags`, and therefore
+        // in every JIT cache key, for both the NVCC and NVRTC backends.
+        const auto nccl_include_path = library_include_path / "nccl";
+        DG_HOST_ASSERT(std::filesystem::exists(nccl_include_path / "nccl.h") and
+                       std::filesystem::exists(nccl_include_path / "nccl_device.h") and
+                       "GIN-enabled package is missing its bundled NCCL headers");
+        flags += fmt::format(
+            " -DDG_MEGAMOE_GIN=1 -DDG_NCCL_VERSION_CODE={} "
+            "-DDG_NCCL_HEADERS_FINGERPRINT=0x{:016x}ULL -I{}",
+            DG_NCCL_VERSION_CODE,
+            static_cast<unsigned long long>(DG_NCCL_HEADERS_FINGERPRINT),
+            nccl_include_path.c_str());
+#endif
         if (get_env("DG_JIT_DEBUG", 0) or get_env("DG_JIT_PTXAS_VERBOSE", 0) or get_env("DG_JIT_PTXAS_CHECK", 0))
             flags += " --ptxas-options=--verbose,--warn-on-local-memory-usage";
         if (get_env("DG_JIT_WITH_LINEINFO", 0))

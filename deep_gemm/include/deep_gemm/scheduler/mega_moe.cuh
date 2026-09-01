@@ -254,7 +254,12 @@ struct MegaMoEScheduler {
             uint64_t value = 0;
             if (expert_idx < kNumExpertsPerRank) {
                 do {
-                    value = ptx::ld_volatile(workspace.get_expert_recv_count_sum_ptr(expert_idx));
+                    // Acquire the route/count publication guarded by the high
+                    // ready tag.  The GIN owner publishes this word with a
+                    // matching GPU-scope release after reconstructing every
+                    // per-source count cell.
+                    value = ptx::ld_acq_gpu(
+                        workspace.get_expert_recv_count_sum_ptr(expert_idx));
                 } while (static_cast<uint32_t>(value >> 32) != kNumSMs * kNumRanks);
             }
             stored_num_tokens_per_expert[i] = static_cast<uint32_t>(value);

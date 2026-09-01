@@ -183,6 +183,8 @@ The library also provides some environment variables, which may be useful:
     - `DG_SKIP_CUDA_BUILD`: `0` or `1`, skip CUDA extension build during installation, `0` by default
     - `DG_FORCE_BUILD`: `0` or `1`, force local build instead of downloading pre-built wheels, `0` by default
     - `DG_JIT_USE_RUNTIME_API`: `0` or `1`, use CUDA Runtime API for kernel loading (requires CUDA runtime >= 12.8), `0` by default
+    - `DG_MEGAMOE_GIN`: `0` or `1`, opt into the experimental MegaMoE NCCL Device API/GIN build, `0` by default. This always builds from source.
+    - `DG_NCCL_ROOT`: NCCL installation used when `DG_MEGAMOE_GIN=1`; this prototype requires exactly NCCL 2.30.7 headers (including `nccl_device.h` and `nccl_device/`) and matching `lib/libnccl.so.2` or `lib64/libnccl.so.2`. `NCCL_ROOT` is accepted as a fallback, but `DG_NCCL_ROOT` takes precedence. The validated headers are copied into the built package for JIT compilation, and the extension records an absolute RUNPATH to the selected library, so neither variable is needed after installation.
 
 For additional examples and details, please refer to [the test code](tests/test_core.py) or review the corresponding Python documentation.
 
