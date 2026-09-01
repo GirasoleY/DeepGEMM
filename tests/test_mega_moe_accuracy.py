@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 ROUTE_MODES: Tuple[str, ...] = (
     "all_local",
+    "all_same_host",
     "all_peer",
     "all_remote",
     "different_peers",
@@ -112,6 +113,88 @@ def _check_runtime(torch: Any, deep_gemm: Any) -> None:
         )
 
 
+def _configure_symmetric_memory_backend(
+    args: argparse.Namespace, torch: Any, dist: Any
+) -> Tuple[Optional[str], Optional[Any]]:
+    """Select the cross-host allocator required by the GIN accuracy path.
+
+    Production callers may configure symmetric memory before constructing a
+    MegaMoE buffer.  This standalone harness owns that setup so a successful
+    ``--require-gin`` result proves the registered allocation itself spans the
+    two hosts instead of accidentally using the CUDA/IPC-only default.
+    """
+    if not args.require_gin:
+        return None, None
+    try:
+        import torch.distributed._symmetric_memory as symm_mem
+    except Exception as exc:
+        raise RuntimeError(
+            "--require-gin needs torch.distributed._symmetric_memory"
+        ) from exc
+
+    set_backend = getattr(symm_mem, "set_backend", None)
+    get_backend = getattr(symm_mem, "get_backend", None)
+    if not callable(set_backend) or not callable(get_backend):
+        raise RuntimeError(
+            "--require-gin needs symmetric-memory set_backend/get_backend support"
+        )
+
+    # Some PyTorch builds still require the compatibility registration to
+    # attach the process-group store/ranks used by the NCCL host communicator.
+    # It is a no-op when the group was already registered.
+    enable_group = getattr(symm_mem, "enable_symm_mem_for_group", None)
+    if callable(enable_group):
+        enable_group(dist.group.WORLD.group_name)
+    set_backend("NCCL")
+
+    # Publish ProcessGroupNCCL's device/host communicator pair before the
+    # symmetric-memory rendezvous looks it up.  Object collectives are not a
+    # sufficient warmup for this registry in all PyTorch builds.
+    communicator_probe = torch.ones(1, dtype=torch.int32, device="cuda")
+    dist.all_reduce(communicator_probe, group=dist.group.WORLD)
+    expected = dist.get_world_size()
+    actual = int(communicator_probe.item())
+    if actual != expected:
+        raise RuntimeError(
+            "NCCL communicator publication probe returned "
+            f"{actual}, expected {expected}"
+        )
+    device = torch.device("cuda", torch.cuda.current_device())
+    backend = str(get_backend(device))
+    if backend.upper() != "NCCL":
+        raise RuntimeError(
+            f"--require-gin selected NCCL symmetric memory, but got {backend!r}"
+        )
+
+    # PyTorch 2.13 wheels built before upstream fix 1b6b0f687149 can have a
+    # duplicated, DSO-local NCCL symmetric-memory registry.  Publish the
+    # native ProcessGroupNCCL communicator through the supported external
+    # registration bridge so rendezvous and the process group see one entry.
+    try:
+        from torch.distributed._symmetric_memory._nccl import (
+            register_external_nccl_comm,
+        )
+        backend_impl = dist.group.WORLD._get_backend(device)
+        comm_ptr = getattr(backend_impl, "_comm_ptr", None)
+        if not callable(comm_ptr):
+            raise RuntimeError("ProcessGroupNCCL does not expose _comm_ptr()")
+        comm_ptr_value = int(comm_ptr())
+        if comm_ptr_value == 0:
+            raise RuntimeError("ProcessGroupNCCL returned a null communicator pointer")
+        registration = register_external_nccl_comm(
+            dist.group.WORLD.group_name,
+            comm_ptr_value,
+            device,
+            backend_impl,
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "--require-gin could not bridge ProcessGroupNCCL into the "
+            "symmetric-memory communicator registry"
+        ) from exc
+    return backend.upper(), registration
+
+
 def _init_distributed(local_rank: int, local_world_size: int, torch: Any, dist: Any) -> None:
     torch.cuda.set_device(local_rank)
     if "LOCAL_RANK" in os.environ:
@@ -153,14 +236,50 @@ def _owner_for(
     slot: int,
     hostnames: Sequence[str],
 ) -> Optional[int]:
-    peers, _same_host, remote_host = _rank_candidates(rank, hostnames)
+    peers, same_host, remote_host = _rank_candidates(rank, hostnames)
     if mode == "all_local":
         return rank
+    if mode == "all_same_host":
+        if same_host:
+            # Select a cyclic lane relative to the source rank, rather than an
+            # index into a source-dependent list with the source removed.  For
+            # every (token, top-k slot), this is a permutation of the ranks in
+            # one host.  Consequently every destination receives exactly the
+            # same local-expert histogram as all_local, while every payload
+            # still crosses an NVLink peer (the nonzero offset excludes self).
+            local_group = [
+                candidate
+                for candidate, hostname in enumerate(hostnames)
+                if hostname == hostnames[rank]
+            ]
+            source_lane = local_group.index(rank)
+            offset = 1 + (token + slot) % (len(local_group) - 1)
+            return local_group[(source_lane + offset) % len(local_group)]
+        return peers[(token + slot) % len(peers)]
     if mode == "all_masked":
         return None
     if mode == "all_peer":
         return peers[(token + slot) % len(peers)]
     if mode == "all_remote":
+        local_group = [
+            candidate
+            for candidate, hostname in enumerate(hostnames)
+            if hostname == hostnames[rank]
+        ]
+        remote_hostnames = {hostnames[candidate] for candidate in remote_host}
+        if (
+            len(local_group) > 1
+            and len(remote_host) == len(local_group)
+            and len(remote_hostnames) == 1
+        ):
+            # Mirror the same cyclic lane into the other host.  The paired
+            # lane is deliberately excluded so this has the same seven-peer
+            # fanout as all_same_host on the 2x8 target.  Across all sources,
+            # each destination still receives every (token, slot) exactly
+            # once, matching both expert occupancy and GEMM block count.
+            source_lane = local_group.index(rank)
+            offset = 1 + (token + slot) % (len(local_group) - 1)
+            return remote_host[(source_lane + offset) % len(remote_host)]
         candidates = remote_host if remote_host else peers
         return candidates[(token + slot) % len(candidates)]
     if mode == "different_peers":
@@ -223,7 +342,9 @@ def _make_route_cases(
     dist: Any,
 ) -> Dict[str, RouteCase]:
     cases: Dict[str, RouteCase] = {}
-    has_remote = bool(_rank_candidates(rank, hostnames)[2])
+    _peers, same_host, remote_host = _rank_candidates(rank, hostnames)
+    has_same_host = bool(same_host)
+    has_remote = bool(remote_host)
     for mode in ROUTE_MODES:
         topk_idx, topk_weights = _build_route_tensors(
             mode,
@@ -237,6 +358,8 @@ def _make_route_cases(
         expected_stats = _global_route_stats(topk_idx, rank, experts_per_rank, torch, dist)
         if mode == "all_remote":
             owner_kind = "cross_host" if has_remote else "same_host_peer_fallback"
+        elif mode == "all_same_host":
+            owner_kind = "same_host_peer" if has_same_host else "peer_fallback"
         elif mode == "all_local":
             owner_kind = "local"
         elif mode == "all_masked":
@@ -629,7 +752,7 @@ def _snapshot_and_check_oracles(
 
     # The local expert slot, input, top-k slot, and top-k weight are identical;
     # only the owner rank changes.  Any byte difference is a transport bug.
-    for name in ("all_peer", "all_remote", "different_peers"):
+    for name in ("all_same_host", "all_peer", "all_remote", "different_peers"):
         _assert_bitwise_equal(
             snapshots[name], snapshots["all_local"], f"transport/{name}", torch
         )
@@ -698,7 +821,7 @@ def _run_graph_stress(
     snapshots: Dict[str, Any],
     torch: Any,
     dist: Any,
-) -> None:
+) -> Tuple[Any, Any, Any]:
     graph, static_idx, static_weights = _capture_graph(harness, torch, dist)
     expected = torch.zeros_like(harness.stats)
     for epoch in range(harness.args.graph_replays):
@@ -713,6 +836,193 @@ def _run_graph_stress(
         harness.assert_stats(expected, f"graph/{epoch}/{name}")
         harness.assert_guards(f"graph/{epoch}/{name}")
         _assert_bitwise_equal(harness.output, snapshots[name], f"graph/{epoch}/{name}", torch)
+    return graph, static_idx, static_weights
+
+
+def _timing_summary(values: Sequence[float]) -> Dict[str, float]:
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        raise ValueError("timing summary requires at least one value")
+
+    def percentile(fraction: float) -> float:
+        position = (len(ordered) - 1) * fraction
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        if lower == upper:
+            return ordered[lower]
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    return {
+        "min": ordered[0],
+        "p50": percentile(0.50),
+        "p90": percentile(0.90),
+        "p99": percentile(0.99),
+        "max": ordered[-1],
+        "mean": sum(ordered) / len(ordered),
+    }
+
+
+def _capture_launch_only_graph(
+    harness: AccuracyHarness,
+    torch: Any,
+    dist: Any,
+) -> Any:
+    """Capture only MegaMoE, leaving route/input preparation outside timing."""
+    harness.copy_inputs(harness.cases["all_local"])
+    harness.stats.zero_()
+    for _ in range(3):
+        harness.launch()
+    torch.cuda.synchronize()
+
+    harness.stats.zero_()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        harness.launch()
+    torch.cuda.synchronize()
+    # Capture executes once.  It is setup, not a measured replay.
+    harness.stats.zero_()
+    dist.barrier()
+    return graph
+
+
+def _benchmark_graph_routes(
+    harness: AccuracyHarness,
+    graph: Any,
+    snapshots: Dict[str, Any],
+    torch: Any,
+    dist: Any,
+) -> Dict[str, Any]:
+    """Time full captured MegaMoE steps and retain the slowest rank per replay.
+
+    `all_same_host` and `all_remote` keep routed expert occupancy exactly
+    matched while changing owner payload transport from mapped NVLink to GIN.
+    Their delta is therefore the communication latency still exposed after the
+    fused kernel's compute/communication overlap, not raw one-sided-operation
+    latency or an overlap percentage.  Route copies are ordered before the
+    start event, and the measured graph contains only the MegaMoE launch.
+
+    Routes are interleaved with a rotating order on every cycle to limit clock,
+    thermal, and fixed-order bias.  CUDA events retain one paired sample per
+    route and cycle; CPU launch and synchronize overhead are outside timing.
+    """
+    route_names = list(harness.args.benchmark_routes)
+    count = harness.args.num_tokens
+
+    def select_route(name: str) -> None:
+        case = harness.cases[name]
+        harness.buffer.topk_idx[:count].copy_(case.topk_idx)
+        harness.buffer.topk_weights[:count].copy_(case.topk_weights)
+
+    def rotated(cycle: int) -> List[str]:
+        offset = cycle % len(route_names)
+        return route_names[offset:] + route_names[:offset]
+
+    # Warm each path in the same rotating order used by measurement.
+    harness.stats.zero_()
+    torch.cuda.synchronize()
+    dist.barrier()
+    for cycle in range(harness.args.benchmark_warmups):
+        for name in rotated(cycle):
+            select_route(name)
+            graph.replay()
+    torch.cuda.synchronize()
+
+    # Reset the only user-visible cumulative state so measured replays have an
+    # exact postcondition independent of capture and warmup execution.
+    harness.stats.zero_()
+    harness.output.fill_(float("nan"))
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    starts: Dict[str, List[Any]] = {name: [] for name in route_names}
+    ends: Dict[str, List[Any]] = {name: [] for name in route_names}
+    for cycle in range(harness.args.benchmark_replays):
+        for name in rotated(cycle):
+            select_route(name)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            starts[name].append(start)
+            ends[name].append(end)
+            start.record()
+            graph.replay()
+            end.record()
+    torch.cuda.synchronize()
+
+    expected_stats = torch.zeros_like(harness.stats)
+    for name in route_names:
+        expected_stats.add_(
+            harness.cases[name].expected_local_stats,
+            alpha=harness.args.benchmark_replays,
+        )
+    harness.assert_stats(expected_stats, "benchmark/measured-batch")
+    harness.assert_guards("benchmark/measured-batch")
+    last_name = rotated(harness.args.benchmark_replays - 1)[-1]
+    _assert_bitwise_equal(
+        harness.output,
+        snapshots[last_name],
+        f"benchmark/final/{last_name}",
+        torch,
+    )
+
+    results: Dict[str, Any] = {}
+    max_rank_samples: Dict[str, List[float]] = {}
+    for name in route_names:
+        case = harness.cases[name]
+        local_us_values = [
+            float(start.elapsed_time(end) * 1.0e3)
+            for start, end in zip(starts[name], ends[name])
+        ]
+        local_us = torch.tensor(local_us_values, device="cuda", dtype=torch.float64)
+        max_rank_us = local_us.clone()
+        dist.all_reduce(max_rank_us, op=dist.ReduceOp.MAX)
+
+        local_summary = _timing_summary(local_us_values)
+        summary_vector = torch.tensor(
+            [
+                local_summary["min"],
+                local_summary["p50"],
+                local_summary["p90"],
+                local_summary["p99"],
+                local_summary["max"],
+                local_summary["mean"],
+            ],
+            device="cuda",
+            dtype=torch.float64,
+        )
+        gathered = [torch.empty_like(summary_vector) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, summary_vector)
+        rank_p50_values = [float(item[1].item()) for item in gathered]
+        rank_mean_values = [float(item[5].item()) for item in gathered]
+
+        global_us_values = [float(value) for value in max_rank_us.cpu().tolist()]
+        max_rank_samples[name] = global_us_values
+        results[name] = {
+            "owner_kind": case.owner_kind,
+            "max_rank_per_replay_us": _timing_summary(global_us_values),
+            "local_rank_p50_us": _timing_summary(rank_p50_values),
+            "local_rank_mean_us": _timing_summary(rank_mean_values),
+        }
+
+    baseline = results.get("all_same_host")
+    if baseline is not None:
+        baseline_samples = max_rank_samples["all_same_host"]
+        baseline_p50 = baseline["max_rank_per_replay_us"]["p50"]
+        for name, value in results.items():
+            p50 = value["max_rank_per_replay_us"]["p50"]
+            paired_delta = [
+                sample - reference
+                for sample, reference in zip(
+                    max_rank_samples[name], baseline_samples
+                )
+            ]
+            paired_summary = _timing_summary(paired_delta)
+            value["paired_delta_vs_same_host_us"] = paired_summary
+            value["p50_delta_vs_same_host_us"] = paired_summary["p50"]
+            value["p50_ratio_vs_same_host"] = p50 / baseline_p50
+    dist.barrier()
+    return results
 
 
 def _validate_args(args: argparse.Namespace, world_size: int) -> None:
@@ -810,6 +1120,8 @@ def _gin_transport_evidence(
     rank: int,
     world_size: int,
     hostnames: Sequence[str],
+    symmetric_memory_backend: Optional[str],
+    symmetric_memory_registration: Optional[Any],
 ) -> Dict[str, Any]:
     """Validate the facts needed to call a run GIN transport coverage.
 
@@ -834,6 +1146,16 @@ def _gin_transport_evidence(
             else "buffer.gin_enabled is false"
         )
         raise RuntimeError(f"--require-gin was requested, but {detail}")
+    if symmetric_memory_backend != "NCCL":
+        raise RuntimeError(
+            "--require-gin requires the NCCL symmetric-memory backend, got "
+            f"{symmetric_memory_backend!r}"
+        )
+    if symmetric_memory_registration is None:
+        raise RuntimeError(
+            "--require-gin requires a live symmetric-memory NCCL communicator "
+            "registration"
+        )
 
     context = getattr(buffer, "gin_context", None)
     snapshot_fn = getattr(context, "launch_descriptor_snapshot", None)
@@ -880,6 +1202,26 @@ def _gin_transport_evidence(
         mismatches.append(
             f"buffer_bytes={context_buffer_bytes}, expected {tensor_buffer_bytes}"
         )
+    raw_buffer_ptrs = [int(ptr) for ptr in buffer.handle.buffer_ptrs]
+    buffer_offset = int(buffer.handle.offset)
+    buffer_ptrs = [int(ptr) for ptr in buffer.buffer_ptrs]
+    expected_lsa_ranks = [
+        peer for peer, hostname in enumerate(hostnames)
+        if hostname == hostnames[rank]
+    ]
+    nonzero_ranks = [peer for peer, ptr in enumerate(buffer_ptrs) if ptr != 0]
+    missing_lsa_ranks = [
+        peer for peer in expected_lsa_ranks if buffer_ptrs[peer] == 0
+    ]
+    if len(buffer_ptrs) != world_size:
+        mismatches.append(
+            f"symmetric buffer exposes {len(buffer_ptrs)} pointers, expected {world_size}"
+        )
+    if missing_lsa_ranks:
+        mismatches.append(
+            f"missing symmetric-memory aliases for local LSA ranks="
+            f"{missing_lsa_ranks}; nonzero ranks={nonzero_ranks}"
+        )
     if mismatches:
         raise RuntimeError(
             "--require-gin context/launch descriptor validation failed: "
@@ -891,6 +1233,8 @@ def _gin_transport_evidence(
         "gin_enabled": True,
         "gin_api_present": True,
         "gin_type": gin_type,
+        "symmetric_memory_backend": symmetric_memory_backend,
+        "symmetric_memory_communicator_registration": "external_bridge",
         "cross_host_payload_routes": True,
         "launch_descriptor": {
             name: (bool(snapshot[name]) if name == "enabled" else snapshot[name])
@@ -898,6 +1242,14 @@ def _gin_transport_evidence(
         },
         "connection_count": int(snapshot["connection_count"]),
         "registered_buffer_bytes": context_buffer_bytes,
+        "symmetric_memory_buffer_offset": buffer_offset,
+        "rank_local_raw_buffer_pointer": raw_buffer_ptrs[rank],
+        "rank_local_adjusted_buffer_pointer": buffer_ptrs[rank],
+        "rank_local_tensor_pointer": int(buffer.buffer.data_ptr()),
+        "rank_local_pointer_alias_delta": (
+            buffer_ptrs[rank] - int(buffer.buffer.data_ptr())
+        ),
+        "nonzero_symmetric_memory_ranks": nonzero_ranks,
     }
 
 
@@ -927,12 +1279,30 @@ def _synchronize_worker_success(dist: Any) -> bool:
     return True
 
 
+def _unregister_symmetric_memory_comm(
+    registration: Optional[Any], *, suppress_errors: bool
+) -> None:
+    if registration is None:
+        return
+    try:
+        registration.unregister()
+    except BaseException:
+        if not suppress_errors:
+            raise
+
+
 def _teardown_worker(
-    buffer: Optional[Any], dist: Any, synchronized_success: bool
+    buffer: Optional[Any],
+    dist: Any,
+    synchronized_success: bool,
+    symmetric_memory_registration: Optional[Any],
 ) -> None:
     """Tear down collectives only after every rank crossed the success gate."""
     if not synchronized_success:
         _abort_buffer_rank_local(buffer)
+        _unregister_symmetric_memory_comm(
+            symmetric_memory_registration, suppress_errors=True
+        )
         return
 
     try:
@@ -942,8 +1312,14 @@ def _teardown_worker(
         # A destroy failure must not be followed by process-group teardown;
         # doing so could strand a peer in SymmBuffer's collective destroy.
         _abort_buffer_rank_local(buffer)
+        _unregister_symmetric_memory_comm(
+            symmetric_memory_registration, suppress_errors=True
+        )
         raise
 
+    _unregister_symmetric_memory_comm(
+        symmetric_memory_registration, suppress_errors=False
+    )
     if dist.is_initialized():
         dist.destroy_process_group()
 
@@ -951,11 +1327,19 @@ def _teardown_worker(
 def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) -> None:
     torch, dist, deep_gemm = _load_runtime()
     buffer = None
+    symmetric_memory_registration = None
     synchronized_success = False
     passed_record = None
+    perf_record = None
     try:
         _init_distributed(local_rank, local_world_size, torch, dist)
         _check_runtime(torch, deep_gemm)
+        (
+            symmetric_memory_backend,
+            symmetric_memory_registration,
+        ) = _configure_symmetric_memory_backend(
+            args, torch, dist
+        )
         rank, world_size = dist.get_rank(), dist.get_world_size()
         _validate_args(args, world_size)
         hostnames = _all_hostnames(dist)
@@ -986,7 +1370,13 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
             gin_queue_depth=args.gin_queue_depth,
         )
         transport_evidence = _gin_transport_evidence(
-            buffer, args, rank, world_size, hostnames
+            buffer,
+            args,
+            rank,
+            world_size,
+            hostnames,
+            symmetric_memory_backend,
+            symmetric_memory_registration,
         )
         inputs = _make_inputs(rank, args, torch, deep_gemm)
         weights = _make_kernel_weights(experts_per_rank, args, torch, deep_gemm)
@@ -997,7 +1387,20 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
 
         snapshots, oracle_metrics = _snapshot_and_check_oracles(harness, torch, dist)
         _run_eager_stress(harness, snapshots, torch)
-        _run_graph_stress(harness, snapshots, torch, dist)
+        _run_graph_stress(
+            harness, snapshots, torch, dist
+        )
+        if args.benchmark_replays > 0:
+            benchmark_graph = _capture_launch_only_graph(harness, torch, dist)
+            benchmark_metrics = _benchmark_graph_routes(
+                harness,
+                benchmark_graph,
+                snapshots,
+                torch,
+                dist,
+            )
+        else:
+            benchmark_metrics = None
 
         if rank == 0:
             rel_limit, abs_limit = _oracle_thresholds(args)
@@ -1038,6 +1441,33 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
             }
             passed_record = "MEGAMOE_ACCURACY_JSON=" + json.dumps(
                 result, sort_keys=True)
+            if benchmark_metrics is not None:
+                perf_result = {
+                    "status": "passed",
+                    "world_size": world_size,
+                    "cross_host_exercised": len(set(hostnames)) > 1,
+                    "timing_scope": "launch_only_cuda_graph_device_time",
+                    "aggregation": "slowest_rank_for_each_replay",
+                    "route_schedule": "interleaved_rotating_paired_cycles",
+                    "same_host_control": (
+                        "GIN-enabled fused kernel with same-LSA payload routes; "
+                        "not the legacy GIN-disabled kernel"
+                    ),
+                    "warmups": args.benchmark_warmups,
+                    "replays": args.benchmark_replays,
+                    "shape": result["shape"],
+                    "gin": {
+                        "type": transport_evidence["gin_type"],
+                        "completion_batch": args.gin_completion_batch,
+                        "combine_chunk_bytes": args.gin_combine_chunk_bytes,
+                        "outbox_depth": args.gin_outbox_depth,
+                        "queue_depth": args.gin_queue_depth,
+                    },
+                    "routes": benchmark_metrics,
+                }
+                perf_record = "MEGAMOE_PERF_JSON=" + json.dumps(
+                    perf_result, sort_keys=True
+                )
 
         # This must be the final operation that can diverge by rank before
         # collective teardown.  Only ranks that all cross this barrier may
@@ -1045,8 +1475,15 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
         synchronized_success = _synchronize_worker_success(dist)
         if passed_record is not None:
             print(passed_record, flush=True)
+        if perf_record is not None:
+            print(perf_record, flush=True)
     finally:
-        _teardown_worker(buffer, dist, synchronized_success)
+        _teardown_worker(
+            buffer,
+            dist,
+            synchronized_success,
+            symmetric_memory_registration,
+        )
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1068,6 +1505,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--fast-math", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--eager-iterations", type=int, default=256)
     parser.add_argument("--graph-replays", type=int, default=1000)
+    parser.add_argument(
+        "--benchmark-replays",
+        type=int,
+        default=0,
+        help=(
+            "After correctness, time this many back-to-back CUDA graph replays "
+            "per benchmark route (0 disables timing)"
+        ),
+    )
+    parser.add_argument("--benchmark-warmups", type=int, default=10)
+    parser.add_argument(
+        "--benchmark-routes",
+        nargs="+",
+        choices=ROUTE_MODES,
+        default=("all_local", "all_same_host", "all_remote"),
+    )
     parser.add_argument("--oracle-rel-diff", type=float, default=None)
     parser.add_argument("--oracle-max-abs", type=float, default=None)
     parser.add_argument("--require-cross-host", action="store_true")
@@ -1125,6 +1578,14 @@ def _parse_args() -> argparse.Namespace:
         parser.error("--num-processes must be positive")
     if args.eager_iterations < 1 or args.graph_replays < 1:
         parser.error("eager and graph iteration counts must both be positive")
+    if args.benchmark_replays < 0:
+        parser.error("--benchmark-replays must be non-negative")
+    if args.benchmark_replays > 0 and not args.require_gin:
+        parser.error("--benchmark-replays currently requires --require-gin")
+    if args.benchmark_warmups < 1:
+        parser.error("--benchmark-warmups must be positive")
+    if len(set(args.benchmark_routes)) != len(args.benchmark_routes):
+        parser.error("--benchmark-routes must not contain duplicates")
     return args
 
 

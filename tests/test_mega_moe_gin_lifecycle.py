@@ -61,13 +61,25 @@ class _FlakyGinContext(_FakeGinContext):
         super().destroy()
 
 
+class _FailingAbortGinContext(_FakeGinContext):
+    def abort(self):
+        if self._events is not None:
+            self._events.append('context.abort.failed')
+        raise RuntimeError('injected abort failure')
+
+
 def _uninitialized_symm_buffer(rank=0):
     result = SymmBuffer.__new__(SymmBuffer)
     result.group = _FakeGroup(rank=rank)
     result.buffer = torch.empty(1, dtype=torch.uint8)
     result.handle = object()
-    result.x = object()
-    result.x_sf = object()
+    for name in SymmBuffer._RAW_BUFFER_VIEW_NAMES:
+        setattr(result, name, object())
+    lsa_begin = (rank // 8) * 8
+    result.buffer_ptrs = [
+        0x1000 + peer if lsa_begin <= peer < lsa_begin + 8 else 0
+        for peer in range(16)
+    ]
     result.num_experts = 896
     result.num_max_tokens_per_rank = 384
     result.num_topk = 16
@@ -100,6 +112,21 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
         self.assertFalse(
             inspect.signature(get_symm_buffer_for_mega_moe)
             .parameters['enable_gin'].default)
+
+    def test_constructor_rejects_nonunit_completion_before_allocation(self):
+        with mock.patch.object(
+                mega._C, 'get_symm_buffer_size_for_mega_moe') as get_size:
+            for completion_batch in (0, 2, 4, 8):
+                with self.subTest(completion_batch=completion_batch):
+                    with self.assertRaisesRegex(
+                            ValueError, 'gin_completion_batch=1'):
+                        SymmBuffer(
+                            _FakeGroup(), 896, 384, 16, 3584, 3072,
+                            enable_gin=True,
+                            gin_completion_batch=completion_batch)
+
+        get_size.assert_not_called()
+        self.all_gather_object.assert_not_called()
 
     def test_build_info_and_disabled_diagnostic(self):
         info = _C.megamoe_gin_build_info()
@@ -151,12 +178,30 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
             (completion_batch, combine_chunk_bytes, outbox_depth),
             (1, 7168, 8))
 
-    def test_enable_propagates_nondefault_registered_layout_tuning(self):
+    def test_enable_collectively_rejects_nonunit_completion_batch(self):
         symm_buffer = _uninitialized_symm_buffer()
         symm_buffer.gin_completion_batch = 8
         symm_buffer.gin_combine_chunk_bytes = 256
         symm_buffer.gin_outbox_depth = 16
         symm_buffer.gin_queue_depth = 128
+
+        with mock.patch.object(
+                mega._C, 'megamoe_gin_build_info',
+                return_value={'enabled': True}), mock.patch.object(
+                mega._C, 'get_megamoe_gin_unique_id') as get_uid, mock.patch.object(
+                mega._C, 'create_megamoe_gin_context') as create, mock.patch.object(
+                mega.dist, 'broadcast') as broadcast:
+            with self.assertRaisesRegex(
+                    RuntimeError, 'completion_batch must be exactly 1'):
+                symm_buffer.enable_gin()
+
+        get_uid.assert_not_called()
+        create.assert_not_called()
+        broadcast.assert_not_called()
+
+    def test_enable_accepts_nonzero_aliases_outside_local_lsa(self):
+        symm_buffer = _uninitialized_symm_buffer()
+        symm_buffer.buffer_ptrs = [0x1000 + peer for peer in range(16)]
 
         with mock.patch.object(
                 mega._C, 'megamoe_gin_build_info',
@@ -168,13 +213,28 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
                 mega.dist, 'broadcast'):
             symm_buffer.enable_gin()
 
-        (_, _, _, _, contexts, queue_depth, barriers, lsa_size, gin_type,
-         completion_batch, combine_chunk_bytes, outbox_depth) = create.call_args.args
-        self.assertEqual((contexts, queue_depth, barriers), (9, 128, 3))
-        self.assertEqual((lsa_size, gin_type), (8, 'gdaki'))
-        self.assertEqual(
-            (completion_batch, combine_chunk_bytes, outbox_depth),
-            (8, 256, 16))
+        create.assert_called_once()
+
+    def test_missing_same_lsa_alias_fails_collectively_before_uid(self):
+        symm_buffer = _uninitialized_symm_buffer(rank=11)
+        symm_buffer.buffer_ptrs[12] = 0
+
+        with mock.patch.object(
+                mega._C, 'megamoe_gin_build_info',
+                return_value={'enabled': True}), mock.patch.object(
+                mega._C, 'get_megamoe_gin_unique_id') as get_uid, mock.patch.object(
+                mega._C, 'create_megamoe_gin_context') as create, mock.patch.object(
+                mega.dist, 'broadcast') as broadcast:
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    r'contiguous LSA ranks \[8, 9, 10, 11, 12, 13, 14, 15\], '
+                    r'missing ranks \[12\]'):
+                symm_buffer.enable_gin()
+
+        self.assertEqual(self.all_gather_object.call_count, 2)
+        get_uid.assert_not_called()
+        create.assert_not_called()
+        broadcast.assert_not_called()
 
     def test_enable_uses_global_rank_fallback_for_old_torch(self):
         symm_buffer = _uninitialized_symm_buffer(rank=3)
@@ -270,6 +330,8 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
         self.assertIsNone(symm_buffer.gin_context)
         self.assertIsNone(symm_buffer.buffer)
         self.assertIsNone(symm_buffer.group)
+        for name in SymmBuffer._RAW_BUFFER_VIEW_NAMES:
+            self.assertIsNone(getattr(symm_buffer, name))
 
     def test_destroyed_gin_context_cannot_reach_legacy_launch(self):
         symm_buffer = _uninitialized_symm_buffer()
@@ -310,6 +372,27 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
         self.assertIsNone(symm_buffer.gin_context)
         self.assertIsNone(symm_buffer.buffer)
         self.assertIsNone(symm_buffer.group)
+        for name in SymmBuffer._RAW_BUFFER_VIEW_NAMES:
+            self.assertIsNone(getattr(symm_buffer, name))
+
+    def test_abort_failure_still_clears_every_raw_view_and_allocation(self):
+        events = []
+        symm_buffer = _uninitialized_symm_buffer()
+        symm_buffer._gin_context = _FailingAbortGinContext(events)
+
+        with self.assertRaisesRegex(RuntimeError, 'injected abort failure'):
+            symm_buffer.abort()
+
+        self.assertEqual(events, [
+            'context.abort.failed', 'context.release_registration',
+        ])
+        self.assertIsNone(symm_buffer.gin_context)
+        self.assertIsNone(symm_buffer.handle)
+        self.assertIsNone(symm_buffer.buffer_ptrs)
+        self.assertIsNone(symm_buffer.buffer)
+        self.assertIsNone(symm_buffer.group)
+        for name in SymmBuffer._RAW_BUFFER_VIEW_NAMES:
+            self.assertIsNone(getattr(symm_buffer, name))
 
     def test_destroy_failure_preserves_ownership_for_collective_retry(self):
         events = []
@@ -326,12 +409,16 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
             self.assertIs(symm_buffer.gin_context, context)
             self.assertIsNotNone(symm_buffer.buffer)
             self.assertIsNotNone(symm_buffer.group)
+            for name in SymmBuffer._RAW_BUFFER_VIEW_NAMES:
+                self.assertIsNotNone(getattr(symm_buffer, name))
             symm_buffer.destroy()
 
         self.assertEqual(context.destroy_attempts, 2)
         self.assertIsNone(symm_buffer.gin_context)
         self.assertIsNone(symm_buffer.buffer)
         self.assertIsNone(symm_buffer.group)
+        for name in SymmBuffer._RAW_BUFFER_VIEW_NAMES:
+            self.assertIsNone(getattr(symm_buffer, name))
 
 
 if __name__ == '__main__':

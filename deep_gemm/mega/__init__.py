@@ -16,6 +16,15 @@ from .. import _C
 
 
 class SymmBuffer:
+    _RAW_BUFFER_VIEW_NAMES = (
+        'x', 'x_sf',
+        'topk_idx', 'topk_weights',
+        'shared_l1_acts', 'shared_l1_acts_sf',
+        'shared_l2_acts', 'shared_l2_acts_sf',
+        'l1_acts', 'l1_acts_sf',
+        'l2_acts', 'l2_acts_sf',
+    )
+
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int,
@@ -30,6 +39,14 @@ class SymmBuffer:
                  gin_queue_depth: int = 64):
         assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
         if enable_gin:
+            # The first fused path has only been made correct for one
+            # completion per readiness wave.  Reject other tunings before the
+            # symmetric allocation/rendezvous: 2/4/8 remain available to the
+            # standalone GIN probes, but must not silently enter MegaMoE.
+            if gin_completion_batch != 1:
+                raise ValueError(
+                    'fused MegaMoE GIN currently requires '
+                    'gin_completion_batch=1')
             if mma_type != 'fp8xfp4':
                 raise ValueError('the first fused MegaMoE GIN path requires mma_type=fp8xfp4')
             if hidden % 512 != 0:
@@ -54,12 +71,30 @@ class SymmBuffer:
             enable_gin, gin_completion_batch, gin_outbox_depth
         )
         allocator = torch if group.size() == 1 else symm_mem
-        self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+        # Keep the allocator's communicator lookup key identical to the
+        # process-group device key.  In some PyTorch builds, passing the
+        # indexless ``cuda`` device allocates on the current GPU but records
+        # device index -1 in the NCCL symmetric-memory allocation.  The
+        # communicator is registered under the explicit local device index,
+        # so rendezvous cannot find it once more than one GPU is involved.
+        device = torch.device('cuda', torch.cuda.current_device())
+        self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device=device)
         self.handle = (
-            types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
+            types.SimpleNamespace(
+                buffer_ptrs=[self.buffer.data_ptr()], offset=0)
             if group.size() == 1
             else symm_mem.rendezvous(self.buffer, group=group)
         )
+        # Symmetric-memory handles expose allocation/window bases plus the
+        # offset of this tensor inside that allocation.  The MegaMoE kernels
+        # expect pointers to the tensor itself, so apply the offset once for
+        # every locally addressable peer.  Remote peers remain null and use
+        # the GIN transport instead.
+        buffer_offset = int(self.handle.offset)
+        self.buffer_ptrs = [
+            int(ptr) + buffer_offset if int(ptr) != 0 else 0
+            for ptr in self.handle.buffer_ptrs
+        ]
         self.buffer.zero_()
         self.group.barrier()
         torch.cuda.synchronize()
@@ -169,8 +204,8 @@ class SymmBuffer:
             errors.append('expected_lsa_size must be exactly 8')
         if canonical['required_gin_type'] not in ('gdaki', 'proxy', 'gpi', 'any'):
             errors.append('required_gin_type must be gdaki, proxy, gpi, or any')
-        if canonical['completion_batch'] not in (1, 2, 4, 8):
-            errors.append('completion_batch must be 1, 2, 4, or 8')
+        if canonical['completion_batch'] != 1:
+            errors.append('completion_batch must be exactly 1 for fused MegaMoE')
         if canonical['combine_chunk_bytes'] not in (256, 1792, 3584, 7168):
             errors.append('combine_chunk_bytes is unsupported')
         if canonical['outbox_depth'] not in (4, 8, 16):
@@ -179,6 +214,56 @@ class SymmBuffer:
             raise RuntimeError(
                 'MegaMoE GIN collective configuration rejected: '
                 + '; '.join(errors))
+
+    def _collective_validate_gin_pointer_aliases(
+            self, expected_lsa_size: int):
+        """Collectively reject missing aliases in each rank's contiguous LSA.
+
+        PyTorch may expose aliases for ranks outside the local LSA, so those
+        entries are deliberately not required to be zero.  A rank-local raise
+        here would strand peers in the subsequent UID collectives; gather the
+        diagnostics first so every rank takes the same failure path.
+        """
+        local_error = None
+        try:
+            rank = self.group.rank()
+            world_size = self.group.size()
+            pointers = self.buffer_ptrs
+            if pointers is None:
+                raise RuntimeError('symmetric-memory pointer list is unavailable')
+
+            issues = []
+            if len(pointers) != world_size:
+                issues.append(
+                    f'pointer count {len(pointers)} does not match world size '
+                    f'{world_size}')
+
+            lsa_begin = (rank // expected_lsa_size) * expected_lsa_size
+            lsa_end = min(lsa_begin + expected_lsa_size, world_size)
+            expected_ranks = list(range(lsa_begin, lsa_end))
+            missing_ranks = [
+                peer for peer in expected_ranks
+                if peer >= len(pointers) or int(pointers[peer]) == 0
+            ]
+            if missing_ranks:
+                issues.append(
+                    'expected nonzero aliases for contiguous LSA ranks '
+                    f'{expected_ranks}, missing ranks {missing_ranks}')
+            if issues:
+                local_error = '; '.join(issues)
+        except BaseException as exception:
+            local_error = f'{type(exception).__name__}: {exception}'
+
+        errors = [None] * self.group.size()
+        dist.all_gather_object(errors, local_error, group=self.group)
+        if any(error is not None for error in errors):
+            details = '; '.join(
+                f'rank {rank}: {error}' for rank, error in enumerate(errors)
+                if error is not None
+            )
+            raise RuntimeError(
+                'MegaMoE GIN symmetric-memory pointer alias validation '
+                'failed collectively: ' + details)
 
     def _collective_get_gin_unique_id(self):
         local_unique_id = bytes(128)
@@ -225,6 +310,8 @@ class SymmBuffer:
             # the same actionable build-disabled diagnostic.
             _C.get_megamoe_gin_unique_id()
 
+        self._collective_validate_gin_pointer_aliases(expected_lsa_size)
+
         rank = self.group.rank()
         unique_id = self._collective_get_gin_unique_id()
         unique_id_tensor = torch.tensor(
@@ -247,6 +334,20 @@ class SymmBuffer:
             self.gin_outbox_depth)
         return self._gin_context
 
+    def _release_buffer_storage(self):
+        # ``slice_input_buffers`` returns torch::from_blob views.  They do not
+        # own the symmetric allocation, and CUDA graph execs retain the same
+        # raw addresses independently of these Python objects.  Callers must
+        # finish in-flight kernels and retire every captured graph that can be
+        # replayed before destroy()/abort(); no view or graph may be used after
+        # this method releases the allocation.
+        for name in self._RAW_BUFFER_VIEW_NAMES:
+            setattr(self, name, None)
+        self.handle = None
+        self.buffer_ptrs = None
+        self.buffer = None
+        self.group = None
+
     def destroy(self):
         if self._gin_context is not None:
             # All kernels must be locally quiescent before all ranks enter the
@@ -258,25 +359,19 @@ class SymmBuffer:
             self._gin_context.destroy()
             self._gin_context._release_buffer_registration()
             self._gin_context = None
-        self.handle = None
-        self.buffer = None
-        self.group = None
-        self.x = None
-        self.x_sf = None
+        self._release_buffer_storage()
 
     def abort(self):
         """Release this buffer without collectives after a peer/rank failure."""
-        if self._gin_context is not None:
-            try:
-                self._gin_context.abort()
-            finally:
-                self._gin_context._release_buffer_registration()
-                self._gin_context = None
-        self.handle = None
-        self.buffer = None
-        self.group = None
-        self.x = None
-        self.x_sf = None
+        try:
+            if self._gin_context is not None:
+                try:
+                    self._gin_context.abort()
+                finally:
+                    self._gin_context._release_buffer_registration()
+        finally:
+            self._gin_context = None
+            self._release_buffer_storage()
 
 
 def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
@@ -391,7 +486,7 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
         shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
+        sym_buffer.buffer_ptrs, sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts, sym_buffer.num_topk,
         recipe,
@@ -418,7 +513,7 @@ def bf16_mega_moe(y: torch.Tensor,
         shared_l2_weights,
         cumulative_local_expert_recv_stats,
         sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs,
+        sym_buffer.buffer_ptrs,
         sym_buffer.group.rank(),
         sym_buffer.num_max_tokens_per_rank,
         sym_buffer.num_experts,

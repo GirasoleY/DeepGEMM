@@ -1,4 +1,5 @@
 import unittest
+from collections import Counter
 from types import SimpleNamespace
 
 import test_mega_moe_accuracy as accuracy
@@ -30,6 +31,9 @@ class _FakeTensor:
 
     def element_size(self):
         return 1
+
+    def data_ptr(self):
+        return 0x1000
 
 
 class _FakeContext:
@@ -66,6 +70,11 @@ class _FakeBuffer:
         self, context=None, events=None, destroy_error=None, abort_error=None
     ):
         self.buffer = _FakeTensor()
+        self.buffer_ptrs = [0x1000 + peer * 0x1000 for peer in range(8)] + [0] * 8
+        self.handle = SimpleNamespace(
+            buffer_ptrs=list(self.buffer_ptrs),
+            offset=0,
+        )
         self.gin_context = context
         self.events = events if events is not None else []
         self.destroy_error = destroy_error
@@ -103,6 +112,42 @@ class _FakeDist:
 
 
 class TestMegaMoeAccuracyGinContract(unittest.TestCase):
+    def test_matched_routes_have_identical_expert_work_on_2x8(self):
+        hostnames = ["host-a"] * 8 + ["host-b"] * 8
+        experts_per_rank = 56
+
+        def received_histograms(mode, num_tokens):
+            received = [Counter() for _ in range(16)]
+            fanout = [set() for _ in range(16)]
+            for source in range(16):
+                for token in range(num_tokens):
+                    for slot in range(16):
+                        owner = accuracy._owner_for(
+                            mode, source, token, slot, hostnames
+                        )
+                        self.assertIsNotNone(owner)
+                        if mode == "all_same_host":
+                            self.assertNotEqual(owner, source)
+                            self.assertEqual(hostnames[owner], hostnames[source])
+                        elif mode == "all_remote":
+                            self.assertNotEqual(hostnames[owner], hostnames[source])
+                        local_expert = (token * 16 + slot) % experts_per_rank
+                        received[owner][local_expert] += 1
+                        fanout[source].add(owner)
+            return received, fanout
+
+        for num_tokens in (24, 30, 36):
+            local, local_fanout = received_histograms("all_local", num_tokens)
+            same_host, same_host_fanout = received_histograms(
+                "all_same_host", num_tokens
+            )
+            remote, remote_fanout = received_histograms("all_remote", num_tokens)
+            self.assertEqual(same_host, local)
+            self.assertEqual(remote, local)
+            self.assertTrue(all(len(peers) == 1 for peers in local_fanout))
+            self.assertTrue(all(len(peers) == 7 for peers in same_host_fanout))
+            self.assertTrue(all(len(peers) == 7 for peers in remote_fanout))
+
     def test_required_gin_accepts_only_integrated_fp8_kernel(self):
         with self.assertRaisesRegex(ValueError, "BF16 MegaMoE launch"):
             accuracy._validate_args(_args(mma_type="bf16xbf16"), 16)
@@ -130,6 +175,8 @@ class TestMegaMoeAccuracyGinContract(unittest.TestCase):
             rank=0,
             world_size=16,
             hostnames=["host-a"] * 8 + ["host-b"] * 8,
+            symmetric_memory_backend="NCCL",
+            symmetric_memory_registration=object(),
         )
 
         self.assertEqual(evidence["requested"], "gin")
@@ -148,6 +195,8 @@ class TestMegaMoeAccuracyGinContract(unittest.TestCase):
                 rank=0,
                 world_size=16,
                 hostnames=["host-a"] * 8 + ["host-b"] * 8,
+                symmetric_memory_backend="NCCL",
+                symmetric_memory_registration=object(),
             )
 
     def test_transport_evidence_requires_cross_host_payload(self):
@@ -158,6 +207,8 @@ class TestMegaMoeAccuracyGinContract(unittest.TestCase):
                 rank=0,
                 world_size=16,
                 hostnames=["host-a"] * 16,
+                symmetric_memory_backend="NCCL",
+                symmetric_memory_registration=object(),
             )
 
     def test_transport_evidence_requires_contiguous_2x8_host_ranks(self):
@@ -168,6 +219,8 @@ class TestMegaMoeAccuracyGinContract(unittest.TestCase):
                 rank=0,
                 world_size=16,
                 hostnames=["host-a", "host-b"] * 8,
+                symmetric_memory_backend="NCCL",
+                symmetric_memory_registration=object(),
             )
 
 
@@ -178,7 +231,7 @@ class TestMegaMoeAccuracyFailureSafeTeardown(unittest.TestCase):
         dist = _FakeDist(events)
 
         synchronized_success = accuracy._synchronize_worker_success(dist)
-        accuracy._teardown_worker(buffer, dist, synchronized_success)
+        accuracy._teardown_worker(buffer, dist, synchronized_success, None)
 
         self.assertEqual(
             events,
@@ -195,7 +248,10 @@ class TestMegaMoeAccuracyFailureSafeTeardown(unittest.TestCase):
         buffer = _FakeBuffer(events=events)
         dist = _FakeDist(events)
 
-        accuracy._teardown_worker(buffer, dist, synchronized_success=False)
+        accuracy._teardown_worker(
+            buffer, dist, synchronized_success=False,
+            symmetric_memory_registration=None,
+        )
 
         self.assertEqual(events, ["buffer.abort"])
 
@@ -203,7 +259,10 @@ class TestMegaMoeAccuracyFailureSafeTeardown(unittest.TestCase):
         events = []
         dist = _FakeDist(events)
 
-        accuracy._teardown_worker(None, dist, synchronized_success=False)
+        accuracy._teardown_worker(
+            None, dist, synchronized_success=False,
+            symmetric_memory_registration=None,
+        )
 
         self.assertEqual(events, [])
 
@@ -212,7 +271,10 @@ class TestMegaMoeAccuracyFailureSafeTeardown(unittest.TestCase):
         buffer = _FakeBuffer(events=events, abort_error=RuntimeError("abort failed"))
         dist = _FakeDist(events)
 
-        accuracy._teardown_worker(buffer, dist, synchronized_success=False)
+        accuracy._teardown_worker(
+            buffer, dist, synchronized_success=False,
+            symmetric_memory_registration=None,
+        )
 
         self.assertEqual(events, ["buffer.abort"])
 
@@ -222,7 +284,10 @@ class TestMegaMoeAccuracyFailureSafeTeardown(unittest.TestCase):
         dist = _FakeDist(events)
 
         with self.assertRaisesRegex(RuntimeError, "destroy failed"):
-            accuracy._teardown_worker(buffer, dist, synchronized_success=True)
+            accuracy._teardown_worker(
+                buffer, dist, synchronized_success=True,
+                symmetric_memory_registration=None,
+            )
 
         self.assertEqual(events, ["buffer.destroy", "buffer.abort"])
 
@@ -231,7 +296,10 @@ class TestMegaMoeAccuracyFailureSafeTeardown(unittest.TestCase):
         buffer = _FakeBuffer(events=events)
         dist = _FakeDist(events, initialized=False)
 
-        accuracy._teardown_worker(buffer, dist, synchronized_success=True)
+        accuracy._teardown_worker(
+            buffer, dist, synchronized_success=True,
+            symmetric_memory_registration=None,
+        )
 
         self.assertEqual(events, ["buffer.destroy", "dist.is_initialized"])
 
