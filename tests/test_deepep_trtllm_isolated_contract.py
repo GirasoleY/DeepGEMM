@@ -28,10 +28,20 @@ class ComparisonContractTest(unittest.TestCase):
                  "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
                  "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1"}
         metadata = comparison.dispatch_candidate_metadata(flags)
-        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_ready_coalesced_combine")
+        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_ready_coalesced_direct_reduce")
         contract = metadata["combine_overlap_contract"]
         self.assertEqual(contract["requested_raw"], "1")
         self.assertTrue(contract["requested"])
+        reducer = contract["direct_reducer"]
+        self.assertTrue(reducer["requested"])
+        self.assertTrue(reducer["source_inverse_written_during_actual_pack"])
+        self.assertTrue(reducer["received_count_and_put_visibility_preserved"])
+        self.assertIn("async_global_proxy_fence", reducer["target_visibility_to_tma_proxy"])
+        self.assertEqual(reducer["additional_source_local_ordinal_bytes"], 3072)
+        self.assertEqual(reducer["required_scratch_extent_bytes"], 62720)
+        self.assertEqual(reducer["added_barriers"], 0)
+        self.assertIn("original_scatter", reducer["fit_failure"])
+        self.assertIn("deferred_until_all_local_packet_reads_complete", reducer["cleanup_handoff"])
         self.assertIn("expert-ready storage fit", contract["eligibility"])
         self.assertEqual(contract["producer_target"],
                          "ceil(actual expert assignments / actual BM) * (H / BN)")

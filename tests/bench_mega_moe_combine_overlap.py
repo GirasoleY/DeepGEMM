@@ -1,4 +1,4 @@
-"""Accuracy-gated bounded ready-span coalescing; no compute tuning.
+"""Accuracy-gated ready-span coalescing and direct packet reduction.
 
 Two-node torchrun, eight ranks/node:
   python tests/bench_mega_moe_combine_overlap.py --decode-mns 8 --output RESULT.json
@@ -16,7 +16,7 @@ import bench_mega_moe_dispatch_overlap as shared
 MODE_ENV = "DG_MEGAMOE_GIN_COMBINE_OVERLAP"
 AXIS = shared.SweepAxis("combine", MODE_ENV, (
     (shared.MODE_ENV, "1"), (shared.COMBINE_ENV, "1")),
-    ("tests/bench_mega_moe_combine_overlap.py",))
+    ("tests/bench_mega_moe_combine_overlap.py", "tests/mega_moe_serialized_streams.py"))
 
 
 def combine_contract(mode):
@@ -32,6 +32,24 @@ def combine_contract(mode):
         "counter_storage_fit_is_per_rank": True,
         "counter_storage_capacity_policy": "56 expert ready counts + 56 sent entries + 8*56 saved source/expert prefixes + 8*2 nonempty mask words",
         "expert_metadata_storage_bytes": 2304,
+        "direct_reducer": {
+            "requested": bool(mode),
+            "additional_source_local_ordinal_bytes": 3072,
+            "required_scratch_extent_bytes": 62720,
+            "fit_policy": "combine_overlap_eligible_and_source_local_inverse_map_fits",
+            "source_inverse_written_during_actual_pack": True,
+            "remote_inputs": "owner_packet_payload_via_original_assignment_inverse",
+            "local_shared_inputs": "unchanged_combine_buffer",
+            "reduction_order": "original_ascending_topk_slot_fp32_then_bf16",
+            "received_count_and_put_visibility_preserved": True,
+            "target_visibility_to_tma_proxy": "one_async_global_proxy_fence_per_epilogue_thread_before_reduction",
+            "scatter_and_third_epilogue_grid_skipped_if_eligible": True,
+            "cleanup_handoff": "existing_second_handoff_deferred_until_all_local_packet_reads_complete",
+            "added_barriers": 0,
+            "fit_failure": "retain_current_sender_policy_and_original_scatter",
+            "stream_lifetime": "same_buffer_launches_event_or_stream_serialized",
+            "policy_not_device_observation": True,
+        },
         "expert_readiness_target_policy": "ceil(actual_expert_assignments / actual_block_m) * (hidden / actual_block_n)",
         "send_range_policy": "dispatch_saved_source_expert_prefix_and_existing_exact_count",
         "ready_selection_policy": "warp_parallel_readiness_peer_independent_bounded_ready_coalescing",

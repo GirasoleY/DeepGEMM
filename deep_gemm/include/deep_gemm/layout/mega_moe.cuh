@@ -81,6 +81,8 @@ get_mega_moe_gin_combine_overlap_scratch_bytes() {
            uint64_t(kMegaMoeGinDirectDispatchNumPeers) * sizeof(uint32_t) *
                kMegaMoeGinCombineOverlapNumExpertGroups;
 }
+static constexpr uint32_t kMegaMoeGinDirectReduceOrdinalBytes =
+    kMegaMoeGinDirectDispatchMaxRoutes * sizeof(uint32_t);
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -690,6 +692,27 @@ struct MegaMoeGinWorkspace {
             (2u + kMegaMoeGinDirectDispatchNumPeers) *
                 kMegaMoeGinCombineOverlapNumExperts +
             source_lane * kMegaMoeGinCombineOverlapNumExpertGroups + expert_group;
+    }
+
+    CUTLASS_HOST_DEVICE
+    bool combine_direct_reduce_alias_fits() const {
+        return scale_scratch_buffer.get_num_bytes() >=
+                   kMegaMoeGinDirectDispatchStorageBytes +
+                       get_mega_moe_gin_combine_overlap_scratch_bytes() +
+                       kMegaMoeGinDirectReduceOrdinalBytes;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_combine_direct_reduce_ordinal_ptr(
+            const uint32_t token_topk_idx) const {
+        DG_UNIFIED_ASSERT(combine_direct_reduce_alias_fits());
+        DG_UNIFIED_ASSERT(token_topk_idx < kMegaMoeGinDirectDispatchMaxRoutes);
+        // Source-local inverse of the actually packed assignment ordering.
+        // Distinct from the owner's simultaneously live return-index buffer.
+        return static_cast<uint32_t*>(math::advance_ptr(
+            scale_scratch_buffer.base,
+            kMegaMoeGinDirectDispatchStorageBytes +
+                get_mega_moe_gin_combine_overlap_scratch_bytes())) + token_topk_idx;
     }
 
     CUTLASS_HOST_DEVICE

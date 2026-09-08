@@ -421,6 +421,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         return false;
     };
+    // Pre-consensus packing may prepare only local storage. The same full
+    // alias bound and local token guard also gate every later inverse lookup.
+    const bool prepare_gin_direct_reduce_ordinals = [&]() {
+        if constexpr (kUseGin and kMegaMoeGinCombineOverlap)
+            return num_tokens <= layout::kMegaMoeGinDirectDispatchMaxTokens and
+                   buffer.gin_workspace.combine_direct_reduce_alias_fits();
+        return false;
+    }();
 
     // SF and its buffer configs
     constexpr uint32_t kGranK = 32;
@@ -795,9 +803,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         route_prefix + count <=
                         layout::kMegaMoeGinDirectDispatchMaxRoutes);
                     for (uint32_t slot = 0; slot < count; ++slot) {
-                        packed_routes[route_prefix + slot] =
+                        const uint32_t token_topk_idx =
                             *buffer.gin_workspace.get_route_staging_ptr(
                                 global_expert, slot);
+                        packed_routes[route_prefix + slot] = token_topk_idx;
+                        if (prepare_gin_direct_reduce_ordinals) {
+                            DG_DEVICE_ASSERT(token_topk_idx < num_tokens * kNumTopk);
+                            *buffer.gin_workspace.get_combine_direct_reduce_ordinal_ptr(
+                                token_topk_idx) = route_prefix + slot;
+                        }
                     }
                     route_prefix += count;
                 }
@@ -1200,10 +1214,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     route_prefix + count <=
                                     layout::kMegaMoeGinDirectDispatchMaxRoutes);
                                 for (uint32_t slot = 0; slot < count; ++slot) {
-                                    packed_routes[route_prefix + slot] =
+                                    const uint32_t token_topk_idx =
                                         *buffer.gin_workspace
                                              .get_route_staging_ptr(
                                                  global_expert, slot);
+                                    packed_routes[route_prefix + slot] = token_topk_idx;
+                                    if (prepare_gin_direct_reduce_ordinals) {
+                                        DG_DEVICE_ASSERT(token_topk_idx < num_tokens * kNumTopk);
+                                        *buffer.gin_workspace.get_combine_direct_reduce_ordinal_ptr(
+                                            token_topk_idx) = route_prefix + slot;
+                                    }
                                 }
                                 route_prefix += count;
                             }
@@ -1290,10 +1310,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     route_count + count <=
                                     layout::kMegaMoeGinDirectDispatchMaxRoutes);
                                 for (uint32_t slot = 0; slot < count; ++slot) {
-                                    packed_routes[route_count + slot] =
+                                    const uint32_t token_topk_idx =
                                         *buffer.gin_workspace
                                              .get_route_staging_ptr(
                                                  global_expert, slot);
+                                    packed_routes[route_count + slot] = token_topk_idx;
+                                    if (prepare_gin_direct_reduce_ordinals) {
+                                        DG_DEVICE_ASSERT(token_topk_idx < num_tokens * kNumTopk);
+                                        *buffer.gin_workspace.get_combine_direct_reduce_ordinal_ptr(
+                                            token_topk_idx) = route_count + slot;
+                                    }
                                 }
                                 route_count += count;
                             }
@@ -3267,6 +3293,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         const bool use_gin_combine_overlap =
             use_gin_combine_overlap_this_launch();
+        const bool use_gin_direct_reduce =
+            prepare_gin_direct_reduce_ordinals and use_gin_combine_overlap;
 
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
@@ -3920,6 +3948,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                     __syncwarp();
 
+                    if (not use_gin_direct_reduce) {
                     #pragma unroll
                     for (uint32_t owner_in_lsa = 0;
                          owner_in_lsa < layout::kMegaMoeGinNumDataContexts;
@@ -3969,8 +3998,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                     // The reduction may be scheduled on a different CTA from
                     // the record scatter, so retain a third epilogue grid
-                    // rendezvous only for the bulk path.  Uniform eligibility
-                    // guarantees every rank and CTA makes the same choice.
+                    // rendezvous only for the scatter path. Every CTA on this
+                    // rank makes the same local alias-fit/eligibility choice.
                     comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
                         workspace, sm_idx, epilogue_thread_idx,
                         [&]() {
@@ -3979,13 +4008,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 kEpilogueFullBarrierIdx);
                         });
                     DG_GIN_TRACE_IF(epilogue_warp_idx == 0 and lane_idx == 0, 60);
+                    }
                 }
             }
 
-            // Release dispatch cleanup only after phase 2 is locally complete.
-            ptx::sync_unaligned(
-                kNumDispatchThreads + kNumEpilogueThreads,
-                kDispatchWithEpilogueBarrierIdx);
+            // Release dispatch cleanup here only for the scatter/fallback path
+            // after phase 2 is locally complete. Direct packet readers keep this
+            // existing second handoff pending until reduction ends.
+            if (not use_gin_direct_reduce)
+                ptx::sync_unaligned(
+                    kNumDispatchThreads + kNumEpilogueThreads,
+                    kDispatchWithEpilogueBarrierIdx);
             } else {
                 comm::nvlink_lsa_barrier<
                     kNumRanks, 8, kNumSMs, kNumEpilogueThreads,
@@ -4028,6 +4061,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
             // Barrier with dispatch warps, so that they can do clean workspace
             ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+        }
+
+        if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
+            if (use_gin_direct_reduce) {
+                // The retained GIN Put fence plus grid2 establishes target
+                // visibility. Bridge that acquired global memory into TMA's
+                // async proxy once on every potential issuer, before reading
+                // immutable received packets. This is not a network drain.
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+            }
         }
 
         // Combine: reduce top-k results and write back
@@ -4094,12 +4137,56 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
 
+                        int selected_expert = -1;
+                        if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
+                            if (use_gin_direct_reduce and slot_idx < kNumTopk) {
+                                // This is a full-warp gather, never inside the
+                                // elected TMA issuer's divergent branch.
+                                selected_expert = __shfl_sync(
+                                    0xffffffffu, stored_topk_slot_idx, slot_idx);
+                            }
+                        }
+
                         // Load
                         if (cute::elect_one_sync()) {
-                            const auto src_ptr = math::advance_ptr<uint8_t>(
+                            auto src_ptr = math::advance_ptr<uint8_t>(
                                 buffer.combine_token_buffer.get_rank_buffer(slot_idx)
                                                     .get_data_buffer(token_idx).get_base_ptr(),
                                 chunk_byte_offset);
+                            if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
+#ifdef DG_MEGAMOE_GIN
+                                if (use_gin_direct_reduce and slot_idx < kNumTopk) {
+                                    DG_DEVICE_ASSERT(selected_expert >= 0 and
+                                                     selected_expert < kNumExperts);
+                                    const uint32_t owner =
+                                        static_cast<uint32_t>(selected_expert) / kNumExpertsPerRank;
+                                    if (not gin_transport.is_same_lsa_peer(owner)) {
+                                        const uint32_t token_topk_idx = token_idx * kNumTopk + slot_idx;
+                                        // Active remote assignments are each
+                                        // overwritten by actual source packing
+                                        // this launch. Local/masked/shared slots
+                                        // never consult an inverse-map entry.
+                                        const uint32_t ordinal =
+                                            *buffer.gin_workspace.get_combine_direct_reduce_ordinal_ptr(
+                                                token_topk_idx);
+                                        const uint32_t owner_in_lsa = owner %
+                                            static_cast<uint32_t>(gin_transport.dev_comm.lsaSize);
+                                        const uint32_t received_count = ptx::ld_acq_sys(
+                                            buffer.gin_workspace.get_bulk_combine_packet_count_ptr(
+                                                /*send=*/ false, owner_in_lsa));
+                                        DG_DEVICE_ASSERT(ordinal < received_count);
+                                        const uint32_t destination = ptx::ld_acq_sys(
+                                            buffer.gin_workspace.get_bulk_combine_record_destination_ptr(
+                                                /*send=*/ false, owner_in_lsa, ordinal));
+                                        DG_DEVICE_ASSERT(destination == token_topk_idx);
+                                        src_ptr = math::advance_ptr<uint8_t>(
+                                            buffer.gin_workspace.get_bulk_combine_record_payload_ptr(
+                                                /*send=*/ false, owner_in_lsa, ordinal),
+                                            chunk_byte_offset);
+                                    }
+                                }
+#endif
+                            }
                             ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
                             ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);
                         }
@@ -4163,6 +4250,20 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
         DG_GIN_TRACE_IF(lane_idx == 0, 88u + epilogue_warp_idx);
+        if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
+            if (use_gin_direct_reduce) {
+                // All packet-input TMA loads have completed their mbarrier
+                // waits, including on CTAs with no output tokens. Move only
+                // the epilogue side of the EXISTING second handoff: dispatch
+                // then cleans and joins its old grid/world cleanup barriers,
+                // which now also retire every rank's packet consumers.
+                asm volatile("" ::: "memory");
+                ptx::sync_unaligned(
+                    kNumDispatchThreads + kNumEpilogueThreads,
+                    kDispatchWithEpilogueBarrierIdx);
+                asm volatile("" ::: "memory");
+            }
+        }
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

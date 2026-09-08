@@ -917,7 +917,7 @@ def dispatch_candidate_metadata(flags):
     if combine_enabled and (not enabled or flags.get("DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT") != "1"):
         raise ValueError("combine overlap metadata requires dispatch overlap1 and single context1")
     return {
-        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_combine" if combine_enabled else
+        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_direct_reduce" if combine_enabled else
                              "direct_control_first_dispatch" if enabled else
                              "clean_single_combine_context_only"),
         "combine_overlap_contract": {
@@ -929,6 +929,24 @@ def dispatch_candidate_metadata(flags):
             "early_payload_policy": "each peer independently selects at most eight already-ready adjacent expert spans; never waits for future readiness",
             "readiness_tracking": "common monotonic discovered-ready experts; independent per-peer pending-ready selection",
             "submission_granularity": "one nonaggregate PUT per bounded contiguous ready batch; fixed cap8",
+            "direct_reducer": {
+                "requested": combine_enabled,
+                "additional_source_local_ordinal_bytes": 3072,
+                "required_scratch_extent_bytes": 62720,
+                "fit_policy": "combine_overlap_eligible_and_source_local_inverse_map_fits",
+                "source_inverse_written_during_actual_pack": True,
+                "remote_inputs": "owner_packet_payload_via_original_assignment_inverse",
+                "local_shared_inputs": "unchanged_combine_buffer",
+                "reduction_order": "original_ascending_topk_slot_fp32_then_bf16",
+                "received_count_and_put_visibility_preserved": True,
+                "target_visibility_to_tma_proxy": "one_async_global_proxy_fence_per_epilogue_thread_before_reduction",
+                "scatter_and_third_epilogue_grid_skipped_if_eligible": True,
+                "cleanup_handoff": "existing_second_handoff_deferred_until_all_local_packet_reads_complete",
+                "added_barriers": 0,
+                "fit_failure": "retain_current_sender_policy_and_original_scatter",
+                "stream_lifetime": "same_buffer_launches_event_or_stream_serialized",
+                "policy_not_device_observation": True,
+            },
             "ready_batch_max_experts": 8,
             "ready_batch_cap_is_compile_time_constant": True,
             "frozen_ready_snapshot_no_fill_wait": True,

@@ -290,6 +290,12 @@ def main(axis=DISPATCH_AXIS, contract=dispatch_contract):
                     with patch.object(args, "benchmark_replays", options.benchmark_replays):
                         timing = accuracy._benchmark_graph_routes(harness, graph, snapshots, torch, dist)
                     imbalance = _fixed_shape_imbalance(harness, graph, mode, torch, dist, axis)
+                    serialized = {"enabled": False, "reason": "combine-axis-only gate"}
+                    if axis.name == "combine":
+                        from mega_moe_serialized_streams import validate_serialized_streams
+                        serialized = validate_serialized_streams(
+                            harness, graph, mode, torch, dist, accuracy=accuracy,
+                            common=common, axis=axis, validate_reference=_check_imbalance_output)
                     common._retire_graphs(graphs)
                     graph = None
                     payload = _payload_with_control(harness, mode, torch, dist, axis)
@@ -307,6 +313,7 @@ def main(axis=DISPATCH_AXIS, contract=dispatch_contract):
                         "collectively_validated_mode_flags": mode_flags,
                         "environment": {**configuration["environment"], axis.mode_env: str(mode)},
                         "checks": checks, "fixed_shape_imbalance": imbalance,
+                        "serialized_stream_validation": serialized,
                         "payload_validation": payload, "fast_path_transition": transition, "timing": timing})
                     if dist.get_rank() == 0:
                         print(log_prefix + "PENDING_JSON=" + json.dumps({
