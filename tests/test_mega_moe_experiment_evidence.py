@@ -31,7 +31,7 @@ def _args(*, direct_dispatch=False):
     return SimpleNamespace(gin_direct_dispatch=direct_dispatch)
 
 
-def _records(*, warp="0", coop="0", prepack="0", single="0", direct=False,
+def _records(*, warp="0", coop="0", prepack="0", single="0", dispatch="0", combine="0", direct=False,
              world_size=16):
     return [
         {
@@ -44,6 +44,8 @@ def _records(*, warp="0", coop="0", prepack="0", single="0", direct=False,
                 accuracy.GIN_COOP_DIRECT_PACK_ENV: coop,
                 accuracy.GIN_PRECONSENSUS_PACK_ENV: prepack,
                 accuracy.GIN_SINGLE_COMBINE_CONTEXT_ENV: single,
+                accuracy.GIN_DISPATCH_OVERLAP_ENV: dispatch,
+                accuracy.GIN_COMBINE_OVERLAP_ENV: combine,
             },
         }
         for rank in range(world_size)
@@ -51,6 +53,27 @@ def _records(*, warp="0", coop="0", prepack="0", single="0", direct=False,
 
 
 class TestMegaMoeExperimentEvidence(unittest.TestCase):
+    def test_combine_overlap_is_default_off_collective_and_not_force_enabled(self):
+        name = accuracy.GIN_COMBINE_OVERLAP_ENV
+        self.assertNotIn(name, accuracy.GIN_EXPERIMENT_FLAG_ENVS)
+        self.assertIn(name, accuracy.GIN_PROTOCOL_FLAG_ENVS)
+        records = _records(single="1", dispatch="1", combine="1", direct=True)
+        evidence = accuracy._collect_gin_experiment_flags(
+            _args(direct_dispatch=True), 0, 16, _FakeDist(records))
+        self.assertTrue(evidence[name])
+        for invalid in ("2", "01", "true", "", "1 "):
+            malformed = _records(combine=invalid)
+            with self.assertRaisesRegex(RuntimeError, "must be 0 or 1"):
+                accuracy._collect_gin_experiment_flags(_args(), 0, 16, _FakeDist(malformed))
+        records[7]["flags"][name] = "0"
+        with self.assertRaisesRegex(RuntimeError, "not uniform across ranks"):
+            accuracy._collect_gin_experiment_flags(
+                _args(direct_dispatch=True), 0, 16, _FakeDist(records))
+        for single, dispatch in (("0", "0"), ("0", "1"), ("1", "0")):
+            with self.assertRaisesRegex(RuntimeError, "requires SINGLE_COMBINE_CONTEXT=1"):
+                accuracy._collect_gin_experiment_flags(_args(direct_dispatch=True), 0, 16,
+                    _FakeDist(_records(single=single, dispatch=dispatch, combine="1", direct=True)))
+
     def test_single_mode_is_opt_in_and_not_implicitly_enabled_by_legacy_flags(self):
         self.assertNotIn(accuracy.GIN_SINGLE_COMBINE_CONTEXT_ENV,
                          accuracy.GIN_EXPERIMENT_FLAG_ENVS)
@@ -95,6 +118,8 @@ class TestMegaMoeExperimentEvidence(unittest.TestCase):
                 "DG_MEGAMOE_GIN_COOP_DIRECT_PACK": False,
                 "DG_MEGAMOE_GIN_PRECONSENSUS_PACK": False,
                 "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": False,
+                "DG_MEGAMOE_GIN_DISPATCH_OVERLAP": False,
+                "DG_MEGAMOE_GIN_COMBINE_OVERLAP": False,
             },
         )
 

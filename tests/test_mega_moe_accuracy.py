@@ -100,6 +100,7 @@ GIN_COOP_DIRECT_PACK_ENV = "DG_MEGAMOE_GIN_COOP_DIRECT_PACK"
 GIN_PRECONSENSUS_PACK_ENV = "DG_MEGAMOE_GIN_PRECONSENSUS_PACK"
 GIN_SINGLE_COMBINE_CONTEXT_ENV = "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT"
 GIN_DISPATCH_OVERLAP_ENV = "DG_MEGAMOE_GIN_DISPATCH_OVERLAP"
+GIN_COMBINE_OVERLAP_ENV = "DG_MEGAMOE_GIN_COMBINE_OVERLAP"
 GIN_EXPERIMENT_FLAG_ENVS: Tuple[str, ...] = (
     GIN_DISPATCH_WARP_SCAN_ENV,
     GIN_COOP_DIRECT_PACK_ENV,
@@ -108,7 +109,7 @@ GIN_EXPERIMENT_FLAG_ENVS: Tuple[str, ...] = (
 # Legacy launchers explicitly enable every optimization in the tuple above.
 # Protocol-changing, default-off experiments must not silently join that set.
 GIN_PROTOCOL_FLAG_ENVS: Tuple[str, ...] = (
-    GIN_SINGLE_COMBINE_CONTEXT_ENV, GIN_DISPATCH_OVERLAP_ENV,
+    GIN_SINGLE_COMBINE_CONTEXT_ENV, GIN_DISPATCH_OVERLAP_ENV, GIN_COMBINE_OVERLAP_ENV,
 )
 GIN_VALIDATED_FLAG_ENVS = GIN_EXPERIMENT_FLAG_ENVS + GIN_PROTOCOL_FLAG_ENVS
 GIN_LOCAL_ABLATION_STAGES: Dict[int, str] = {
@@ -2855,6 +2856,12 @@ def _collect_gin_experiment_flags(
                 f"{name}=1 requires --gin-direct-dispatch on every rank"
             )
         result[name] = enabled
+    if (result[GIN_COMBINE_OVERLAP_ENV] and not (
+            result[GIN_SINGLE_COMBINE_CONTEXT_ENV] and result[GIN_DISPATCH_OVERLAP_ENV])):
+        raise RuntimeError(
+            f"{GIN_COMBINE_OVERLAP_ENV}=1 requires SINGLE_COMBINE_CONTEXT=1 "
+            "and DISPATCH_OVERLAP=1 on every rank"
+        )
     if (result[GIN_PRECONSENSUS_PACK_ENV] and
             not result[GIN_COOP_DIRECT_PACK_ENV]):
         raise RuntimeError(

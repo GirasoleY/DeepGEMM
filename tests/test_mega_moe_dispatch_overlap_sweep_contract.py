@@ -98,7 +98,7 @@ class DispatchSweepContracts(unittest.TestCase):
         source = Path(sweep.__file__).read_text()
         self.assertLess(source.index('accuracy._worker(int(os.environ["LOCAL_RANK"])'),
                         source.index('result.update(status="passed"'))
-        self.assertLess(source.index('"dispatch-overlap/preflight-before-candidate"'),
+        self.assertLess(source.index('axis.label + "/preflight-before-candidate"'),
                         source.index('for entry, mode in enumerate(options.schedule)'))
         for name in ("tests/bench_mega_moe_dispatch_overlap.py", "tests/test_mega_moe_accuracy.py",
                      "tests/bench_mega_moe_single_combine_context.py"):

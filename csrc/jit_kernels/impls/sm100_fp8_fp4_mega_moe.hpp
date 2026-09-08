@@ -41,6 +41,7 @@ public:
         int gin_diagnostics;
         bool gin_single_combine_context;
         bool gin_dispatch_overlap;
+        bool gin_combine_overlap;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -89,6 +90,7 @@ public:
 #define DG_MEGAMOE_GIN_DIAGNOSTICS {}
 #define DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT {}
 #define DG_MEGAMOE_GIN_DISPATCH_OVERLAP {}
+#define DG_MEGAMOE_GIN_COMBINE_OVERLAP {}
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -124,6 +126,7 @@ static void __instantiate_kernel() {{
     args.gin_diagnostics,
     args.gin_single_combine_context ? "1" : "0",
     args.gin_dispatch_overlap ? "1" : "0",
+    args.gin_combine_overlap ? "1" : "0",
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_shared_experts,
@@ -327,6 +330,10 @@ static void sm100_fp8_fp4_mega_moe(
     // Fail closed for removed experimental paths, even with context mode off.
     DG_HOST_ASSERT(get_env<std::string>("DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE", "0") == "0");
     DG_HOST_ASSERT(get_env<std::string>("DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS", "1") == "1");
+    const auto gin_combine_overlap_value =
+        get_env<std::string>("DG_MEGAMOE_GIN_COMBINE_OVERLAP", "0");
+    DG_HOST_ASSERT(gin_combine_overlap_value == "0" or
+                   gin_combine_overlap_value == "1");
 #ifdef DG_MEGAMOE_GIN
     const int gin_local_ablation_stage = gin_transport_opt.has_value() ?
         get_env<int>("DG_MEGAMOE_GIN_LOCAL_ABLATION_STAGE", 0) : 0;
@@ -413,7 +420,15 @@ static void sm100_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(not gin_dispatch_overlap or
                    (gin_direct_dispatch and gin_bulk_combine and
                     gin_preconsensus_pack));
+    const bool gin_combine_overlap = gin_combine_overlap_value == "1";
+    DG_HOST_ASSERT(not gin_combine_overlap or
+                   (gin_single_combine_context and gin_dispatch_overlap and
+                    gin_direct_dispatch and gin_bulk_combine));
+    // Scratch fit is checked against the actual BLOCK_M in the kernel.
+    // Insufficient tail space uses the unchanged whole-packet path; never
+    // resize registered storage or change the selected compute configuration.
 #else
+    DG_HOST_ASSERT(gin_combine_overlap_value == "0");
     constexpr int gin_local_ablation_stage = 0;
     constexpr bool gin_active_fast_path = false;
     constexpr bool gin_activity_gate_opt = false;
@@ -425,6 +440,7 @@ static void sm100_fp8_fp4_mega_moe(
     constexpr int gin_diagnostics = 0;
     constexpr bool gin_single_combine_context = false;
     constexpr bool gin_dispatch_overlap = false;
+    constexpr bool gin_combine_overlap = false;
 #endif
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
@@ -450,6 +466,7 @@ static void sm100_fp8_fp4_mega_moe(
         .gin_diagnostics = gin_diagnostics,
         .gin_single_combine_context = gin_single_combine_context,
         .gin_dispatch_overlap = gin_dispatch_overlap,
+        .gin_combine_overlap = gin_combine_overlap,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

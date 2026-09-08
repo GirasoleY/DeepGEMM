@@ -85,31 +85,105 @@ def _calibration_deltas(level_records):
     return result
 
 
-def _kernel_configuration(args):
-    width_raw = os.environ.get("DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE", "0")
+def _raw_kernel_environment():
+    names = (
+        "DG_MEGAMOE_GIN_ACTIVITY_GATE_OPT", "DG_MEGAMOE_GIN_DISPATCH_WARP_SCAN",
+        "DG_MEGAMOE_GIN_COOP_DIRECT_PACK", "DG_MEGAMOE_GIN_PRECONSENSUS_PACK",
+        "DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE",
+        accuracy.GIN_SINGLE_COMBINE_CONTEXT_ENV,
+        "DG_MEGAMOE_GIN_DISPATCH_OVERLAP", "DG_MEGAMOE_GIN_COMBINE_OVERLAP",
+    )
+    result = {name: os.environ.get(name, "0") for name in names}
+    result["DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS"] = os.environ.get(
+        "DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS", "1")
+    return result
+
+
+def _collective_kernel_configuration(args, diagnostic, dist):
+    # Collect raw strings BEFORE parsing them: a rank-local flag error must not
+    # leave peers entering allocation/GIN setup or a mismatched graph capture.
+    local = {
+        "environment": _raw_kernel_environment(),
+        "setup": {name: getattr(args, name, None) for name in (
+            "num_tokens", "hidden", "intermediate_hidden", "num_experts", "num_topk",
+            "num_max_tokens_per_rank", "fast_math", "activation_clamp",
+            "gin_active_fast_path", "gin_bulk_combine", "gin_direct_dispatch",
+            "gin_completion_batch", "gin_combine_issue_wave", "gin_outbox_depth",
+            "gin_combine_chunk_bytes", "eager_iterations", "graph_replays",
+        )},
+        "diagnostic": {name: getattr(diagnostic, name, None) for name in (
+            "diagnostic_level", "diagnostic_replays", "diagnostic_warmups",
+            "calibration_replays",
+        )},
+    }
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, local)
+    if any(record != gathered[0] for record in gathered):
+        raise RuntimeError("phase capture raw configuration differs across ranks")
+    return {
+        **_kernel_configuration(args, environment=gathered[0]["environment"]),
+        "collectively_validated_setup": gathered[0]["setup"],
+        "collectively_validated_diagnostic_settings": gathered[0]["diagnostic"],
+    }
+
+
+def _kernel_configuration(args, *, environment=None):
+    environment = _raw_kernel_environment() if environment is None else dict(environment)
+    width_raw = environment["DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE"]
     if width_raw != "0":
         raise ValueError("retired GIN expert waves are unsupported; requires experts per wave 0")
     width = 0
     barrier_env = "DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS"
-    if os.environ.get(barrier_env, "1") != "1":
+    if environment[barrier_env] != "1":
         raise ValueError("retired GIN barrier warp count is unsupported; requires 1")
     barrier_warps = 1
     single_env = accuracy.GIN_SINGLE_COMBINE_CONTEXT_ENV
-    single_raw = os.environ.get(single_env, "0")
+    single_raw = environment[single_env]
     if single_raw not in ("0", "1"):
         raise ValueError("invalid single combine context mode")
     single_context = int(single_raw)
-    environment = {name: os.environ.get(name, "0") for name in (
-        "DG_MEGAMOE_GIN_ACTIVITY_GATE_OPT", "DG_MEGAMOE_GIN_DISPATCH_WARP_SCAN",
-        "DG_MEGAMOE_GIN_COOP_DIRECT_PACK", "DG_MEGAMOE_GIN_PRECONSENSUS_PACK",
-        "DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE",
-    )}
-    environment[barrier_env] = str(barrier_warps)
-    environment[single_env] = str(single_context)
+    dispatch_raw = environment["DG_MEGAMOE_GIN_DISPATCH_OVERLAP"]
+    combine_raw = environment["DG_MEGAMOE_GIN_COMBINE_OVERLAP"]
+    for name, raw in (("dispatch_overlap", dispatch_raw), ("combine_overlap", combine_raw)):
+        if raw not in ("0", "1"):
+            raise ValueError(f"{name} must be exactly 0 or 1")
+    if dispatch_raw == "1" and not (
+        getattr(args, "gin_bulk_combine", False)
+        and getattr(args, "gin_direct_dispatch", False)
+        and environment["DG_MEGAMOE_GIN_PRECONSENSUS_PACK"] == "1"
+        and environment["DG_MEGAMOE_GIN_COOP_DIRECT_PACK"] == "1"
+    ):
+        raise ValueError("dispatch_overlap requires bulk/direct and preconsensus/cooperative packing")
+    if combine_raw == "1" and not (single_raw == "1" and dispatch_raw == "1"):
+        raise ValueError("combine_overlap requires single_combine_context=1 and dispatch_overlap=1")
+    combine_schedule = (
+        "completed_block_spans_then_late_header" if combine_raw == "1"
+        else "post_compute_full_packet"
+    )
     return {
         "combine_experts_per_wave": width,
         "combine_wave_count": 0,
-        "combine_schedule": "post_compute_full_packet",
+        "combine_schedule": combine_schedule,
+        "dispatch_overlap_requested": dispatch_raw == "1",
+        "combine_overlap_requested": combine_raw == "1",
+        "combine_schedule_is_requested_policy_not_device_observation": True,
+        "combine_overlap_effective_policy": {
+            "bulk_direct_remote_and_scratch_alias_fits_actual_block_m": combine_schedule,
+            "bulk_direct_remote_but_scratch_alias_insufficient": "post_compute_full_packet",
+            "remote_ineligible": "unchanged_fallback",
+            "all_local": "unchanged_local_path",
+        },
+        "phase_marker_semantics": {
+            "32_39": ("receiver_control_terminal_acquired_not_payload" if dispatch_raw == "1"
+                      else "receiver_combined_control_payload_terminal_acquired"),
+            "24_31": "late_sender_local_flush_not_receiver_arrival_or_last_payload_time",
+            "64_71": "first_combine_issue_observation_per_peer",
+            "72_79": ("last_recorded_queue_observation_includes_late_header" if combine_raw == "1"
+                      else "whole_packet_queue_observation"),
+            "80_87": ("late_header_local_flush_not_last_payload_time" if combine_raw == "1"
+                      else "whole_packet_local_flush_not_receiver_arrival"),
+            "53": "epilogue_task_loop_exit_not_mma_completion_or_nic_visibility",
+        },
         "retired_expert_wave_and_coop_width_experiments_supported": False,
         "combine_barrier_warps_requested": barrier_warps,
         # Source-level policy, not a new device observation. The clean
@@ -246,8 +320,14 @@ def main() -> None:
     os.environ["DG_MEGAMOE_GIN_DIAGNOSTICS"] = str(diagnostic.diagnostic_level)
     torch, dist, deep_gemm = accuracy._load_runtime()
     original_allocate = deep_gemm.get_symm_buffer_for_mega_moe
+    original_init_distributed = accuracy._init_distributed
     original_graph_stress = accuracy._run_graph_stress
     state = {}
+
+    def initialize_then_validate(*positional, **kwargs):
+        result = original_init_distributed(*positional, **kwargs)
+        state["kernel_configuration"] = _collective_kernel_configuration(args, diagnostic, dist)
+        return result
 
     def allocate(*positional, **kwargs):
         buffer = original_allocate(*positional, **kwargs)
@@ -258,6 +338,8 @@ def main() -> None:
         return buffer
 
     def graph_stress_then_capture(harness, snapshots, torch, dist):
+        if _collective_kernel_configuration(args, diagnostic, dist) != state["kernel_configuration"]:
+            raise RuntimeError("phase kernel configuration changed before capture")
         original_graph_stress(harness, snapshots, torch, dist)
         markers = state["markers"]
         calibration = calibrate_diagnostics(harness, snapshots, markers, diagnostic, torch, dist)
@@ -299,10 +381,14 @@ def main() -> None:
                 routes[route] = [sample for rank_samples in gathered for sample in rank_samples]
         finally:
             graph = None
+        if _collective_kernel_configuration(args, diagnostic, dist) != state["kernel_configuration"]:
+            raise RuntimeError("phase kernel configuration changed during capture")
         capture = {
             "schema": "megamoe-gin-phase-capture-v1", "performance_claim": False,
             "diagnostic_level": diagnostic.diagnostic_level,
-            "kernel_configuration": _kernel_configuration(args),
+            "kernel_configuration": state["kernel_configuration"],
+            "kernel_configuration_collectively_validated_before_allocation": True,
+            "kernel_configuration_stable_through_capture": True,
             "shape": {"tokens_per_rank": args.num_tokens, "hidden": args.hidden,
                       "intermediate_hidden": args.intermediate_hidden,
                       "num_experts": args.num_experts, "num_topk": args.num_topk,
@@ -317,6 +403,7 @@ def main() -> None:
 
     rank = int(os.environ.get("RANK", "0"))
     with patch.object(deep_gemm, "get_symm_buffer_for_mega_moe", allocate), \
+         patch.object(accuracy, "_init_distributed", initialize_then_validate), \
          patch.object(accuracy, "_run_graph_stress", graph_stress_then_capture):
         accuracy._worker(int(os.environ["LOCAL_RANK"]), 8, args)
     if rank == 0:

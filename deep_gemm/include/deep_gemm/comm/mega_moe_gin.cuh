@@ -522,6 +522,64 @@ NCCL_DEVICE_INLINE void mega_moe_gin_put_data(
             cuda::thread_scope_device, cuda::thread_scope_device, opt_flags);
 }
 
+// These scoped publication helpers deliberately do not reuse the legacy PTX
+// wrappers: every participating producer needs compiler ordering around the
+// complete CTA epilogue barrier, then a device-release RMW per N fragment.
+// Each issuing peer lane acquires the completed counter before constructing
+// any span PUT. Counter storage must not be reset until all consumers finish.
+NCCL_DEVICE_INLINE void mega_moe_gin_combine_producer_barrier(
+    const uint32_t num_threads, const uint32_t barrier_idx) {
+    asm volatile("bar.sync %0, %1;"
+                 :: "r"(barrier_idx), "r"(num_threads) : "memory");
+}
+
+NCCL_DEVICE_INLINE void mega_moe_gin_combine_ready_release(uint32_t* ptr) {
+    asm volatile("red.release.gpu.global.add.u32 [%0], %1;"
+                 :: "l"(ptr), "r"(1u) : "memory");
+}
+
+NCCL_DEVICE_INLINE uint32_t mega_moe_gin_combine_ready_acquire(
+    const uint32_t* ptr) {
+    uint32_t value;
+    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];"
+                 : "=r"(value) : "l"(ptr) : "memory");
+    return value;
+}
+
+// Publish only complete fixed-stride records (including destination headers).
+// The caller owns all readiness acquires, exactly-once span selection and the
+// later flush. Default rings the doorbell and retains automatic queue-credit
+// checking; an open aggregate chain across dynamically discovered spans is
+// expressly forbidden. NCCL2.30.7/GDAKI adds the required system release after
+// the issuer's device acquire, cumulatively publishing producer payload stores.
+NCCL_DEVICE_INLINE void mega_moe_gin_put_bulk_combine_span(
+    const MegaMoeGinTransport& transport,
+    const uint32_t peer,
+    const uint32_t context_stripe,
+    const void* local_window_base,
+    const void* local_span,
+    void* remote_span,
+    const uint32_t span_bytes,
+    const uint32_t diagnostic_peer_lane) {
+    DG_DEVICE_ASSERT(span_bytes > 0u and span_bytes % 16u == 0u);
+    mega_moe_gin_trace(
+        transport, blockIdx.x, 64u + diagnostic_peer_lane, true);
+    asm volatile("" ::: "memory");
+    ncclGin gin{transport.dev_comm,
+                static_cast<int>(transport.data_context(context_stripe)),
+                NCCL_GIN_RESOURCE_SHARING_GPU};
+    gin.put(ncclTeamWorld(transport.dev_comm), static_cast<int>(peer),
+            transport.window,
+            transport.window_offset(local_window_base, remote_span),
+            transport.window,
+            transport.window_offset(local_window_base, local_span), span_bytes,
+            ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+            cuda::thread_scope_device, cuda::thread_scope_system,
+            ncclGinOptFlagsDefault);
+    asm volatile("" ::: "memory");
+    mega_moe_gin_trace(transport, blockIdx.x, 72u + diagnostic_peer_lane);
+}
+
 // Publish one BF16 combine row as a chained sequence of equally sized PUTs.
 // The final PUT closes the aggregate chain.  The caller must flush/wait the
 // destination peer before allowing the source outbox slot to be reused.
@@ -592,6 +650,31 @@ NCCL_DEVICE_INLINE void mega_moe_gin_put_bulk_combine_packet(
     mega_moe_gin_put_data(
         transport, peer, context_stripe, local_window_base, local_packet,
         remote_packet, packet_bytes);
+    mega_moe_gin_trace(transport, blockIdx.x, 72u + diagnostic_peer_lane);
+    ncclGinRequest_t request{};
+    mega_moe_gin_flush_data_peer_async(
+        transport, peer, context_stripe, &request);
+    mega_moe_gin_wait_data_peer(transport, context_stripe, request);
+    mega_moe_gin_trace(transport, blockIdx.x, 80u + diagnostic_peer_lane);
+}
+
+// Early-record mode leaves packet-count publication at the original late
+// epilogue point. Send exactly the existing 16-byte packet header, never the
+// payload again, with the original device/device and flush/wait semantics.
+// The existing world Put fence still establishes remote visibility.
+NCCL_DEVICE_INLINE void mega_moe_gin_put_bulk_combine_header(
+    const MegaMoeGinTransport& transport,
+    const uint32_t peer,
+    const uint32_t context_stripe,
+    const void* local_window_base,
+    const void* local_packet,
+    void* remote_packet,
+    const uint32_t diagnostic_peer_lane) {
+    mega_moe_gin_trace(
+        transport, blockIdx.x, 64u + diagnostic_peer_lane, true);
+    mega_moe_gin_put_data(
+        transport, peer, context_stripe, local_window_base, local_packet,
+        remote_packet, 16u);
     mega_moe_gin_trace(transport, blockIdx.x, 72u + diagnostic_peer_lane);
     ncclGinRequest_t request{};
     mega_moe_gin_flush_data_peer_async(

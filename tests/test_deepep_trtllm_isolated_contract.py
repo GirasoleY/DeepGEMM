@@ -23,6 +23,29 @@ class FakeDist:
 
 
 class ComparisonContractTest(unittest.TestCase):
+    def test_combine_metadata_requires_dispatch_sc_and_labels_only_transport_policy(self):
+        flags = {"DG_MEGAMOE_GIN_DISPATCH_OVERLAP": "1",
+                 "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
+                 "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1"}
+        metadata = comparison.dispatch_candidate_metadata(flags)
+        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_completed_block_combine")
+        contract = metadata["combine_overlap_contract"]
+        self.assertEqual(contract["requested_raw"], "1")
+        self.assertTrue(contract["requested"])
+        self.assertIn("counter storage fit", contract["eligibility"])
+        self.assertIn("not device branch", contract["basis"])
+        self.assertFalse(contract["compute_hints_tiling_sm_count_and_math_changed"])
+        for invalid in ("01", "2", 1, True):
+            with self.assertRaises(ValueError):
+                comparison.dispatch_candidate_metadata({**flags, "DG_MEGAMOE_GIN_COMBINE_OVERLAP": invalid})
+        for missing in ("DG_MEGAMOE_GIN_DISPATCH_OVERLAP", "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT"):
+            with self.assertRaises(ValueError):
+                comparison.dispatch_candidate_metadata({**flags, missing: "0"})
+        import inspect
+        source = inspect.getsource(comparison.main)
+        self.assertLess(source.index('"DG_MEGAMOE_GIN_COMBINE_OVERLAP"'),
+                        source.index("dist.all_gather_object(rank_flags, flags)"))
+
     def test_dispatch_metadata_distinguishes_control_first_without_claiming_measured_overlap(self):
         for raw, family in (("0", "clean_single_combine_context_only"),
                             ("1", "direct_control_first_dispatch")):

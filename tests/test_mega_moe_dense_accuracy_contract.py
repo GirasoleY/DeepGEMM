@@ -14,6 +14,46 @@ import test_mega_moe_dense_accuracy as dense
 
 
 class TestDenseAccuracyPolicy(unittest.TestCase):
+    def test_combine_mode_is_collective_canonical_boolean(self):
+        for value in ("0", "1"):
+            self.assertEqual(dense.validate_combine_modes([value] * 16), int(value))
+        for values in ([], ["0"] * 8 + ["1"] * 8, ["01"] * 16, ["1 "] * 16,
+                       ["2"] * 16, [True] * 16, [1] * 16):
+            with self.assertRaises(ValueError):
+                dense.validate_combine_modes(values)
+
+    def test_combine_baseline_changes_only_combine_with_dispatch_and_sc_fixed(self):
+        self.assertTrue(dense.baseline_control_required(0, 1, 1, 1, 1))
+        candidate = {dense.EXPERT_WIDTH_ENV: "0", dense.BARRIER_WIDTH_ENV: "1",
+                     dense.SINGLE_CONTEXT_ENV: "1", dense.DISPATCH_OVERLAP_ENV: "1",
+                     dense.COMBINE_OVERLAP_ENV: "1"}
+        baseline = dense.baseline_control_environment(1, 1)
+        self.assertEqual(baseline, {**candidate, dense.COMBINE_OVERLAP_ENV: "0"})
+        for single, dispatch in ((0, 0), (0, 1), (1, 0)):
+            with self.assertRaises(ValueError):
+                dense.validate_experiment_combination(0, 1, single, dispatch, 1)
+        with patch.dict(os.environ, candidate, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "capture"):
+                with patch.dict(os.environ, baseline):
+                    self.assertEqual(dict(os.environ), baseline)
+                    raise RuntimeError("capture")
+            self.assertEqual(dict(os.environ), candidate)
+
+    def test_disabled_combine_retains_dispatch_axis_and_explicit_zero(self):
+        baseline = dense.baseline_control_environment(1, 0)
+        self.assertEqual(baseline[dense.COMBINE_OVERLAP_ENV], "0")
+        self.assertEqual(baseline[dense.DISPATCH_OVERLAP_ENV], "0")
+        self.assertEqual(baseline[dense.SINGLE_CONTEXT_ENV], "1")
+        self.assertEqual(dense.baseline_control_environment(0, 0)[dense.SINGLE_CONTEXT_ENV], "0")
+
+    def test_combine_preflight_and_labels_precede_allocation_without_runtime_claim(self):
+        source = inspect.getsource(dense.worker)
+        self.assertLess(source.index("validate_combine_modes("), source.index("dg.get_symm_buffer_for_mega_moe("))
+        self.assertIn('"combine_overlap_requested_raw": candidate_environment[COMBINE_OVERLAP_ENV]', source)
+        self.assertIn('"combine0-dispatch1-sc1-control/"', source)
+        self.assertIn('"combine_overlap_effective_policy_not_device_observation"', source)
+        self.assertIn('"physical_overlap_measured": False', source)
+
     def test_dispatch_mode_requires_collective_canonical_boolean(self):
         for value in ("0", "1"):
             self.assertEqual(dense.validate_dispatch_modes([value] * 16), int(value))

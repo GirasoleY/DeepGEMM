@@ -15,7 +15,9 @@ per-element rounding budget: one BF16 ULP per expert contribution plus one
 final BF16 rounding ULP. This accounts for cancellation when one expert's GEMM
 accumulator lands on a different BF16 rounding boundary. It is a tolerance
 budget, not a proof about arbitrary intermediate FP8 errors. Historical fixed
-absolute-gate failures remain reported. Enabled dispatch overlap must match
+absolute-gate failures remain reported. Enabled combine overlap must match
+combine0 BITWISE while dispatch overlap and single-context COMBINE stay1.
+Otherwise enabled dispatch overlap must match
 dispatch0 BITWISE while single-context COMBINE stays1. With overlap disabled,
 enabled single-context mode retains its original all-context-COMBINE baseline.
 Both comparisons use identical inputs, weights, context and compute settings.
@@ -39,6 +41,7 @@ EXPERT_WIDTH_ENV = "DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE"
 BARRIER_WIDTH_ENV = "DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS"
 SINGLE_CONTEXT_ENV = "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT"
 DISPATCH_OVERLAP_ENV = "DG_MEGAMOE_GIN_DISPATCH_OVERLAP"
+COMBINE_OVERLAP_ENV = "DG_MEGAMOE_GIN_COMBINE_OVERLAP"
 
 
 def source_fingerprint():
@@ -246,11 +249,16 @@ def validate_barrier_widths(values):
     return width
 
 
-def baseline_control_environment(dispatch_overlap=0):
+def baseline_control_environment(dispatch_overlap=0, combine_overlap=0):
     if type(dispatch_overlap) is not int or dispatch_overlap not in (0, 1):
         raise ValueError("dispatch overlap mode must be0 or1")
+    if type(combine_overlap) is not int or combine_overlap not in (0, 1):
+        raise ValueError("combine overlap mode must be0 or1")
+    if combine_overlap and not dispatch_overlap:
+        raise ValueError("combine overlap requires dispatch overlap1")
     return {EXPERT_WIDTH_ENV: "0", BARRIER_WIDTH_ENV: "1",
-            SINGLE_CONTEXT_ENV: "1" if dispatch_overlap else "0", DISPATCH_OVERLAP_ENV: "0"}
+            SINGLE_CONTEXT_ENV: "1" if dispatch_overlap else "0",
+            DISPATCH_OVERLAP_ENV: "1" if combine_overlap else "0", COMBINE_OVERLAP_ENV: "0"}
 
 
 def validate_dispatch_modes(values):
@@ -258,6 +266,14 @@ def validate_dispatch_modes(values):
         raise ValueError("invalid dispatch overlap mode; requires canonical0/1")
     if len(set(values)) != 1:
         raise ValueError("dispatch overlap mode differs across ranks")
+    return int(values[0])
+
+
+def validate_combine_modes(values):
+    if not values or any(value not in ("0", "1") for value in values):
+        raise ValueError("invalid combine overlap mode; requires canonical0/1")
+    if len(set(values)) != 1:
+        raise ValueError("combine overlap mode differs across ranks")
     return int(values[0])
 
 
@@ -273,18 +289,24 @@ def validate_single_context_modes(values):
     return mode
 
 
-def validate_experiment_combination(experts_per_wave, barrier_warps, single_context, dispatch_overlap=0):
+def validate_experiment_combination(experts_per_wave, barrier_warps, single_context,
+                                    dispatch_overlap=0, combine_overlap=0):
     if experts_per_wave != 0 or barrier_warps != 1:
         raise ValueError("retired experiments are unsupported; requires expert waves off and barrier width one")
     if dispatch_overlap not in (0, 1):
         raise ValueError("invalid dispatch overlap mode")
     if dispatch_overlap and single_context != 1:
         raise ValueError("dispatch overlap dense gate requires single-context COMBINE1")
+    if type(combine_overlap) is not int or combine_overlap not in (0, 1):
+        raise ValueError("invalid combine overlap mode")
+    if combine_overlap and (single_context != 1 or dispatch_overlap != 1):
+        raise ValueError("combine overlap dense gate requires dispatch overlap1 and single-context COMBINE1")
 
 
-def baseline_control_required(experts_per_wave, barrier_warps, single_context=0, dispatch_overlap=0):
-    validate_experiment_combination(experts_per_wave, barrier_warps, single_context, dispatch_overlap)
-    return bool(single_context or dispatch_overlap)
+def baseline_control_required(experts_per_wave, barrier_warps, single_context=0,
+                              dispatch_overlap=0, combine_overlap=0):
+    validate_experiment_combination(experts_per_wave, barrier_warps, single_context, dispatch_overlap, combine_overlap)
+    return bool(single_context or dispatch_overlap or combine_overlap)
 
 
 def check_output(harness, case, expected, rounding_budget, options, label,
@@ -386,7 +408,8 @@ def worker(options, args):
         candidate_environment = {EXPERT_WIDTH_ENV: os.environ.get(EXPERT_WIDTH_ENV, "0"),
                                  BARRIER_WIDTH_ENV: os.environ.get(BARRIER_WIDTH_ENV, "1"),
                                  SINGLE_CONTEXT_ENV: os.environ.get(SINGLE_CONTEXT_ENV, "0"),
-                                 DISPATCH_OVERLAP_ENV: os.environ.get(DISPATCH_OVERLAP_ENV, "0")}
+                                 DISPATCH_OVERLAP_ENV: os.environ.get(DISPATCH_OVERLAP_ENV, "0"),
+                                 COMBINE_OVERLAP_ENV: os.environ.get(COMBINE_OVERLAP_ENV, "0")}
         configuration = {"candidate_environment": candidate_environment, "source": source}
         dist.all_gather_object(configurations, configuration)
         if any(item["source"] != source for item in configurations):
@@ -396,10 +419,12 @@ def worker(options, args):
         barrier_width = validate_barrier_widths([item[BARRIER_WIDTH_ENV] for item in environments])
         single_context = validate_single_context_modes([item[SINGLE_CONTEXT_ENV] for item in environments])
         dispatch_overlap = validate_dispatch_modes([item[DISPATCH_OVERLAP_ENV] for item in environments])
-        validate_experiment_combination(expert_width, barrier_width, single_context, dispatch_overlap)
-        control_enabled = baseline_control_required(expert_width, barrier_width, single_context, dispatch_overlap)
-        baseline_environment = baseline_control_environment(dispatch_overlap)
-        comparison_axis = "dispatch_overlap_with_combine1_fixed" if dispatch_overlap else "single_combine_context"
+        combine_overlap = validate_combine_modes([item[COMBINE_OVERLAP_ENV] for item in environments])
+        validate_experiment_combination(expert_width, barrier_width, single_context, dispatch_overlap, combine_overlap)
+        control_enabled = baseline_control_required(expert_width, barrier_width, single_context, dispatch_overlap, combine_overlap)
+        baseline_environment = baseline_control_environment(dispatch_overlap, combine_overlap)
+        comparison_axis = ("combine_overlap_with_dispatch1_sc1_fixed" if combine_overlap else
+                           "dispatch_overlap_with_combine1_fixed" if dispatch_overlap else "single_combine_context")
         experts = args.num_experts // world
         if (experts, args.hidden, args.intermediate_hidden, args.num_topk) != (56, 3584, 3072, 16):
             raise RuntimeError("dense gate requires actual H3584/I3072/E896/topk16")
@@ -472,7 +497,8 @@ def worker(options, args):
                     torch.cuda.synchronize()
                     control_output = harness.output.clone()
                     results.append(check_output(harness, case, expected, rounding_budget,
-                                                options, ("dispatch0-combine1-control/" if dispatch_overlap
+                                                options, ("combine0-dispatch1-sc1-control/" if combine_overlap else
+                                                          "dispatch0-combine1-control/" if dispatch_overlap
                                                           else "single-context0-control/") + label))
                 harness.copy_inputs(case)
                 harness.stats.zero_()
@@ -501,6 +527,12 @@ def worker(options, args):
                   "single_combine_context_requested": single_context,
                   "dispatch_overlap_requested": dispatch_overlap,
                   "dispatch_overlap_requested_raw": candidate_environment[DISPATCH_OVERLAP_ENV],
+                  "combine_overlap_requested": combine_overlap,
+                  "combine_overlap_requested_raw": candidate_environment[COMBINE_OVERLAP_ENV],
+                  "combine_overlap_effective_policy_not_device_observation": {
+                      "requires": "remote direct+bulk and per-rank counter storage fit",
+                      "fit_failure": "unchanged full-packet SC1 combine",
+                      "physical_overlap_measured": False},
                   "transport_comparison_axis": comparison_axis,
                   "single_combine_context_effective_by_route": {
                       mode: bool(single_context and mode not in ("all_same_host", "all_masked"))
@@ -517,7 +549,8 @@ def worker(options, args):
                   "bitwise_width0_control_enabled": control_enabled,
                   "bitwise_baseline_control_enabled": control_enabled,
                   "baseline_control_environment": baseline_environment,
-                  "bitwise_dispatch0_combine1_control_enabled": bool(dispatch_overlap and control_enabled),
+                  "bitwise_dispatch0_combine1_control_enabled": bool(dispatch_overlap and not combine_overlap and control_enabled),
+                  "bitwise_combine0_dispatch1_sc1_control_enabled": bool(combine_overlap and control_enabled),
                   "control_uses_identical_context_weights_and_storage": True,
                   "oracle": "canonical_dequantized_FP32_matmul_BF16_SwiGLU_weight_MXFP8_FP32_matmul_BF16_ordered_combine",
                   "tf32": False, "fast_math": False, "heterogeneous_input_sf": True,

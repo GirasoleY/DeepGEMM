@@ -72,6 +72,10 @@
 #define DG_MEGAMOE_GIN_DISPATCH_OVERLAP 0
 #endif
 
+#ifndef DG_MEGAMOE_GIN_COMBINE_OVERLAP
+#define DG_MEGAMOE_GIN_COMBINE_OVERLAP 0
+#endif
+
 // Retired experiment switches must not silently select an unsupported path.
 #if defined(DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE) && DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE != 0
 #error "Expert-wave combine is not part of the clean single-context candidate"
@@ -168,6 +172,17 @@ static_assert(not kMegaMoeGinDispatchOverlap or
                kMegaMoeGinPreconsensusPack),
               "GIN dispatch overlap requires prepacked direct dispatch and "
               "bulk combine");
+static constexpr bool kMegaMoeGinCombineOverlap =
+    DG_MEGAMOE_GIN_COMBINE_OVERLAP != 0;
+static_assert(DG_MEGAMOE_GIN_COMBINE_OVERLAP == 0 or
+              DG_MEGAMOE_GIN_COMBINE_OVERLAP == 1,
+              "Invalid MegaMoE GIN combine-overlap flag");
+static_assert(not kMegaMoeGinCombineOverlap or
+              (kMegaMoeGinDispatchOverlap and
+               kMegaMoeGinSingleCombineContext and
+               kMegaMoeGinDirectDispatch and kMegaMoeGinBulkCombine),
+              "GIN combine overlap requires split direct dispatch and "
+              "single-context bulk combine");
 
 template <
     uint32_t kNumMaxTokensPerRank,
@@ -393,6 +408,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             return ptx::ld_acq(workspace.get_gin_world_active_ptr()) != 0 and
                    ptx::ld_acq(
                        workspace.get_gin_world_bulk_ineligible_ptr()) == 0;
+        }
+        return false;
+    };
+    const auto use_gin_combine_overlap_this_launch = [&]() {
+        if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
+            // Local fit fallback is safe: only this owner's send mechanism
+            // changes. Packet headers, receivers and world collectives do not.
+            return use_gin_bulk_combine_this_launch() and
+                   use_gin_direct_dispatch_this_launch() and
+                   buffer.gin_workspace.combine_overlap_alias_fits(BLOCK_M);
         }
         return false;
     };
@@ -941,6 +966,31 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             use_gin_bulk_combine_this_launch();
         const bool use_gin_direct_dispatch =
             use_gin_direct_dispatch_this_launch();
+        const bool use_gin_combine_overlap =
+            use_gin_combine_overlap_this_launch();
+
+        if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
+#ifdef DG_MEGAMOE_GIN
+            // The tail of GET scale scratch is unused only in direct mode.
+            // Initialize every eligible invocation: a row fallback may have
+            // overwritten it since the last eligible graph replay. The
+            // existing pre-pull grid/handoff publishes this initialization
+            // before any producer can increment a full logical-block count.
+            if (use_gin_combine_overlap and sm_idx == 0 and warp_idx == 0) {
+                constexpr uint32_t kCapacity =
+                    layout::get_mega_moe_gin_combine_overlap_block_capacity(
+                        BLOCK_M);
+                for (uint32_t block = lane_idx; block < kCapacity; block += 32u) {
+                    *buffer.gin_workspace.get_combine_overlap_ready_ptr(
+                        BLOCK_M, block) = 0;
+                    *buffer.gin_workspace.get_combine_overlap_sent_ptr(
+                        BLOCK_M, block) = 0;
+                }
+                __threadfence();
+                __syncwarp();
+            }
+#endif
+        }
 
         if constexpr (kUseGin and kMegaMoeGinDirectDispatch) {
 #ifdef DG_MEGAMOE_GIN
@@ -2213,6 +2263,151 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         DG_GIN_TRACE_IF(lane_idx == 0, 48u + warp_idx);
+        if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
+#ifdef DG_MEGAMOE_GIN
+            // Reuse a dispatch warp only AFTER all its pulls. Producers do
+            // not wait for send credits or reuse these immutable output slabs;
+            // all readiness publications precede their end handoff. Thus the
+            // drainer may wait here without creating a producer/handoff cycle.
+            if (use_gin_combine_overlap and sm_idx == 0 and warp_idx == 0) {
+                constexpr uint32_t kNumL2Fragments = L2_SHAPE_N / BLOCK_N;
+                constexpr uint32_t kCapacity =
+                    layout::get_mega_moe_gin_combine_overlap_block_capacity(
+                        BLOCK_M);
+                const uint32_t total_blocks =
+                    scheduler.get_num_total_pool_blocks();
+                DG_DEVICE_ASSERT(total_blocks <= kCapacity);
+                const uint32_t lsa_size =
+                    static_cast<uint32_t>(gin_transport.dev_comm.lsaSize);
+                DG_DEVICE_ASSERT(lsa_size == 8u);
+                const uint32_t remote_base =
+                    (1u - sym_buffer.rank_idx / lsa_size) * lsa_size;
+                const uint32_t owner_lane = sym_buffer.rank_idx % lsa_size;
+                const bool peer_lane = lane_idx < lsa_size;
+                const uint32_t peer = remote_base + lane_idx;
+                uint32_t claimed_blocks = 0;
+                uint32_t sent_records = 0;
+                uint32_t pending_begin = 0, pending_count = 0;
+
+                const auto issue_pending_span = [&]() {
+                    if (peer_lane and pending_count != 0) {
+                        DG_DEVICE_ASSERT(pending_begin + pending_count <=
+                            layout::kMegaMoeGinBulkCombineMaxTokens * kNumTopk);
+                        comm::mega_moe_gin_put_bulk_combine_span(
+                            gin_transport, peer, /*context_stripe=*/ 0u,
+                            sym_buffer.get_base_ptr(),
+                            buffer.gin_workspace.get_bulk_combine_record_ptr(
+                                /*send=*/ true, lane_idx, pending_begin),
+                            buffer.gin_workspace.get_bulk_combine_record_ptr(
+                                /*send=*/ false, owner_lane, pending_begin),
+                            pending_count * buffer.gin_workspace.bulk_record_bytes,
+                            /*diagnostic_peer_lane=*/ lane_idx);
+                        sent_records += pending_count;
+                        pending_count = 0;
+                    }
+                    __syncwarp();
+                };
+
+                while (claimed_blocks < total_blocks) {
+                    uint32_t pool_offset = 0;
+                    // Scan all experts/blocks for readiness, never wait on an
+                    // unfinished lower-numbered block. Scheduler queries must
+                    // remain warp-converged: their counts are lane-distributed.
+                    for (uint32_t expert = 0; expert < kNumExpertsPerRank; ++expert) {
+                        const uint32_t tokens = scheduler.get_num_tokens(expert);
+                        const uint32_t blocks = math::ceil_div(tokens, BLOCK_M);
+                        for (uint32_t block = 0; block < blocks; ++block) {
+                            const uint32_t logical_block = pool_offset + block;
+                            uint32_t already_claimed = 0;
+                            if (lane_idx == 0)
+                                already_claimed = *buffer.gin_workspace
+                                    .get_combine_overlap_sent_ptr(
+                                        BLOCK_M, logical_block);
+                            already_claimed = __shfl_sync(
+                                0xffffffffu, already_claimed, 0);
+                            if (already_claimed != 0)
+                                continue;
+
+                            // Every issuing lane performs its own acquire.
+                            // The final release-RMW sequence covers all N
+                            // fragments and their producer barriers/stores.
+                            const uint32_t ready =
+                                comm::mega_moe_gin_combine_ready_acquire(
+                                    buffer.gin_workspace
+                                        .get_combine_overlap_ready_ptr(
+                                            BLOCK_M, logical_block));
+                            DG_DEVICE_ASSERT(ready <= kNumL2Fragments);
+                            if (not __all_sync(0xffffffffu,
+                                              ready == kNumL2Fragments))
+                                continue;
+
+                            const uint32_t valid_m =
+                                cute::min(tokens - block * BLOCK_M, BLOCK_M);
+                            uint32_t span_begin = 0, span_count = 0;
+                            if (peer_lane) {
+                                for (uint32_t row = 0; row < valid_m; ++row) {
+                                    const uint32_t pool_token =
+                                        logical_block * BLOCK_M + row;
+                                    const auto metadata =
+                                        *workspace.get_token_src_metadata_ptr(pool_token);
+                                    // Local rows have no bulk return index.
+                                    if (metadata.rank_idx != peer)
+                                        continue;
+                                    const uint32_t index = *buffer.gin_workspace
+                                        .get_bulk_combine_return_index_ptr(pool_token);
+                                    if (span_count == 0)
+                                        span_begin = index;
+                                    DG_DEVICE_ASSERT(index == span_begin + span_count);
+                                    ++span_count;
+                                }
+                            }
+
+                            // Coalesce only adjacent, entirely ready records.
+                            // Skipping an unready block cannot introduce a
+                            // hole because its record indices break adjacency.
+                            const bool disjoint = peer_lane and span_count != 0 and
+                                pending_count != 0 and
+                                span_begin != pending_begin + pending_count;
+                            if (__any_sync(0xffffffffu, disjoint))
+                                issue_pending_span();
+                            if (peer_lane and span_count != 0) {
+                                if (pending_count == 0)
+                                    pending_begin = span_begin;
+                                pending_count += span_count;
+                            }
+                            if (lane_idx == 0)
+                                *buffer.gin_workspace.get_combine_overlap_sent_ptr(
+                                    BLOCK_M, logical_block) = 1;
+                            ++claimed_blocks;
+                            __syncwarp();
+                        }
+                        pool_offset += blocks;
+                    }
+                    DG_DEVICE_ASSERT(pool_offset == total_blocks);
+                    // Do not hold a ready span waiting for a future block.
+                    // This submits each claimed record before the next scan;
+                    // default PUTs also keep SQ credits/doorbells progressing.
+                    issue_pending_span();
+                }
+
+                if (peer_lane) {
+                    uint32_t expected_records = 0;
+                    for (uint32_t expert = 0; expert < kNumExpertsPerRank; ++expert)
+                        expected_records += static_cast<uint32_t>(
+                            *workspace.get_expert_recv_count_ptr(peer, expert));
+                    DG_DEVICE_ASSERT(sent_records == expected_records);
+                    if (sent_records != 0) {
+                        ncclGinRequest_t request{};
+                        comm::mega_moe_gin_flush_data_peer_async(
+                            gin_transport, peer, /*context_stripe=*/ 0u, &request);
+                        comm::mega_moe_gin_wait_data_peer(
+                            gin_transport, /*context_stripe=*/ 0u, request);
+                    }
+                }
+                __syncwarp();
+            }
+#endif
+        }
         if constexpr (kUseGin and kMegaMoeGinDispatchOverlap) {
 #ifdef DG_MEGAMOE_GIN
             // All eight peer chains were posted before the count rendezvous.
@@ -2944,6 +3139,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         const bool use_gin_bulk_combine =
             use_gin_bulk_combine_this_launch();
 
+        const bool use_gin_combine_overlap =
+            use_gin_combine_overlap_this_launch();
+
         // Persistently schedule over blocks
         uint32_t current_iter_idx = 0;
         task_info_t task_info;
@@ -3366,7 +3564,27 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
 
                 // Ensure the next epilogue safe to use shared memory
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
+#ifdef DG_MEGAMOE_GIN
+                    if (use_gin_combine_overlap and not task_info.is_shared()) {
+                        // Same named barrier/count as the original epilogue,
+                        // now with explicit compiler ordering for publication.
+                        comm::mega_moe_gin_combine_producer_barrier(
+                            kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                        DG_DEVICE_ASSERT(pool_block_idx <
+                            layout::get_mega_moe_gin_combine_overlap_block_capacity(
+                                BLOCK_M));
+                        if (epilogue_warp_idx == 0 and lane_idx == 0)
+                            comm::mega_moe_gin_combine_ready_release(
+                                buffer.gin_workspace.get_combine_overlap_ready_ptr(
+                                    BLOCK_M, pool_block_idx));
+                    } else {
+                        ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    }
+#endif
+                } else {
+                    ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
 
 #if DG_MEGAMOE_GIN_DIAGNOSTICS >= 2
                 // One writer per (logical SM, expert). Sampling the first and
@@ -3484,13 +3702,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     layout::kMegaMoeGinBulkCombineHeaderBytes +
                                     route_count *
                                         buffer.gin_workspace.bulk_record_bytes;
-                                comm::mega_moe_gin_put_bulk_combine_packet(
-                                    gin_transport, remote_source,
-                                    /*context_stripe=*/
-                                        use_single_combine_context ? 0u : lane_idx,
-                                    sym_buffer.get_base_ptr(), local_packet,
-                                    remote_packet, packet_bytes,
-                                    /*diagnostic_peer_lane=*/ lane_idx);
+                                if (use_gin_combine_overlap) {
+                                    // Records were already sent by dispatch.
+                                    // Retain late count publication to avoid a
+                                    // race with the receiver's startup clear.
+                                    comm::mega_moe_gin_put_bulk_combine_header(
+                                        gin_transport, remote_source,
+                                        /*context_stripe=*/ 0u,
+                                        sym_buffer.get_base_ptr(), local_packet,
+                                        remote_packet,
+                                        /*diagnostic_peer_lane=*/ lane_idx);
+                                } else {
+                                    comm::mega_moe_gin_put_bulk_combine_packet(
+                                        gin_transport, remote_source,
+                                        /*context_stripe=*/
+                                            use_single_combine_context ? 0u : lane_idx,
+                                        sym_buffer.get_base_ptr(), local_packet,
+                                        remote_packet, packet_bytes,
+                                        /*diagnostic_peer_lane=*/ lane_idx);
+                                }
                             }
                         }
                         __syncwarp();

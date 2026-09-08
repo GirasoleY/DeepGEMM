@@ -104,6 +104,10 @@ def summarize_sample(sample: dict[str, Any]) -> dict[str, Any]:
         "epilogue_work_span_us": span((52,), (53,)),
         "tmem_free_to_combine_issue_us": span((54,), range(64, 72), "max", "min"),
         "combine_issue_to_last_flush_us": span(range(64, 72), range(80, 88)),
+        # Positive means first issue was observed before the final epilogue
+        # loop-exit marker on THIS GPU. Neither endpoint measures NIC activity
+        # or actual MMA completion; keep the signed value, including negatives.
+        "first_combine_issue_to_last_epilogue_loop_exit_signed_us": span(range(64, 72), (53,)),
         "combine_barrier_span_us": span((56,), (57,)),
         "combine_grid2_to_scatter_done_us": span((58,), range(112, 120)),
         "reduction_through_last_tma_issue_us": span(range(120, 128), range(88, 96)),
@@ -120,7 +124,12 @@ def summarize_sample(sample: dict[str, Any]) -> dict[str, Any]:
         )
     return {"rank": sample["rank"], "replay": sample["replay"],
             "phase_windows_from_local_entry_us": phases,
-            "expert_epilogue_observations": experts, "metrics_us": metrics}
+            "expert_epilogue_observations": experts, "metrics_us": metrics,
+            "first_combine_issue_before_last_epilogue_loop_exit": (
+                metrics["first_combine_issue_to_last_epilogue_loop_exit_signed_us"] > 0
+                if metrics["first_combine_issue_to_last_epilogue_loop_exit_signed_us"] is not None
+                else None
+            )}
 
 
 def summarize_capture(capture: dict[str, Any]) -> dict[str, Any]:
@@ -130,6 +139,20 @@ def summarize_capture(capture: dict[str, Any]) -> dict[str, Any]:
         metric_names = sorted({name for sample in samples for name in sample["metrics_us"]})
         routes[route] = {
             "samples": samples,
+            "combine_issue_epilogue_observation_counts": {
+                "samples_with_both_marker_families": sum(
+                    sample["first_combine_issue_before_last_epilogue_loop_exit"] is not None
+                    for sample in samples),
+                "issue_before_last_epilogue_loop_exit": sum(
+                    sample["first_combine_issue_before_last_epilogue_loop_exit"] is True
+                    for sample in samples),
+                "issue_at_or_after_last_epilogue_loop_exit": sum(
+                    sample["first_combine_issue_before_last_epilogue_loop_exit"] is False
+                    for sample in samples),
+                "samples_missing_a_marker_family": sum(
+                    sample["first_combine_issue_before_last_epilogue_loop_exit"] is None
+                    for sample in samples),
+            },
             "same_gpu_interval_distribution_us": {
                 name: describe([sample["metrics_us"][name] for sample in samples
                                 if sample["metrics_us"].get(name) is not None])
@@ -147,6 +170,9 @@ def summarize_capture(capture: dict[str, Any]) -> dict[str, Any]:
             "Intervals can overlap and must not be added as a serial breakdown.",
             "Slot62-to63 is an observed dispatch cleanup-region span, not isolated cleanup-barrier cost: recorded slot62 can precede combine issue/fencing on the same SM.",
             "Ready observations include polling order; they are not NIC arrival timestamps.",
+            "With dispatch_overlap=1 slots32–39 observe control readiness, not payload readiness; slots24–31 are late sender flushes, not receiver payload timestamps.",
+            "The signed first-combine-issue to last-epilogue-loop-exit interval is positive when issue was observed first on that GPU; it is an issue/remaining-epilogue observation, not physical IB or MMA overlap proof.",
+            "With combine_overlap=1 first issue is retained in slots64–71, while slots72–79 include late headers and slots80–87 report header flush. Do not infer last-payload timing from either late observation.",
             "Expert production completion uses max(last L2 epilogue fragment marker) over participating SMs; it is not a NIC visibility proof.",
             "Reduction end marks loop exit/last TMA store issue, not asynchronous store completion.",
             "Level 1 omits per-expert readiness; level 2 includes its instrumentation cost.",

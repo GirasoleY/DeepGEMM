@@ -910,9 +910,25 @@ def dispatch_candidate_metadata(flags):
     if raw not in ("0", "1"):
         raise ValueError("dispatch overlap metadata requires a canonical0/1 flag")
     enabled = raw == "1"
+    combine_raw = flags.get("DG_MEGAMOE_GIN_COMBINE_OVERLAP", "0")
+    if combine_raw not in ("0", "1"):
+        raise ValueError("combine overlap metadata requires a canonical0/1 flag")
+    combine_enabled = combine_raw == "1"
+    if combine_enabled and (not enabled or flags.get("DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT") != "1"):
+        raise ValueError("combine overlap metadata requires dispatch overlap1 and single context1")
     return {
-        "candidate_family": ("direct_control_first_dispatch" if enabled else
+        "candidate_family": ("direct_control_first_dispatch_completed_block_combine" if combine_enabled else
+                             "direct_control_first_dispatch" if enabled else
                              "clean_single_combine_context_only"),
+        "combine_overlap_contract": {
+            "requested_raw": combine_raw, "requested": combine_enabled,
+            "early_payload_policy": "all N producers complete a logical M block; exact per-peer spans",
+            "eligibility": "remote direct+bulk and per-rank counter storage fit",
+            "fit_failure": "unchanged full-packet SC1 combine",
+            "count_headers_and_final_put_barrier": "late, unchanged completion scope",
+            "compute_hints_tiling_sm_count_and_math_changed": False,
+            "basis": "selected flag and source policy, not device branch or physical-overlap measurement",
+        },
         "dispatch_overlap_contract": {
             "requested_raw": raw,
             "requested": enabled,
@@ -945,6 +961,7 @@ def main():
             "DG_MEGAMOE_GIN_PRECONSENSUS_PACK",
             "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT",
             "DG_MEGAMOE_GIN_DISPATCH_OVERLAP",
+            "DG_MEGAMOE_GIN_COMBINE_OVERLAP",
         )}
         rank_flags = [None] * dist.get_world_size()
         dist.all_gather_object(rank_flags, flags)

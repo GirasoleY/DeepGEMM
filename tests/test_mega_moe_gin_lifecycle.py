@@ -110,6 +110,7 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
         mock.patch.dict(os.environ, {
             'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '0',
             'DG_MEGAMOE_GIN_DISPATCH_OVERLAP': '0',
+            'DG_MEGAMOE_GIN_COMBINE_OVERLAP': '0',
             'DG_MEGAMOE_GIN_PRECONSENSUS_PACK': '0',
             'DG_MEGAMOE_GIN_COOP_DIRECT_PACK': '0',
             'DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE': '0',
@@ -589,6 +590,73 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
                 get_uid.assert_not_called()
                 create.assert_not_called()
                 broadcast.assert_not_called()
+
+    def test_combine_overlap_rank_skew_and_malformed_values_fail_before_uid(self):
+        for raw, skewed in (("0", True), ("1", True), ("", False), ("01", False),
+                            ("2", False), ("true", False), (" 1", False), ("1suffix", False)):
+            with self.subTest(raw=raw, skewed=skewed), mock.patch.dict(os.environ, {
+                    'DG_MEGAMOE_GIN_COMBINE_OVERLAP': raw,
+                    'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '1',
+                    'DG_MEGAMOE_GIN_DISPATCH_OVERLAP': '1',
+                    'DG_MEGAMOE_GIN_PRECONSENSUS_PACK': '1',
+                    'DG_MEGAMOE_GIN_COOP_DIRECT_PACK': '1'}), mock.patch.object(
+                    mega._C, 'megamoe_gin_build_info', return_value={'enabled': True}), mock.patch.object(
+                    mega._C, 'get_megamoe_gin_unique_id') as get_uid, mock.patch.object(
+                    mega._C, 'create_megamoe_gin_context') as create:
+                symm_buffer = _uninitialized_symm_buffer()
+                symm_buffer.gin_active_fast_path = symm_buffer.gin_bulk_combine = True
+                symm_buffer.gin_direct_dispatch = True
+                symm_buffer.gin_outbox_depth = 64
+                def gather(output, local, group):
+                    _mirror_all_gather_object(output, local, group)
+                    if skewed:
+                        output[7]['combine_overlap'] = '0' if raw == '1' else '1'
+                self.all_gather_object.side_effect = gather
+                self.all_gather_object.reset_mock()
+                expected = 'configuration mismatch across ranks' if skewed else 'COMBINE_OVERLAP must be exactly 0 or 1'
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    symm_buffer.enable_gin()
+                self.all_gather_object.assert_called_once()
+                self.assertEqual(self.all_gather_object.call_args.args[1]['combine_overlap'], raw)
+                get_uid.assert_not_called()
+                create.assert_not_called()
+
+    def test_combine_overlap_each_dependency_is_collectively_rejected(self):
+        for missing in ('single_combine_context', 'dispatch_overlap', 'bulk_combine', 'direct_dispatch'):
+            env = {'DG_MEGAMOE_GIN_COMBINE_OVERLAP': '1',
+                   'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '1',
+                   'DG_MEGAMOE_GIN_DISPATCH_OVERLAP': '1',
+                   'DG_MEGAMOE_GIN_PRECONSENSUS_PACK': '1',
+                   'DG_MEGAMOE_GIN_COOP_DIRECT_PACK': '1'}
+            if missing in ('single_combine_context', 'dispatch_overlap'):
+                env['DG_MEGAMOE_GIN_' + missing.upper()] = '0'
+            with self.subTest(missing=missing), mock.patch.dict(os.environ, env), mock.patch.object(
+                    mega._C, 'get_megamoe_gin_unique_id') as get_uid:
+                symm_buffer = _uninitialized_symm_buffer()
+                symm_buffer.gin_active_fast_path = True
+                symm_buffer.gin_bulk_combine = missing != 'bulk_combine'
+                symm_buffer.gin_direct_dispatch = missing != 'direct_dispatch'
+                symm_buffer.gin_outbox_depth = 64
+                self.all_gather_object.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, 'combine_overlap requires'):
+                    symm_buffer._collective_validate_gin_config({'enabled': True}, 9, 64, 4, 8, 'gdaki')
+                self.all_gather_object.assert_called_once()
+                get_uid.assert_not_called()
+
+    def test_combine_overlap_valid_mode_uses_existing_pre_uid_collective(self):
+        with mock.patch.dict(os.environ, {
+                'DG_MEGAMOE_GIN_COMBINE_OVERLAP': '1',
+                'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '1',
+                'DG_MEGAMOE_GIN_DISPATCH_OVERLAP': '1',
+                'DG_MEGAMOE_GIN_PRECONSENSUS_PACK': '1',
+                'DG_MEGAMOE_GIN_COOP_DIRECT_PACK': '1'}):
+            symm_buffer = _uninitialized_symm_buffer()
+            symm_buffer.gin_active_fast_path = symm_buffer.gin_bulk_combine = True
+            symm_buffer.gin_direct_dispatch = True
+            symm_buffer.gin_outbox_depth = 64
+            symm_buffer._collective_validate_gin_config({'enabled': True}, 9, 64, 4, 8, 'gdaki')
+        self.all_gather_object.assert_called_once()
+        self.assertEqual(self.all_gather_object.call_args.args[1]['combine_overlap'], '1')
 
     def test_dispatch_overlap_invalid_raw_values_fail_collectively_before_uid(self):
         for raw in ('', 'true', '01', '2', '-1', ' 1', '1 ', '1suffix'):

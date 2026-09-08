@@ -63,6 +63,24 @@ static constexpr uint32_t kMegaMoeGinDirectDispatchStorageBytes =
     2 * kMegaMoeGinDirectDispatchNumPeers *
     kMegaMoeGinDirectDispatchPacketBytes;
 
+// The optional completed-block combine path aliases only the otherwise-unused
+// tail of the direct-dispatch scale scratch. Derive the bound from the actual
+// specialization, not from balanced expert counts or reusable ring slots.
+CUTLASS_HOST_DEVICE constexpr uint32_t
+get_mega_moe_gin_combine_overlap_block_capacity(const uint32_t block_m) {
+    return block_m == 0 ? 0u :
+        (16u * kMegaMoeGinBulkCombineMaxTokens * 16u + block_m - 1u) /
+            block_m + kMegaMoeGinDirectDispatchExpertsPerRank - 1u;
+}
+
+CUTLASS_HOST_DEVICE constexpr uint64_t
+get_mega_moe_gin_combine_overlap_scratch_bytes(const uint32_t block_m) {
+    // Independent ready-count and sent-state uint32 arrays, one entry per
+    // complete logical M-block. No legacy allocation or offset changes.
+    return 2ull * sizeof(uint32_t) *
+        get_mega_moe_gin_combine_overlap_block_capacity(block_m);
+}
+
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
 CUTLASS_HOST_DEVICE constexpr T get_num_max_pool_tokens(T num_ranks, T num_max_tokens_per_rank, T num_topk,
@@ -628,6 +646,33 @@ struct MegaMoeGinWorkspace {
     bool direct_dispatch_alias_fits() const {
         return scale_scratch_buffer.get_num_bytes() >=
                kMegaMoeGinDirectDispatchStorageBytes;
+    }
+
+    CUTLASS_HOST_DEVICE
+    bool combine_overlap_alias_fits(const uint32_t block_m) const {
+        return block_m >= static_cast<uint32_t>(kMinCandidateBlockM) and
+               block_m <= static_cast<uint32_t>(kMaxCandidateBlockM) and
+               scale_scratch_buffer.get_num_bytes() >=
+                   kMegaMoeGinDirectDispatchStorageBytes +
+                       get_mega_moe_gin_combine_overlap_scratch_bytes(block_m);
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_combine_overlap_ready_ptr(
+            const uint32_t block_m, const uint32_t logical_block) const {
+        DG_UNIFIED_ASSERT(combine_overlap_alias_fits(block_m));
+        DG_UNIFIED_ASSERT(logical_block <
+            get_mega_moe_gin_combine_overlap_block_capacity(block_m));
+        return static_cast<uint32_t*>(math::advance_ptr(
+            scale_scratch_buffer.base,
+            kMegaMoeGinDirectDispatchStorageBytes)) + logical_block;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_combine_overlap_sent_ptr(
+            const uint32_t block_m, const uint32_t logical_block) const {
+        return get_combine_overlap_ready_ptr(block_m, logical_block) +
+            get_mega_moe_gin_combine_overlap_block_capacity(block_m);
     }
 
     CUTLASS_HOST_DEVICE
