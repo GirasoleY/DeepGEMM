@@ -88,4 +88,61 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
         grid_sync<kNumSMs, kGridSyncIndex>(workspace, sm_idx, thread_idx, sync_scope);
 }
 
+// Benchmark-only equivalent of nvlink_barrier for one contiguous NVLink-local
+// scale-up-domain team inside a larger world.  Cross-LSA symmetric-memory
+// aliases are intentionally null in the GIN setup, so a world-sized NVLink
+// barrier cannot be used to establish the all-same-host control floor.
+template <uint32_t kNumRanks, uint32_t kLsaSize,
+          uint32_t kNumSMs, uint32_t kNumThreads,
+          uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
+CUTLASS_DEVICE void nvlink_lsa_barrier(
+        const layout::Workspace& workspace,
+        const layout::SymBuffer<kNumRanks>& sym_buffer,
+        const uint32_t& sm_idx, const uint32_t& thread_idx,
+        const sync_scope_t& sync_scope,
+        const bool& sync_prologue = true,
+        const bool& sync_epilogue = true) {
+    DG_STATIC_ASSERT(kNumRanks % kLsaSize == 0, "Invalid LSA partition");
+    DG_STATIC_ASSERT(kLsaSize <= kNumThreads, "Insufficient threads");
+
+    if (sync_prologue)
+        grid_sync<kNumSMs, kGridSyncIndex>(
+            workspace, sm_idx, thread_idx, sync_scope);
+
+    if (sm_idx == 0) {
+        auto* counter_ptr = workspace.get_nvl_barrier_counter_ptr();
+        const auto status = (*counter_ptr) & 3;
+        const auto signal_phase = status & 1, signal_sign = status >> 1;
+        auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
+        const uint32_t lsa_base =
+            (sym_buffer.rank_idx / kLsaSize) * kLsaSize;
+
+        if (thread_idx < kLsaSize) {
+            const uint32_t peer = lsa_base + thread_idx;
+            ptx::red_add_rel_sys(
+                sym_buffer.map(signal_ptr, peer), signal_sign ? -1 : 1);
+        }
+        sync_scope();
+
+        if (thread_idx == 0) {
+            ptx::red_add(counter_ptr, 1);
+            const int target = signal_sign ? 0 : static_cast<int>(kLsaSize);
+            const auto start_clock = clock64();
+            while (ptx::ld_acq_sys(signal_ptr) != target) {
+                if (clock64() - start_clock >= kNumTimeoutCycles) {
+                    printf("DeepGEMM NVLink LSA barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                           sym_buffer.rank_idx, *counter_ptr,
+                           ptx::ld_acq_sys(signal_ptr), target, signal_phase,
+                           signal_sign, kTag);
+                    DG_DEVICE_ASSERT(false and "NVLink LSA barrier timeout");
+                }
+            }
+        }
+    }
+
+    if (sync_epilogue)
+        grid_sync<kNumSMs, kGridSyncIndex>(
+            workspace, sm_idx, thread_idx, sync_scope);
+}
+
 } // namespace deep_gemm::comm

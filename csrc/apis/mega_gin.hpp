@@ -25,8 +25,9 @@ namespace py = pybind11;
 static constexpr int kRequiredNcclVersion = 23007;
 static constexpr int kDefaultContextCount = 9;
 static constexpr int kDefaultQueueDepth = 64;
-static constexpr int kDefaultWorldBarrierCount = 3;
+static constexpr int kDefaultWorldBarrierCount = 4;
 static constexpr int kDefaultExpectedLsaSize = 8;
+static constexpr int kRequiredSignalCount = 2;
 
 static std::runtime_error unsupported(const std::string& reason, const std::string& detail) {
     return std::runtime_error(
@@ -194,12 +195,17 @@ public:
         const std::string& required_gin_type,
         const uint32_t completion_batch,
         const uint32_t combine_chunk_bytes,
-        const uint32_t outbox_depth) {
+        const uint32_t outbox_depth,
+        const uint32_t combine_issue_wave,
+        const bool active_fast_path,
+        const bool bulk_combine,
+        const bool direct_dispatch) {
         auto context = std::shared_ptr<MegaMoeGinContext>(new MegaMoeGinContext(
             buffer, unique_id_bytes, rank, world_size, context_count,
             queue_depth, world_barrier_count, expected_lsa_size,
             required_gin_type, completion_batch, combine_chunk_bytes,
-            outbox_depth));
+            outbox_depth, combine_issue_wave, active_fast_path,
+            bulk_combine, direct_dispatch));
         context->initialize();
         register_megamoe_gin_context(context->buffer_data_ptr(), context);
         return context;
@@ -280,6 +286,11 @@ public:
     int context_count() const { return actual_context_count_; }
     int requested_context_count() const { return context_count_; }
     int connection_count() const { return connection_count_; }
+    int requested_signal_count() const { return kRequiredSignalCount; }
+    int signal_count() const { return actual_signal_count_; }
+    bool active_fast_path() const { return active_fast_path_; }
+    bool bulk_combine() const { return bulk_combine_; }
+    bool direct_dispatch() const { return direct_dispatch_; }
     int queue_depth() const { return queue_depth_; }
     int world_barrier_count() const { return world_barrier_count_; }
     int gin_type() const { return static_cast<int>(gin_type_); }
@@ -302,18 +313,46 @@ public:
     comm::MegaMoeGinTransport launch_descriptor() const {
         return comm::MegaMoeGinTransport{
             dev_comm(), window(), 1, completion_batch_,
-            combine_chunk_bytes_, outbox_depth_};
+            combine_chunk_bytes_, outbox_depth_, combine_issue_wave_,
+            active_fast_path_ ? 1u : 0u,
+            bulk_combine_ ? 1u : 0u,
+            direct_dispatch_ ? 1u : 0u,
+            diagnostic_buffer_.defined() ?
+                reinterpret_cast<uint64_t*>(diagnostic_buffer_.data_ptr<int64_t>()) : nullptr,
+            diagnostic_buffer_.defined() ?
+                static_cast<uint32_t>(diagnostic_buffer_.size(0)) : 0u};
+    }
+
+    // Attach once, before graph capture. Owning the tensor here keeps captured
+    // launch pointers valid for the context lifetime; replacement is forbidden.
+    void set_diagnostic_buffer(const torch::Tensor& diagnostic_buffer) {
+        if (not active())
+            throw std::runtime_error("Cannot attach diagnostics to an inactive GIN context");
+        if (diagnostic_buffer_.defined())
+            throw std::runtime_error("GIN diagnostic buffer is immutable once attached");
+        if (not diagnostic_buffer.is_cuda() or
+            diagnostic_buffer.device() != buffer_.device() or
+            diagnostic_buffer.scalar_type() != torch::kInt64 or
+            not diagnostic_buffer.is_contiguous() or
+            diagnostic_buffer.dim() != 2 or diagnostic_buffer.size(0) <= 0 or
+            diagnostic_buffer.size(1) != comm::kMegaMoeGinDiagnosticColumns)
+            throw std::invalid_argument(
+                "GIN diagnostic buffer must be contiguous CUDA int64 [num_sms,240] on the buffer device");
+        diagnostic_buffer_ = diagnostic_buffer;
     }
 
     comm::MegaMoeGinTransport launch_descriptor(
         const uint32_t completion_batch,
         const uint32_t combine_chunk_bytes,
-        const uint32_t outbox_depth) const {
+        const uint32_t outbox_depth,
+        const uint32_t combine_issue_wave) const {
         validate_launch_tuning(
-            completion_batch, combine_chunk_bytes, outbox_depth);
+            completion_batch, combine_chunk_bytes, outbox_depth,
+            combine_issue_wave);
         if (completion_batch != completion_batch_ ||
             combine_chunk_bytes != combine_chunk_bytes_ ||
-            outbox_depth != outbox_depth_)
+            outbox_depth != outbox_depth_ ||
+            combine_issue_wave != combine_issue_wave_)
             throw std::invalid_argument(
                 "MegaMoE GIN launch tuning differs from the registered context/layout tuning");
         return launch_descriptor();
@@ -335,17 +374,23 @@ public:
         result["context_count"] = actual_context_count_;
         result["requested_context_count"] = context_count_;
         result["connection_count"] = connection_count_;
+        result["requested_signal_count"] = kRequiredSignalCount;
+        result["signal_count"] = actual_signal_count_;
         result["queue_depth"] = queue_depth_;
         result["world_barrier_count"] = world_barrier_count_;
         result["enabled"] = descriptor.enabled;
         result["completion_batch"] = descriptor.completion_batch;
         result["combine_chunk_bytes"] = descriptor.combine_chunk_bytes;
         result["outbox_depth"] = descriptor.outbox_depth;
+        result["combine_issue_wave"] = descriptor.combine_issue_wave;
+        result["active_fast_path"] = descriptor.active_fast_path != 0;
+        result["bulk_combine"] = descriptor.bulk_combine != 0;
+        result["direct_dispatch"] = descriptor.direct_dispatch != 0;
         return result;
     }
 
 private:
-    static constexpr int kCapabilityFields = 12;
+    static constexpr int kCapabilityFields = 16;
 
     MegaMoeGinContext(
         torch::Tensor buffer,
@@ -359,7 +404,11 @@ private:
         const std::string& required_gin_type,
         const uint32_t completion_batch,
         const uint32_t combine_chunk_bytes,
-        const uint32_t outbox_depth)
+        const uint32_t outbox_depth,
+        const uint32_t combine_issue_wave,
+        const bool active_fast_path,
+        const bool bulk_combine,
+        const bool direct_dispatch)
         : buffer_(std::move(buffer)), unique_id_bytes_(std::move(unique_id_bytes)),
           rank_(rank), world_size_(world_size), context_count_(context_count),
           queue_depth_(queue_depth), world_barrier_count_(world_barrier_count),
@@ -367,7 +416,11 @@ private:
           required_gin_type_(parse_required_gin_type(required_gin_type)),
           completion_batch_(completion_batch),
           combine_chunk_bytes_(combine_chunk_bytes),
-          outbox_depth_(outbox_depth) {
+          outbox_depth_(outbox_depth),
+          combine_issue_wave_(combine_issue_wave),
+          active_fast_path_(active_fast_path),
+          bulk_combine_(bulk_combine),
+          direct_dispatch_(direct_dispatch) {
         validate_arguments();
         buffer_data_ptr_ = buffer_.data_ptr();
         buffer_bytes_ = buffer_.nbytes();
@@ -396,16 +449,26 @@ private:
         if (context_count_ < kDefaultContextCount)
             throw std::invalid_argument(
                 "MegaMoE GIN requires at least 9 contexts (control + 8 data)");
-        if (queue_depth_ < 0)
-            throw std::invalid_argument("MegaMoE GIN queue_depth must be non-negative");
+        if (queue_depth_ < 64)
+            throw std::invalid_argument(
+                "MegaMoE GIN queue_depth must be at least 64");
         if (world_barrier_count_ < kDefaultWorldBarrierCount)
             throw std::invalid_argument(
-                "MegaMoE GIN requires at least 3 world/hybrid barrier slots");
+                "MegaMoE GIN requires at least 4 world/hybrid barrier slots");
         if (expected_lsa_size_ != kDefaultExpectedLsaSize)
             throw std::invalid_argument(
                 "initial MegaMoE GIN target requires expected_lsa_size == 8");
         validate_launch_tuning(
-            completion_batch_, combine_chunk_bytes_, outbox_depth_);
+            completion_batch_, combine_chunk_bytes_, outbox_depth_,
+            combine_issue_wave_);
+        if (bulk_combine_ && !active_fast_path_)
+            throw std::invalid_argument(
+                "MegaMoE GIN bulk_combine requires active_fast_path for "
+                "world-uniform runtime eligibility consensus");
+        if (direct_dispatch_ && !active_fast_path_)
+            throw std::invalid_argument(
+                "MegaMoE GIN direct_dispatch requires active_fast_path for "
+                "world-uniform runtime eligibility consensus");
 
         int current_device = -1;
         check_cuda(cudaGetDevice(&current_device), "cudaGetDevice");
@@ -421,7 +484,8 @@ private:
     static void validate_launch_tuning(
         const uint32_t completion_batch,
         const uint32_t combine_chunk_bytes,
-        const uint32_t outbox_depth) {
+        const uint32_t outbox_depth,
+        const uint32_t combine_issue_wave) {
         if (completion_batch != 1 && completion_batch != 2 &&
             completion_batch != 4 && completion_batch != 8)
             throw std::invalid_argument(
@@ -430,9 +494,14 @@ private:
             combine_chunk_bytes != 3584 && combine_chunk_bytes != 7168)
             throw std::invalid_argument(
                 "MegaMoE GIN combine_chunk_bytes must be one of 256, 1792, 3584, 7168");
-        if (outbox_depth != 4 && outbox_depth != 8 && outbox_depth != 16)
+        if (outbox_depth != 4 && outbox_depth != 8 &&
+            outbox_depth != 16 && outbox_depth != 64)
             throw std::invalid_argument(
-                "MegaMoE GIN outbox_depth must be one of 4, 8, 16");
+                "MegaMoE GIN outbox_depth must be one of 4, 8, 16, 64");
+        if (combine_issue_wave != 1 && combine_issue_wave != 2 &&
+            combine_issue_wave != 4 && combine_issue_wave != 8)
+            throw std::invalid_argument(
+                "MegaMoE GIN combine_issue_wave must be one of 1, 2, 4, 8");
     }
 
     void initialize() {
@@ -478,6 +547,10 @@ private:
                 comm_device,
                 static_cast<int>(buffer_.nbytes() & 0x7fffffff),
                 static_cast<int>((static_cast<uint64_t>(buffer_.nbytes()) >> 31) & 0x7fffffff),
+                kRequiredSignalCount,
+                active_fast_path_ ? 1 : 0,
+                bulk_combine_ ? 1 : 0,
+                direct_dispatch_ ? 1 : 0,
             };
             const auto gathered = allgather(local);
             validate_capabilities(gathered);
@@ -491,7 +564,7 @@ private:
                 NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
             requirements.ginForceEnable = true;
             requirements.ginContextCount = context_count_;
-            requirements.ginSignalCount = 0;
+            requirements.ginSignalCount = kRequiredSignalCount;
             requirements.ginCounterCount = 0;
             requirements.ginConnectionType = NCCL_GIN_CONNECTION_FULL;
             requirements.ginExclusiveContexts = true;
@@ -505,6 +578,7 @@ private:
             lsa_size_ = dev_comm_.lsaSize;
             actual_context_count_ = static_cast<int>(dev_comm_.ginContextCount);
             connection_count_ = static_cast<int>(dev_comm_.ginConnectionCount);
+            actual_signal_count_ = static_cast<int>(dev_comm_.ginSignalCount);
 
             std::array<int, kCapabilityFields> resources = {
                 dev_comm_.rank,
@@ -519,6 +593,10 @@ private:
                 world_size_,
                 context_count_,
                 world_barrier_count_,
+                actual_signal_count_,
+                active_fast_path_ ? 1 : 0,
+                bulk_combine_ ? 1 : 0,
+                direct_dispatch_ ? 1 : 0,
             };
             validate_resources(allgather(resources));
             gin_type_ = properties.ginType;
@@ -603,6 +681,31 @@ private:
                     "rank " + std::to_string(peer) + " registered " +
                     std::to_string(buffer_bytes) + " bytes, local rank registered " +
                     std::to_string(buffer_.nbytes()));
+            if (fields[12] != kRequiredSignalCount)
+                throw unsupported(
+                    "gin_signal_count_request_mismatch",
+                    "rank " + std::to_string(peer) + " requested " +
+                    std::to_string(fields[12]) +
+                    " indexed GIN signals; expected " +
+                    std::to_string(kRequiredSignalCount));
+            if (fields[13] != static_cast<int>(active_fast_path_))
+                throw unsupported(
+                    "active_fast_path_mismatch",
+                    "rank " + std::to_string(peer) + " selected active_fast_path=" +
+                    std::to_string(fields[13]) + ", local rank selected " +
+                    std::to_string(static_cast<int>(active_fast_path_)));
+            if (fields[14] != static_cast<int>(bulk_combine_))
+                throw unsupported(
+                    "bulk_combine_mismatch",
+                    "rank " + std::to_string(peer) + " selected bulk_combine=" +
+                    std::to_string(fields[14]) + ", local rank selected " +
+                    std::to_string(static_cast<int>(bulk_combine_)));
+            if (fields[15] != static_cast<int>(direct_dispatch_))
+                throw unsupported(
+                    "direct_dispatch_mismatch",
+                    "rank " + std::to_string(peer) + " selected direct_dispatch=" +
+                    std::to_string(fields[15]) + ", local rank selected " +
+                    std::to_string(static_cast<int>(direct_dispatch_)));
         }
     }
 
@@ -624,12 +727,45 @@ private:
             // ncclGinAllContexts iterates dev_comm.ginContextCount locally.
             // Requiring the exact collective request prevents ranks from
             // executing different signal/wait counts in a world barrier.
-            if (fields[4] != context_count_)
+            if (fields[4] != context_count_ || fields[10] != context_count_)
                 throw unsupported(
                     "gin_context_count_mismatch",
                     "rank " + std::to_string(peer) + " received " +
-                    std::to_string(fields[4]) + " contexts, requested " +
+                    std::to_string(fields[4]) + " contexts and requested " +
+                    std::to_string(fields[10]) + "; local request is " +
                     std::to_string(context_count_));
+            if (fields[11] != world_barrier_count_)
+                throw unsupported(
+                    "gin_world_barrier_count_mismatch",
+                    "rank " + std::to_string(peer) + " requested " +
+                    std::to_string(fields[11]) +
+                    " world GIN barrier slots; local request is " +
+                    std::to_string(world_barrier_count_));
+            if (fields[12] < kRequiredSignalCount)
+                throw unsupported(
+                    "gin_signal_count_mismatch",
+                    "rank " + std::to_string(peer) + " received " +
+                    std::to_string(fields[12]) +
+                    " indexed GIN signals; at least " +
+                    std::to_string(kRequiredSignalCount) + " are required");
+            if (fields[13] != static_cast<int>(active_fast_path_))
+                throw unsupported(
+                    "active_fast_path_resource_mismatch",
+                    "rank " + std::to_string(peer) + " initialized active_fast_path=" +
+                    std::to_string(fields[13]) + ", local rank initialized " +
+                    std::to_string(static_cast<int>(active_fast_path_)));
+            if (fields[14] != static_cast<int>(bulk_combine_))
+                throw unsupported(
+                    "bulk_combine_resource_mismatch",
+                    "rank " + std::to_string(peer) + " initialized bulk_combine=" +
+                    std::to_string(fields[14]) + ", local rank initialized " +
+                    std::to_string(static_cast<int>(bulk_combine_)));
+            if (fields[15] != static_cast<int>(direct_dispatch_))
+                throw unsupported(
+                    "direct_dispatch_resource_mismatch",
+                    "rank " + std::to_string(peer) + " initialized direct_dispatch=" +
+                    std::to_string(fields[15]) + ", local rank initialized " +
+                    std::to_string(static_cast<int>(direct_dispatch_)));
             if (fields[5] <= 0)
                 throw unsupported("no_gin_connections",
                                   "rank " + std::to_string(peer) +
@@ -658,6 +794,7 @@ private:
     }
 
     torch::Tensor buffer_;
+    torch::Tensor diagnostic_buffer_;
     const void* buffer_data_ptr_ = nullptr;
     int64_t buffer_bytes_ = 0;
     std::string unique_id_bytes_;
@@ -672,6 +809,10 @@ private:
     uint32_t completion_batch_ = 1;
     uint32_t combine_chunk_bytes_ = 7168;
     uint32_t outbox_depth_ = 8;
+    uint32_t combine_issue_wave_ = 8;
+    bool active_fast_path_ = false;
+    bool bulk_combine_ = false;
+    bool direct_dispatch_ = false;
 
     ncclComm_t comm_ = nullptr;
     ncclWindow_t window_ = nullptr;
@@ -681,6 +822,7 @@ private:
     int lsa_size_ = 0;
     int actual_context_count_ = 0;
     int connection_count_ = 0;
+    int actual_signal_count_ = 0;
 };
 
 // Typed bridge for csrc/apis/mega.hpp and its JIT wrapper. The shared owner is
@@ -722,6 +864,7 @@ static void register_apis(py::module_& m) {
         result["default_queue_depth"] = kDefaultQueueDepth;
         result["default_world_barrier_count"] = kDefaultWorldBarrierCount;
         result["default_expected_lsa_size"] = kDefaultExpectedLsaSize;
+        result["required_signal_count"] = kRequiredSignalCount;
 #else
         result["enabled"] = false;
         result["compiled_nccl_version"] = py::none();
@@ -736,6 +879,7 @@ static void register_apis(py::module_& m) {
         m, "_MegaMoeGinContext")
         .def("destroy", &MegaMoeGinContext::destroy)
         .def("abort", &MegaMoeGinContext::abort)
+        .def("set_diagnostic_buffer", &MegaMoeGinContext::set_diagnostic_buffer)
         .def("_release_buffer_registration",
              &MegaMoeGinContext::release_buffer_registration)
         .def_property_readonly("active", &MegaMoeGinContext::active)
@@ -746,6 +890,11 @@ static void register_apis(py::module_& m) {
         .def_property_readonly("context_count", &MegaMoeGinContext::context_count)
         .def_property_readonly("requested_context_count", &MegaMoeGinContext::requested_context_count)
         .def_property_readonly("connection_count", &MegaMoeGinContext::connection_count)
+        .def_property_readonly("requested_signal_count", &MegaMoeGinContext::requested_signal_count)
+        .def_property_readonly("signal_count", &MegaMoeGinContext::signal_count)
+        .def_property_readonly("active_fast_path", &MegaMoeGinContext::active_fast_path)
+        .def_property_readonly("bulk_combine", &MegaMoeGinContext::bulk_combine)
+        .def_property_readonly("direct_dispatch", &MegaMoeGinContext::direct_dispatch)
         .def_property_readonly("queue_depth", &MegaMoeGinContext::queue_depth)
         .def_property_readonly("world_barrier_count", &MegaMoeGinContext::world_barrier_count)
         .def_property_readonly("gin_type", &MegaMoeGinContext::gin_type)
@@ -762,14 +911,19 @@ static void register_apis(py::module_& m) {
            const int expected_lsa_size, const std::string& required_gin_type,
            const uint32_t completion_batch,
            const uint32_t combine_chunk_bytes,
-           const uint32_t outbox_depth) {
+           const uint32_t outbox_depth,
+           const uint32_t combine_issue_wave,
+           const bool active_fast_path,
+           const bool bulk_combine,
+           const bool direct_dispatch) {
             const std::string unique_id_bytes = unique_id;
             py::gil_scoped_release release;
             return MegaMoeGinContext::create(
                 buffer, unique_id_bytes, rank, world_size, context_count,
                 queue_depth, world_barrier_count, expected_lsa_size,
                 required_gin_type, completion_batch, combine_chunk_bytes,
-                outbox_depth);
+                outbox_depth, combine_issue_wave, active_fast_path,
+                bulk_combine, direct_dispatch);
         },
         py::arg("buffer"), py::arg("unique_id"), py::arg("rank"),
         py::arg("world_size"), py::arg("context_count") = kDefaultContextCount,
@@ -779,7 +933,11 @@ static void register_apis(py::module_& m) {
         py::arg("required_gin_type") = "gdaki",
         py::arg("completion_batch") = 1,
         py::arg("combine_chunk_bytes") = 7168,
-        py::arg("outbox_depth") = 8);
+        py::arg("outbox_depth") = 8,
+        py::arg("combine_issue_wave") = 8,
+        py::arg("active_fast_path") = false,
+        py::arg("bulk_combine") = false,
+        py::arg("direct_dispatch") = false);
 #else
     m.def("get_megamoe_gin_unique_id", []() -> py::bytes {
         throw unsupported(

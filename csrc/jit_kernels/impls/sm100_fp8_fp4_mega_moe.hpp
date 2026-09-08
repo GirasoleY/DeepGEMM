@@ -6,6 +6,7 @@
 #include "../../jit/kernel_runtime.hpp"
 #include "../../utils/exception.hpp"
 #include "../../utils/format.hpp"
+#include "../../utils/system.hpp"
 #include "runtime_utils.hpp"
 
 #include <deep_gemm/layout/mega_moe.cuh>
@@ -29,6 +30,16 @@ public:
         float activation_clamp;
         bool fast_math;
         bool use_gin;
+        int gin_local_ablation_stage;
+        bool gin_active_fast_path;
+        bool gin_activity_gate_opt;
+        bool gin_bulk_combine;
+        bool gin_direct_dispatch;
+        bool gin_dispatch_warp_scan;
+        bool gin_coop_direct_pack;
+        bool gin_preconsensus_pack;
+        int gin_diagnostics;
+        bool gin_single_combine_context;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -66,6 +77,16 @@ public:
 
     static std::string generate_impl(const Args& args) {
         return fmt::format(R"(
+#define DG_MEGAMOE_GIN_LOCAL_ABLATION_STAGE {}
+#define DG_MEGAMOE_GIN_ACTIVE_FAST_PATH {}
+#define DG_MEGAMOE_GIN_ACTIVITY_GATE_OPT {}
+#define DG_MEGAMOE_GIN_BULK_COMBINE {}
+#define DG_MEGAMOE_GIN_DIRECT_DISPATCH {}
+#define DG_MEGAMOE_GIN_DISPATCH_WARP_SCAN {}
+#define DG_MEGAMOE_GIN_COOP_DIRECT_PACK {}
+#define DG_MEGAMOE_GIN_PRECONSENSUS_PACK {}
+#define DG_MEGAMOE_GIN_DIAGNOSTICS {}
+#define DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT {}
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -90,7 +111,17 @@ static void __instantiate_kernel() {{
         {}
     >);
 }};
-)", args.num_max_tokens_per_rank,
+)", args.gin_local_ablation_stage,
+    args.gin_active_fast_path ? "1" : "0",
+    args.gin_activity_gate_opt ? "1" : "0",
+    args.gin_bulk_combine ? "1" : "0",
+    args.gin_direct_dispatch ? "1" : "0",
+    args.gin_dispatch_warp_scan ? "1" : "0",
+    args.gin_coop_direct_pack ? "1" : "0",
+    args.gin_preconsensus_pack ? "1" : "0",
+    args.gin_diagnostics,
+    args.gin_single_combine_context ? "1" : "0",
+    args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_shared_experts,
     args.num_topk,
@@ -290,6 +321,99 @@ static void sm100_fp8_fp4_mega_moe(
 
     // Launch
     const auto num_sms = device_runtime->get_num_sms();
+    // Fail closed for removed experimental paths, even with context mode off.
+    DG_HOST_ASSERT(get_env<std::string>("DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE", "0") == "0");
+    DG_HOST_ASSERT(get_env<std::string>("DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS", "1") == "1");
+#ifdef DG_MEGAMOE_GIN
+    const int gin_local_ablation_stage = gin_transport_opt.has_value() ?
+        get_env<int>("DG_MEGAMOE_GIN_LOCAL_ABLATION_STAGE", 0) : 0;
+    DG_HOST_ASSERT(gin_local_ablation_stage >= 0 and
+                   gin_local_ablation_stage <= 4);
+    DG_HOST_ASSERT(gin_local_ablation_stage == 0 or
+                   (gin_transport_opt.has_value() and num_ranks == 16 and
+                    num_shared_experts == 0));
+    const bool gin_active_fast_path = gin_transport_opt.has_value() and
+        gin_transport_opt->active_fast_path != 0;
+    DG_HOST_ASSERT(not gin_active_fast_path or
+                   (gin_local_ablation_stage == 0 and num_ranks == 16 and
+                    num_shared_experts == 0));
+    const int gin_activity_gate_opt_value =
+        get_env<int>("DG_MEGAMOE_GIN_ACTIVITY_GATE_OPT", 0);
+    DG_HOST_ASSERT(gin_activity_gate_opt_value == 0 or
+                   gin_activity_gate_opt_value == 1);
+    const bool gin_activity_gate_opt =
+        gin_transport_opt.has_value() and gin_activity_gate_opt_value != 0;
+    DG_HOST_ASSERT(not gin_activity_gate_opt or gin_active_fast_path);
+    const bool gin_bulk_combine = gin_transport_opt.has_value() and
+        gin_transport_opt->bulk_combine != 0 and
+        gin_local_ablation_stage == 0 and num_ranks == 16 and
+        num_experts == 896 and num_topk == 16 and hidden == 3584 and
+        intermediate_hidden == 3072 and num_shared_experts == 0 and
+        gin_transport_opt->outbox_depth == 64;
+    DG_HOST_ASSERT(not gin_transport_opt.has_value() or
+                   gin_transport_opt->bulk_combine == 0 or
+                   (gin_bulk_combine and gin_active_fast_path));
+    const bool gin_direct_dispatch = gin_transport_opt.has_value() and
+        gin_transport_opt->direct_dispatch != 0 and
+        gin_local_ablation_stage == 0 and num_ranks == 16 and
+        num_experts == 896 and num_topk == 16 and hidden == 3584 and
+        intermediate_hidden == 3072 and num_shared_experts == 0 and
+        num_max_tokens_per_rank >= 384 and
+        static_cast<int64_t>(num_sms) *
+                layout::kMegaMoeGinNumDispatchWarps * (hidden / 32) >=
+            layout::kMegaMoeGinDirectDispatchStorageBytes;
+    DG_HOST_ASSERT(not gin_transport_opt.has_value() or
+                   gin_transport_opt->direct_dispatch == 0 or
+                   (gin_direct_dispatch and gin_active_fast_path));
+    const int gin_dispatch_warp_scan_value =
+        get_env<int>("DG_MEGAMOE_GIN_DISPATCH_WARP_SCAN", 0);
+    DG_HOST_ASSERT(gin_dispatch_warp_scan_value == 0 or
+                   gin_dispatch_warp_scan_value == 1);
+    const bool gin_dispatch_warp_scan =
+        gin_dispatch_warp_scan_value != 0;
+    DG_HOST_ASSERT(not gin_dispatch_warp_scan or gin_direct_dispatch);
+    const int gin_coop_direct_pack_value =
+        get_env<int>("DG_MEGAMOE_GIN_COOP_DIRECT_PACK", 0);
+    DG_HOST_ASSERT(gin_coop_direct_pack_value == 0 or
+                   gin_coop_direct_pack_value == 1);
+    const bool gin_coop_direct_pack = gin_coop_direct_pack_value != 0;
+    DG_HOST_ASSERT(not gin_coop_direct_pack or gin_direct_dispatch);
+    const int gin_preconsensus_pack_value =
+        get_env<int>("DG_MEGAMOE_GIN_PRECONSENSUS_PACK", 0);
+    DG_HOST_ASSERT(gin_preconsensus_pack_value == 0 or
+                   gin_preconsensus_pack_value == 1);
+    const bool gin_preconsensus_pack =
+        gin_preconsensus_pack_value != 0;
+    DG_HOST_ASSERT(not gin_preconsensus_pack or
+                   (gin_coop_direct_pack and gin_active_fast_path));
+    const int gin_diagnostics = get_env<int>("DG_MEGAMOE_GIN_DIAGNOSTICS", 0);
+    DG_HOST_ASSERT(gin_diagnostics >= 0 and gin_diagnostics <= 2);
+    DG_HOST_ASSERT(gin_diagnostics == 0 or
+                   (gin_transport_opt.has_value() and
+                    gin_transport_opt->diagnostic_buffer != nullptr and
+                    gin_transport_opt->diagnostic_num_sms >= num_sms and
+                    num_experts_per_rank == 56 and
+                    config.num_dispatch_threads == 128 and
+                    config.num_epilogue_threads <= 256));
+    const auto gin_single_combine_context_value =
+        get_env<std::string>("DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT", "0");
+    DG_HOST_ASSERT(gin_single_combine_context_value == "0" or
+                   gin_single_combine_context_value == "1");
+    const bool gin_single_combine_context = gin_single_combine_context_value == "1";
+    DG_HOST_ASSERT(not gin_single_combine_context or
+                   (gin_bulk_combine and gin_direct_dispatch));
+#else
+    constexpr int gin_local_ablation_stage = 0;
+    constexpr bool gin_active_fast_path = false;
+    constexpr bool gin_activity_gate_opt = false;
+    constexpr bool gin_bulk_combine = false;
+    constexpr bool gin_direct_dispatch = false;
+    constexpr bool gin_dispatch_warp_scan = false;
+    constexpr bool gin_coop_direct_pack = false;
+    constexpr bool gin_preconsensus_pack = false;
+    constexpr int gin_diagnostics = 0;
+    constexpr bool gin_single_combine_context = false;
+#endif
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
         .hidden = hidden, .intermediate_hidden = intermediate_hidden,
@@ -303,6 +427,16 @@ static void sm100_fp8_fp4_mega_moe(
 #else
         .use_gin = false,
 #endif
+        .gin_local_ablation_stage = gin_local_ablation_stage,
+        .gin_active_fast_path = gin_active_fast_path,
+        .gin_activity_gate_opt = gin_activity_gate_opt,
+        .gin_bulk_combine = gin_bulk_combine,
+        .gin_direct_dispatch = gin_direct_dispatch,
+        .gin_dispatch_warp_scan = gin_dispatch_warp_scan,
+        .gin_coop_direct_pack = gin_coop_direct_pack,
+        .gin_preconsensus_pack = gin_preconsensus_pack,
+        .gin_diagnostics = gin_diagnostics,
+        .gin_single_combine_context = gin_single_combine_context,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

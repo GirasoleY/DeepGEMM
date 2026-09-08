@@ -19,6 +19,49 @@ static constexpr int kLCMCandidateBlockM = 384;
 static constexpr uint32_t kMegaMoeGinNumDispatchWarps = 4;
 static constexpr uint32_t kMegaMoeGinMaxCompletionBatch = 8;
 static constexpr uint32_t kMegaMoeGinMaxOutboxBlockM = kMaxCandidateBlockM;
+static constexpr uint32_t kMegaMoeGinNumDataContexts = 8;
+// Stage-1 bulk combine targets the decode regime only.  The public MegaMoE
+// allocation is still aligned to 384 tokens, so keep the packet capacity
+// independent from num_max_tokens_per_rank and select this path only when the
+// actual launch contains at most 48 tokens.
+static constexpr uint32_t kMegaMoeGinBulkCombineMaxTokens = 48;
+static constexpr uint32_t kMegaMoeGinBulkCombineHeaderBytes = 16;
+static constexpr uint32_t kMegaMoeGinBulkCombineRecordHeaderBytes = 16;
+
+// Stage-2 direct dispatch reinterprets the existing 384-row paired-ingress
+// mirrors as eight source-private lanes.  Its compact control packets alias
+// the otherwise-unused fine-grained GET scale scratch; no registered bytes are
+// appended.  Pad each packet stride to a 128-byte line so one source's route
+// tail cannot share a line with another source's VA terminal.  Keep these
+// constants exact so host and device code can prove that the alias fits before
+// enabling the specialization.
+static constexpr uint32_t kMegaMoeGinDirectDispatchMaxTokens = 48;
+static constexpr uint32_t kMegaMoeGinDirectDispatchNumPeers = 8;
+static constexpr uint32_t kMegaMoeGinDirectDispatchExpertsPerRank = 56;
+static constexpr uint32_t kMegaMoeGinDirectDispatchMaxRoutes =
+    kMegaMoeGinDirectDispatchMaxTokens * 16;
+static constexpr uint32_t kMegaMoeGinDirectDispatchReadyBytes = 16;
+static constexpr uint32_t kMegaMoeGinDirectDispatchCountBytes =
+    kMegaMoeGinDirectDispatchExpertsPerRank * sizeof(uint64_t);
+static constexpr uint32_t kMegaMoeGinDirectDispatchRouteBytes =
+    kMegaMoeGinDirectDispatchMaxRoutes * sizeof(uint32_t);
+static constexpr uint32_t kMegaMoeGinDirectDispatchPacketAlignment = 128;
+static constexpr uint32_t kMegaMoeGinDirectDispatchPacketDataBytes =
+    kMegaMoeGinDirectDispatchReadyBytes +
+    kMegaMoeGinDirectDispatchCountBytes +
+    kMegaMoeGinDirectDispatchRouteBytes;
+static constexpr uint32_t kMegaMoeGinDirectDispatchPacketBytes =
+    ((kMegaMoeGinDirectDispatchPacketDataBytes +
+      kMegaMoeGinDirectDispatchPacketAlignment - 1) /
+     kMegaMoeGinDirectDispatchPacketAlignment) *
+    kMegaMoeGinDirectDispatchPacketAlignment;
+static_assert(kMegaMoeGinDirectDispatchPacketBytes %
+                  kMegaMoeGinDirectDispatchPacketAlignment == 0);
+static_assert(kMegaMoeGinDirectDispatchPacketDataBytes <=
+              kMegaMoeGinDirectDispatchPacketBytes);
+static constexpr uint32_t kMegaMoeGinDirectDispatchStorageBytes =
+    2 * kMegaMoeGinDirectDispatchNumPeers *
+    kMegaMoeGinDirectDispatchPacketBytes;
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
 template <typename T>
@@ -141,7 +184,17 @@ struct Workspace {
     // [32..35]: `uint32_t` L2 schedule task counter
     // [36..39]: `uint32_t` shared L1 schedule task counter
     // [40..43]: `uint32_t` shared L2 schedule task counter
-    // [44..127]: padding to isolate hot expert counters from barrier/schedule counters
+    // [44..47]: reserved (former 32-bit GIN activity epoch)
+    // [48..51]: GIN paired-rank activity decision
+    // [52..55]: GIN world activity decision
+    // [56..59]: GIN world small-decode ineligibility decision
+    // [60..63]: reserved
+    // [64..71]: reserved
+    // [72..87]: 2 x `uint64_t` GIN paired-decision mailboxes
+    // [88..95]: reserved (keeps the NIC mailboxes in their own 32-byte sector)
+    // [96..103]: `uint64_t` GIN paired-decision launch epoch
+    // [104..111]: `uint64_t` GIN direct-dispatch invocation epoch
+    // [112..127]: padding to isolate hot expert counters from barrier/schedule counters
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
     template <uint32_t kIndex = 0>
@@ -180,6 +233,37 @@ struct Workspace {
     CUTLASS_DEVICE
     uint32_t* get_shared_l2_task_count_ptr() const {
         return math::advance_ptr<uint32_t>(base, 40u);
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_gin_active_launch_epoch_ptr() const {
+        return math::advance_ptr<uint64_t>(base, 96u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_gin_pair_active_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 48u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_gin_world_active_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 52u);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_gin_world_bulk_ineligible_ptr() const {
+        return math::advance_ptr<uint32_t>(base, 56u);
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_gin_pair_mailbox_ptr(const uint32_t& parity) const {
+        DG_DEVICE_ASSERT(parity < 2);
+        return math::advance_ptr<uint64_t>(base, 72u + parity * sizeof(uint64_t));
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_gin_direct_dispatch_epoch_ptr() const {
+        return math::advance_ptr<uint64_t>(base, 104u);
     }
 
     CUTLASS_DEVICE
@@ -344,10 +428,19 @@ struct MegaMoeGinWorkspace {
     uint32_t num_sms;
     uint32_t completion_batch;
     uint32_t outbox_depth;
+    uint32_t bulk_record_bytes;
 
+    Buffer published_input_token_buffer;
+    Buffer published_input_sf_buffer;
+    Buffer published_input_topk_weights_buffer;
+    Buffer count_staging_buffer;
     Buffer route_staging_buffer;
     Buffer scale_scratch_buffer;
     Buffer combine_outbox_buffer;
+    Buffer bulk_combine_packet_tail_buffer;
+    Buffer bulk_combine_return_index_buffer;
+    bool bulk_combine;
+    uint32_t bulk_packet_bytes;
 
     MegaMoeGinWorkspace() = default;
 
@@ -357,22 +450,50 @@ struct MegaMoeGinWorkspace {
                         const uint32_t& num_ranks,
                         const uint32_t& num_experts,
                         const uint32_t& num_max_tokens_per_rank,
+                        const uint32_t& num_topk,
                         const uint32_t& num_sms,
                         const uint32_t& completion_batch,
-                        const uint32_t& outbox_depth):
+                        const uint32_t& outbox_depth,
+                        const bool& bulk_combine):
         base(base), num_ranks(num_ranks), num_sms(num_sms),
-        completion_batch(completion_batch), outbox_depth(outbox_depth) {
+        completion_batch(completion_batch), outbox_depth(outbox_depth),
+        bulk_record_bytes(0), bulk_combine(bulk_combine),
+        bulk_packet_bytes(0) {
         DG_UNIFIED_ASSERT(completion_batch > 0 and
                           completion_batch <= kMegaMoeGinMaxCompletionBatch);
         DG_UNIFIED_ASSERT(outbox_depth > 0);
 
+        const auto input_token_layout = Data(hidden);
+        const auto input_sf_layout = Data(hidden / 32);
+        const auto input_topk_weights_layout =
+            Data(num_topk * sizeof(float), false);
+        const auto count_layout =
+            Data((num_experts / num_ranks) * sizeof(uint64_t));
         const auto route_layout = Data(sizeof(uint32_t), false);
         const auto scale_layout = Data(hidden / 32);
         const auto combine_row_layout = Data(hidden * sizeof(uint16_t));
+        const auto bulk_return_index_layout = Data(sizeof(uint32_t), false);
 
+        // The r75 fallback interprets these rows as one inbound mirror for the
+        // same-GPU-index peer in the other LSA.  The opt-in direct-dispatch
+        // specialization instead partitions the first 384 rows into eight
+        // source-private 48-row lanes.  The allocation and all later offsets
+        // remain identical in both interpretations.
+        published_input_token_buffer = Buffer(
+            input_token_layout, 1, num_max_tokens_per_rank,
+            get_control_end_ptr());
+        published_input_sf_buffer = Buffer(
+            input_sf_layout, 1, num_max_tokens_per_rank,
+            published_input_token_buffer.get_end_ptr());
+        published_input_topk_weights_buffer = Buffer(
+            input_topk_weights_layout, 1, num_max_tokens_per_rank,
+            published_input_sf_buffer.get_end_ptr());
+        count_staging_buffer = Buffer(
+            count_layout, num_ranks, 1,
+            published_input_topk_weights_buffer.get_end_ptr());
         route_staging_buffer = Buffer(
             route_layout, num_experts, num_max_tokens_per_rank,
-            get_control_end_ptr());
+            count_staging_buffer.get_end_ptr());
         scale_scratch_buffer = Buffer(
             scale_layout,
             num_sms * kMegaMoeGinNumDispatchWarps * completion_batch, 1,
@@ -381,15 +502,59 @@ struct MegaMoeGinWorkspace {
             combine_row_layout, outbox_depth,
             static_cast<uint32_t>(kMegaMoeGinMaxOutboxBlockM),
             scale_scratch_buffer.get_end_ptr());
+
+        // A compact owner->source packet has one 16-byte packet header followed
+        // by at most (48 tokens * top-k) fixed-stride records.  Each record's
+        // first 16 bytes carry the final token/top-k index and the remaining
+        // bytes carry one BF16 output row.
+        // Only the eight peers in the other LSA need storage.
+        const auto bulk_base = combine_outbox_buffer.get_end_ptr();
+        if (bulk_combine) {
+            const uint32_t bulk_capacity =
+                kMegaMoeGinBulkCombineMaxTokens * num_topk;
+            const uint32_t num_remote_peers = num_ranks / 2;
+            bulk_record_bytes =
+                kMegaMoeGinBulkCombineRecordHeaderBytes +
+                hidden * sizeof(uint16_t);
+            bulk_packet_bytes = kMegaMoeGinBulkCombineHeaderBytes +
+                bulk_capacity * bulk_record_bytes;
+            const uint64_t bulk_packet_storage_bytes =
+                2ull * num_remote_peers * bulk_packet_bytes;
+            const uint64_t outbox_storage_bytes =
+                combine_outbox_buffer.get_num_bytes();
+            DG_UNIFIED_ASSERT(
+                bulk_packet_storage_bytes >= outbox_storage_bytes);
+            DG_UNIFIED_ASSERT(
+                bulk_packet_storage_bytes - outbox_storage_bytes <=
+                static_cast<uint64_t>(UINT32_MAX));
+            const uint32_t packet_tail_bytes = static_cast<uint32_t>(
+                bulk_packet_storage_bytes - outbox_storage_bytes);
+            bulk_combine_packet_tail_buffer = Buffer(
+                Data(packet_tail_bytes), 1, 1, bulk_base);
+            bulk_combine_return_index_buffer = Buffer(
+                bulk_return_index_layout, 1,
+                get_num_max_pool_tokens(
+                    num_ranks, num_max_tokens_per_rank, num_topk,
+                    num_experts / num_ranks),
+                bulk_combine_packet_tail_buffer.get_end_ptr());
+        } else {
+            const auto empty_layout = Data(0, false);
+            bulk_combine_packet_tail_buffer = Buffer(
+                empty_layout, 0, 0, bulk_base);
+            bulk_combine_return_index_buffer = Buffer(
+                empty_layout, 0, 0, bulk_base);
+        }
     }
 
     CUTLASS_HOST_DEVICE
     uint64_t get_control_num_bytes() const {
-        // Per-world-peer owner-GET/context issue locks, followed by cumulative
-        // outbox full and empty generations.  Keep the appended data buffers
-        // 16-byte aligned for registered-window/TMA-friendly addressing.
+        // Per-(world peer, data-context) owner-GET issue locks, followed by
+        // cumulative outbox full and empty generations.  Keep the appended
+        // data buffers 16-byte aligned for registered-window/TMA-friendly
+        // addressing.
         const uint64_t bytes =
-            (static_cast<uint64_t>(num_ranks) + 2ull * outbox_depth) *
+            (static_cast<uint64_t>(num_ranks) * kMegaMoeGinNumDataContexts +
+             2ull * outbox_depth) *
             sizeof(uint32_t);
         return math::align<uint64_t>(bytes, 16);
     }
@@ -401,29 +566,35 @@ struct MegaMoeGinWorkspace {
 
     CUTLASS_HOST_DEVICE
     uint64_t get_num_bytes() const {
-        return static_cast<uint8_t*>(combine_outbox_buffer.get_end_ptr()) -
+        return static_cast<uint8_t*>(
+                   bulk_combine_return_index_buffer.get_end_ptr()) -
                static_cast<uint8_t*>(base);
     }
 
     CUTLASS_HOST_DEVICE
     void* get_end_ptr() const {
-        return combine_outbox_buffer.get_end_ptr();
+        return bulk_combine_return_index_buffer.get_end_ptr();
     }
 
 #if defined(__CUDA_ARCH__) or defined(__CLION_IDE__)
     CUTLASS_DEVICE
-    uint32_t* get_peer_issue_lock_ptr(const uint32_t& peer) const {
-        return static_cast<uint32_t*>(base) + peer;
+    uint32_t* get_peer_issue_lock_ptr(const uint32_t& peer,
+                                      const uint32_t& context_stripe) const {
+        DG_DEVICE_ASSERT(context_stripe < kMegaMoeGinNumDataContexts);
+        return static_cast<uint32_t*>(base) +
+               peer * kMegaMoeGinNumDataContexts + context_stripe;
     }
 
     CUTLASS_DEVICE
     uint32_t* get_outbox_full_count_ptr(const uint32_t& slot) const {
-        return static_cast<uint32_t*>(base) + num_ranks + slot;
+        return static_cast<uint32_t*>(base) +
+               num_ranks * kMegaMoeGinNumDataContexts + slot;
     }
 
     CUTLASS_DEVICE
     uint32_t* get_outbox_empty_count_ptr(const uint32_t& slot) const {
-        return static_cast<uint32_t*>(base) + num_ranks + outbox_depth + slot;
+        return static_cast<uint32_t*>(base) +
+               num_ranks * kMegaMoeGinNumDataContexts + outbox_depth + slot;
     }
 
     CUTLASS_DEVICE
@@ -445,11 +616,187 @@ struct MegaMoeGinWorkspace {
             .get_data_buffer(0).get_base_ptr();
     }
 
+    CUTLASS_HOST_DEVICE
+    bool direct_dispatch_alias_fits() const {
+        return scale_scratch_buffer.get_num_bytes() >=
+               kMegaMoeGinDirectDispatchStorageBytes;
+    }
+
+    CUTLASS_HOST_DEVICE
+    bool direct_dispatch_mirrors_fit() const {
+        return published_input_token_buffer.num_max_tokens_per_rank >=
+                   kMegaMoeGinDirectDispatchNumPeers *
+                       kMegaMoeGinDirectDispatchMaxTokens and
+               published_input_sf_buffer.num_max_tokens_per_rank >=
+                   kMegaMoeGinDirectDispatchNumPeers *
+                       kMegaMoeGinDirectDispatchMaxTokens and
+               published_input_topk_weights_buffer.num_max_tokens_per_rank >=
+                   kMegaMoeGinDirectDispatchNumPeers *
+                       kMegaMoeGinDirectDispatchMaxTokens;
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_direct_dispatch_packet_ptr(
+            const bool send, const uint32_t& peer_in_lsa) const {
+        DG_UNIFIED_ASSERT(direct_dispatch_alias_fits());
+        DG_UNIFIED_ASSERT(
+            peer_in_lsa < kMegaMoeGinDirectDispatchNumPeers);
+        const uint32_t packet_idx =
+            (send ? 0u : kMegaMoeGinDirectDispatchNumPeers) + peer_in_lsa;
+        return math::advance_ptr(
+            scale_scratch_buffer.base,
+            static_cast<uint64_t>(packet_idx) *
+                kMegaMoeGinDirectDispatchPacketBytes);
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t* get_direct_dispatch_ready_ptr(
+            const bool send, const uint32_t& peer_in_lsa) const {
+        return static_cast<uint64_t*>(
+            get_direct_dispatch_packet_ptr(send, peer_in_lsa));
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t* get_direct_dispatch_count_ptr(
+            const bool send, const uint32_t& peer_in_lsa,
+            const uint32_t& local_expert_idx = 0) const {
+        DG_UNIFIED_ASSERT(
+            local_expert_idx <=
+            kMegaMoeGinDirectDispatchExpertsPerRank);
+        return math::advance_ptr<uint64_t>(
+            get_direct_dispatch_packet_ptr(send, peer_in_lsa),
+            kMegaMoeGinDirectDispatchReadyBytes) + local_expert_idx;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_direct_dispatch_route_ptr(
+            const bool send, const uint32_t& peer_in_lsa,
+            const uint32_t& route_idx = 0) const {
+        DG_UNIFIED_ASSERT(
+            route_idx <= kMegaMoeGinDirectDispatchMaxRoutes);
+        return math::advance_ptr<uint32_t>(
+            get_direct_dispatch_packet_ptr(send, peer_in_lsa),
+            kMegaMoeGinDirectDispatchReadyBytes +
+                kMegaMoeGinDirectDispatchCountBytes) + route_idx;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t get_direct_dispatch_control_bytes(
+            const uint32_t& route_count) const {
+        DG_UNIFIED_ASSERT(
+            route_count <= kMegaMoeGinDirectDispatchMaxRoutes);
+        return kMegaMoeGinDirectDispatchCountBytes +
+               route_count * sizeof(uint32_t);
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_direct_input_token_ptr(
+            const uint32_t& source_lane,
+            const uint32_t& token_idx = 0) const {
+        DG_UNIFIED_ASSERT(
+            source_lane < kMegaMoeGinDirectDispatchNumPeers and
+            token_idx < kMegaMoeGinDirectDispatchMaxTokens);
+        DG_UNIFIED_ASSERT(direct_dispatch_mirrors_fit());
+        return published_input_token_buffer
+            .get_data_buffer(
+                source_lane * kMegaMoeGinDirectDispatchMaxTokens + token_idx)
+            .get_base_ptr();
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_direct_input_sf_ptr(
+            const uint32_t& source_lane,
+            const uint32_t& token_idx = 0) const {
+        DG_UNIFIED_ASSERT(
+            source_lane < kMegaMoeGinDirectDispatchNumPeers and
+            token_idx < kMegaMoeGinDirectDispatchMaxTokens);
+        DG_UNIFIED_ASSERT(direct_dispatch_mirrors_fit());
+        return published_input_sf_buffer
+            .get_data_buffer(
+                source_lane * kMegaMoeGinDirectDispatchMaxTokens + token_idx)
+            .get_base_ptr();
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_direct_input_topk_weights_ptr(
+            const uint32_t& source_lane,
+            const uint32_t& token_idx = 0) const {
+        DG_UNIFIED_ASSERT(
+            source_lane < kMegaMoeGinDirectDispatchNumPeers and
+            token_idx < kMegaMoeGinDirectDispatchMaxTokens);
+        DG_UNIFIED_ASSERT(direct_dispatch_mirrors_fit());
+        return published_input_topk_weights_buffer
+            .get_data_buffer(
+                source_lane * kMegaMoeGinDirectDispatchMaxTokens + token_idx)
+            .get_base_ptr();
+    }
+
     CUTLASS_DEVICE
     void* get_combine_outbox_row_ptr(const uint32_t& slot,
                                      const uint32_t& row) const {
         return combine_outbox_buffer.get_rank_buffer(slot)
             .get_data_buffer(row).get_base_ptr();
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_bulk_combine_return_index_ptr(
+        const uint32_t& pool_token_idx) const {
+        DG_DEVICE_ASSERT(bulk_combine);
+        return bulk_combine_return_index_buffer
+            .get_data_buffer(pool_token_idx)
+            .template get_base_ptr<uint32_t>();
+    }
+
+    CUTLASS_HOST_DEVICE
+    void* get_bulk_combine_packet_ptr(const bool send,
+                                      const uint32_t& peer_in_lsa) const {
+        DG_UNIFIED_ASSERT(bulk_combine);
+        const uint32_t num_remote_peers = num_ranks / 2;
+        DG_UNIFIED_ASSERT(peer_in_lsa < num_remote_peers);
+        const uint32_t packet_idx =
+            (send ? 0u : num_remote_peers) + peer_in_lsa;
+        // Bulk mode exclusively aliases the existing row-outbox allocation
+        // plus a small appended tail.  Uniform fallback launches continue to
+        // use combine_outbox_buffer's unchanged slot/row formula.
+        return math::advance_ptr(
+            combine_outbox_buffer.base,
+            static_cast<uint64_t>(packet_idx) * bulk_packet_bytes);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_bulk_combine_packet_count_ptr(
+        const bool send, const uint32_t& peer_in_lsa) const {
+        DG_DEVICE_ASSERT(bulk_combine);
+        return static_cast<uint32_t*>(
+            get_bulk_combine_packet_ptr(send, peer_in_lsa));
+    }
+
+    CUTLASS_DEVICE
+    void* get_bulk_combine_record_ptr(const bool send,
+                                      const uint32_t& peer_in_lsa,
+                                      const uint32_t& return_idx) const {
+        DG_DEVICE_ASSERT(bulk_combine);
+        return math::advance_ptr(
+            get_bulk_combine_packet_ptr(send, peer_in_lsa),
+            kMegaMoeGinBulkCombineHeaderBytes +
+                return_idx * bulk_record_bytes);
+    }
+
+    CUTLASS_DEVICE
+    uint32_t* get_bulk_combine_record_destination_ptr(
+        const bool send, const uint32_t& peer_in_lsa,
+        const uint32_t& return_idx) const {
+        return static_cast<uint32_t*>(
+            get_bulk_combine_record_ptr(send, peer_in_lsa, return_idx));
+    }
+
+    CUTLASS_DEVICE
+    void* get_bulk_combine_record_payload_ptr(
+        const bool send, const uint32_t& peer_in_lsa,
+        const uint32_t& return_idx) const {
+        return math::advance_ptr(
+            get_bulk_combine_record_ptr(send, peer_in_lsa, return_idx),
+            kMegaMoeGinBulkCombineRecordHeaderBytes);
     }
 #endif
 };
@@ -494,7 +841,8 @@ struct MegaMoEBuffer {
                   const bool& with_gin = false,
                   const uint32_t& num_sms = 0,
                   const uint32_t& gin_completion_batch = 1,
-                  const uint32_t& gin_outbox_depth = 8):
+                  const uint32_t& gin_outbox_depth = 8,
+                  const bool& gin_bulk_combine = false):
         with_gin(with_gin) {
         // Workspace
         workspace = Workspace(base, num_ranks, num_experts,
@@ -573,8 +921,8 @@ struct MegaMoEBuffer {
             DG_UNIFIED_ASSERT(num_sms > 0);
             gin_workspace = MegaMoeGinWorkspace(
                 combine_token_buffer.get_end_ptr(), hidden, num_ranks,
-                num_experts, num_max_tokens_per_rank, num_sms,
-                gin_completion_batch, gin_outbox_depth);
+                num_experts, num_max_tokens_per_rank, num_topk, num_sms,
+                gin_completion_batch, gin_outbox_depth, gin_bulk_combine);
         }
     }
 

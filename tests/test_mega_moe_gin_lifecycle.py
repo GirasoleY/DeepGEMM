@@ -1,4 +1,5 @@
 import inspect
+import os
 import unittest
 from unittest import mock
 
@@ -85,12 +86,17 @@ def _uninitialized_symm_buffer(rank=0):
     result.num_topk = 16
     result.hidden = 3584
     result.intermediate_hidden = 3072
+    result.num_shared_experts = 0
     result._gin_context = None
     result._gin_layout_enabled = True
     result.gin_completion_batch = 1
     result.gin_combine_chunk_bytes = 7168
     result.gin_outbox_depth = 8
+    result.gin_combine_issue_wave = 8
     result.gin_queue_depth = 64
+    result.gin_active_fast_path = False
+    result.gin_bulk_combine = False
+    result.gin_direct_dispatch = False
     return result
 
 
@@ -101,29 +107,114 @@ def _mirror_all_gather_object(output, local, group):
 
 class TestMegaMoeGinLifecycle(unittest.TestCase):
     def setUp(self):
+        mock.patch.dict(os.environ, {
+            'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '0',
+            'DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE': '0',
+            'DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS': '1',
+        }).start()
         self.all_gather_object = mock.patch.object(
             mega.dist, 'all_gather_object',
             side_effect=_mirror_all_gather_object).start()
         self.addCleanup(mock.patch.stopall)
 
     def test_default_api_is_opt_in(self):
-        self.assertFalse(
-            inspect.signature(SymmBuffer).parameters['enable_gin'].default)
-        self.assertFalse(
-            inspect.signature(get_symm_buffer_for_mega_moe)
-            .parameters['enable_gin'].default)
+        for public_api in (SymmBuffer, get_symm_buffer_for_mega_moe):
+            with self.subTest(public_api=public_api.__name__):
+                parameters = inspect.signature(public_api).parameters
+                self.assertFalse(parameters['enable_gin'].default)
+                self.assertFalse(parameters['gin_active_fast_path'].default)
+                self.assertFalse(parameters['gin_bulk_combine'].default)
+                self.assertFalse(parameters['gin_direct_dispatch'].default)
+                self.assertEqual(parameters['gin_combine_issue_wave'].default, 8)
+                self.assertLess(
+                    list(parameters).index('gin_queue_depth'),
+                    list(parameters).index('gin_combine_issue_wave'))
 
-    def test_constructor_rejects_nonunit_completion_before_allocation(self):
+    def test_constructor_rejects_unsupported_completion_before_allocation(self):
         with mock.patch.object(
                 mega._C, 'get_symm_buffer_size_for_mega_moe') as get_size:
-            for completion_batch in (0, 2, 4, 8):
+            for completion_batch in (0, 3, 16):
                 with self.subTest(completion_batch=completion_batch):
                     with self.assertRaisesRegex(
-                            ValueError, 'gin_completion_batch=1'):
+                            ValueError, 'gin_completion_batch=1, 2, 4, or 8'):
                         SymmBuffer(
                             _FakeGroup(), 896, 384, 16, 3584, 3072,
                             enable_gin=True,
                             gin_completion_batch=completion_batch)
+
+        get_size.assert_not_called()
+        self.all_gather_object.assert_not_called()
+
+    def test_constructor_rejects_unsupported_combine_issue_wave_before_allocation(self):
+        with mock.patch.object(
+                mega._C, 'get_symm_buffer_size_for_mega_moe') as get_size:
+            for combine_issue_wave in (0, 3, 16):
+                with self.subTest(combine_issue_wave=combine_issue_wave):
+                    with self.assertRaisesRegex(
+                            ValueError,
+                            'gin_combine_issue_wave=1, 2, 4, or 8'):
+                        SymmBuffer(
+                            _FakeGroup(), 896, 384, 16, 3584, 3072,
+                            enable_gin=True,
+                            gin_combine_issue_wave=combine_issue_wave)
+
+        get_size.assert_not_called()
+        self.all_gather_object.assert_not_called()
+
+    def test_constructor_rejects_undersized_queue_before_allocation(self):
+        with mock.patch.object(
+                mega._C, 'get_symm_buffer_size_for_mega_moe') as get_size:
+            with self.assertRaisesRegex(ValueError, 'gin_queue_depth >= 64'):
+                SymmBuffer(
+                    _FakeGroup(), 896, 384, 16, 3584, 3072,
+                    enable_gin=True, gin_queue_depth=32)
+
+        get_size.assert_not_called()
+        self.all_gather_object.assert_not_called()
+
+    def test_constructor_rejects_direct_dispatch_without_gin_before_allocation(self):
+        with mock.patch.object(
+                mega._C, 'get_symm_buffer_size_for_mega_moe') as get_size:
+            with self.assertRaisesRegex(
+                    ValueError, 'gin_direct_dispatch requires enable_gin=True'):
+                SymmBuffer(
+                    _FakeGroup(), 896, 384, 16, 3584, 3072,
+                    gin_active_fast_path=True,
+                    gin_direct_dispatch=True)
+
+        get_size.assert_not_called()
+        self.all_gather_object.assert_not_called()
+
+    def test_constructor_rejects_direct_dispatch_without_activity_consensus(self):
+        with mock.patch.object(
+                mega._C, 'get_symm_buffer_size_for_mega_moe') as get_size:
+            with self.assertRaisesRegex(
+                    ValueError, 'requires gin_active_fast_path=True'):
+                SymmBuffer(
+                    _FakeGroup(), 896, 384, 16, 3584, 3072,
+                    enable_gin=True,
+                    gin_direct_dispatch=True)
+
+        get_size.assert_not_called()
+        self.all_gather_object.assert_not_called()
+
+    def test_constructor_rejects_direct_dispatch_outside_target_contract(self):
+        cases = (
+            (_FakeGroup(size=8), 896, 384, 16, 3584, 3072),
+            (_FakeGroup(), 896, 383, 16, 3584, 3072),
+        )
+        with mock.patch.object(
+                mega._C, 'get_symm_buffer_size_for_mega_moe') as get_size:
+            for case in cases:
+                with self.subTest(case=case[1:]):
+                    with self.assertRaisesRegex(
+                            ValueError,
+                            'EP16/E896|num_max_tokens_per_rank >= 384'):
+                        SymmBuffer(
+                            *case,
+                            enable_gin=True,
+                            gin_active_fast_path=True,
+                            gin_direct_dispatch=True)
 
         get_size.assert_not_called()
         self.all_gather_object.assert_not_called()
@@ -133,6 +224,9 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
         self.assertIn('enabled', info)
         self.assertEqual(info['minimum_nccl_version'], 23007)
         self.assertEqual(info['required_nccl_version'], 23007)
+        self.assertEqual(info['default_world_barrier_count'], 4)
+        if info['enabled']:
+            self.assertEqual(info['required_signal_count'], 2)
         if not info['enabled']:
             with self.assertRaisesRegex(
                     RuntimeError, r'reason=build_disabled.*DG_MEGAMOE_GIN=1'):
@@ -146,7 +240,7 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
                 ValueError, 'defined, contiguous CUDA tensor'):
             _C.create_megamoe_gin_context(
                 torch.empty(4096, dtype=torch.int8), bytes(128), 0, 16,
-                9, 64, 3, 8, 'gdaki', 1, 7168, 8)
+                9, 64, 4, 8, 'gdaki', 1, 7168, 8, 8)
 
     def test_enable_broadcasts_uid_and_passes_target_defaults(self):
         symm_buffer = _uninitialized_symm_buffer()
@@ -169,18 +263,38 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
         broadcast.assert_called_once()
         (_, passed_uid, rank, world_size, contexts, queue_depth, barriers,
          lsa_size, gin_type, completion_batch, combine_chunk_bytes,
-         outbox_depth) = create.call_args.args
+         outbox_depth, combine_issue_wave, active_fast_path,
+         bulk_combine, direct_dispatch) = create.call_args.args
         self.assertEqual(passed_uid, uid)
         self.assertEqual((rank, world_size), (0, 16))
-        self.assertEqual((contexts, queue_depth, barriers), (9, 64, 3))
+        self.assertEqual((contexts, queue_depth, barriers), (9, 64, 4))
         self.assertEqual((lsa_size, gin_type), (8, 'gdaki'))
         self.assertEqual(
-            (completion_batch, combine_chunk_bytes, outbox_depth),
-            (1, 7168, 8))
+            (completion_batch, combine_chunk_bytes, outbox_depth,
+             combine_issue_wave, active_fast_path, bulk_combine),
+            (1, 7168, 8, 8, False, False))
+        self.assertFalse(direct_dispatch)
 
-    def test_enable_collectively_rejects_nonunit_completion_batch(self):
+    def test_enable_passes_direct_dispatch_independently_of_bulk_combine(self):
         symm_buffer = _uninitialized_symm_buffer()
-        symm_buffer.gin_completion_batch = 8
+        symm_buffer.gin_active_fast_path = True
+        symm_buffer.gin_direct_dispatch = True
+
+        with mock.patch.object(
+                mega._C, 'megamoe_gin_build_info',
+                return_value={'enabled': True}), mock.patch.object(
+                mega._C, 'get_megamoe_gin_unique_id',
+                return_value=bytes(128)), mock.patch.object(
+                mega._C, 'create_megamoe_gin_context',
+                return_value=_FakeGinContext()) as create, mock.patch.object(
+                mega.dist, 'broadcast'):
+            symm_buffer.enable_gin()
+
+        self.assertEqual(create.call_args.args[-3:], (True, False, True))
+
+    def test_enable_collectively_rejects_unsupported_completion_batch(self):
+        symm_buffer = _uninitialized_symm_buffer()
+        symm_buffer.gin_completion_batch = 3
         symm_buffer.gin_combine_chunk_bytes = 256
         symm_buffer.gin_outbox_depth = 16
         symm_buffer.gin_queue_depth = 128
@@ -192,8 +306,43 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
                 mega._C, 'create_megamoe_gin_context') as create, mock.patch.object(
                 mega.dist, 'broadcast') as broadcast:
             with self.assertRaisesRegex(
-                    RuntimeError, 'completion_batch must be exactly 1'):
+                    RuntimeError, 'completion_batch must be 1, 2, 4, or 8'):
                 symm_buffer.enable_gin()
+
+        get_uid.assert_not_called()
+        create.assert_not_called()
+        broadcast.assert_not_called()
+
+    def test_enable_collectively_rejects_unsupported_combine_issue_wave(self):
+        symm_buffer = _uninitialized_symm_buffer()
+        symm_buffer.gin_combine_issue_wave = 3
+
+        with mock.patch.object(
+                mega._C, 'megamoe_gin_build_info',
+                return_value={'enabled': True}), mock.patch.object(
+                mega._C, 'get_megamoe_gin_unique_id') as get_uid, mock.patch.object(
+                mega._C, 'create_megamoe_gin_context') as create, mock.patch.object(
+                mega.dist, 'broadcast') as broadcast:
+            with self.assertRaisesRegex(
+                    RuntimeError, 'combine_issue_wave must be 1, 2, 4, or 8'):
+                symm_buffer.enable_gin()
+
+        get_uid.assert_not_called()
+        create.assert_not_called()
+        broadcast.assert_not_called()
+
+    def test_enable_collectively_rejects_three_barrier_slots(self):
+        symm_buffer = _uninitialized_symm_buffer()
+
+        with mock.patch.object(
+                mega._C, 'megamoe_gin_build_info',
+                return_value={'enabled': True}), mock.patch.object(
+                mega._C, 'get_megamoe_gin_unique_id') as get_uid, mock.patch.object(
+                mega._C, 'create_megamoe_gin_context') as create, mock.patch.object(
+                mega.dist, 'broadcast') as broadcast:
+            with self.assertRaisesRegex(
+                    RuntimeError, 'world_barrier_count must be at least 4'):
+                symm_buffer.enable_gin(world_barrier_count=3)
 
         get_uid.assert_not_called()
         create.assert_not_called()
@@ -306,6 +455,165 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
                 mega._C, 'create_megamoe_gin_context') as create, mock.patch.object(
                 mega.dist, 'broadcast') as broadcast:
             with self.assertRaisesRegex(RuntimeError, 'configuration mismatch across ranks'):
+                symm_buffer.enable_gin()
+
+        get_uid.assert_not_called()
+        create.assert_not_called()
+        broadcast.assert_not_called()
+
+    def test_rank_skewed_active_fast_path_fails_before_uid_or_auxiliary_init(self):
+        symm_buffer = _uninitialized_symm_buffer()
+        symm_buffer.gin_active_fast_path = True
+
+        def skew(output, local, group):
+            output[:] = [local.copy() for _ in range(group.size())]
+            output[7]['active_fast_path'] = False
+
+        self.all_gather_object.side_effect = skew
+        with mock.patch.object(
+                mega._C, 'megamoe_gin_build_info',
+                return_value={'enabled': True}), mock.patch.object(
+                mega._C, 'get_megamoe_gin_unique_id') as get_uid, mock.patch.object(
+                mega._C, 'create_megamoe_gin_context') as create, mock.patch.object(
+                mega.dist, 'broadcast') as broadcast:
+            with self.assertRaisesRegex(
+                    RuntimeError, 'configuration mismatch across ranks'):
+                symm_buffer.enable_gin()
+
+        get_uid.assert_not_called()
+        create.assert_not_called()
+        broadcast.assert_not_called()
+
+    def test_single_context_raw_rank_skew_fails_before_auxiliary_init(self):
+        symm_buffer = _uninitialized_symm_buffer()
+
+        def skew(output, local, group):
+            output[:] = [local.copy() for _ in range(group.size())]
+            output[7]['single_combine_context'] = '1'
+
+        self.all_gather_object.side_effect = skew
+        with mock.patch.object(
+                mega._C, 'megamoe_gin_build_info',
+                return_value={'enabled': True}), mock.patch.object(
+                mega._C, 'get_megamoe_gin_unique_id') as get_uid, mock.patch.object(
+                mega._C, 'create_megamoe_gin_context') as create:
+            with self.assertRaisesRegex(RuntimeError, 'configuration mismatch across ranks'):
+                symm_buffer.enable_gin()
+        self.all_gather_object.assert_called_once()
+        get_uid.assert_not_called()
+        create.assert_not_called()
+
+    def test_single_context_invalid_raw_values_fail_collectively(self):
+        for raw in ('', 'true', '01', '2', '-1', ' 1'):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {
+                    'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': raw}), mock.patch.object(
+                    mega._C, 'megamoe_gin_build_info',
+                    return_value={'enabled': True}), mock.patch.object(
+                    mega._C, 'get_megamoe_gin_unique_id') as get_uid:
+                self.all_gather_object.reset_mock()
+                with self.assertRaisesRegex(RuntimeError, 'must be exactly 0 or 1'):
+                    _uninitialized_symm_buffer().enable_gin()
+                self.all_gather_object.assert_called_once()
+                get_uid.assert_not_called()
+
+    def test_single_context_dependencies_rejected_collectively(self):
+        with mock.patch.dict(os.environ, {
+                'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '1'}):
+            symm_buffer = _uninitialized_symm_buffer()
+            with self.assertRaisesRegex(RuntimeError, 'requires bulk_combine and direct_dispatch'):
+                symm_buffer._collective_validate_gin_config(
+                    {'enabled': True}, 9, 64, 4, 8, 'gdaki')
+            symm_buffer.gin_active_fast_path = True
+            symm_buffer.gin_bulk_combine = True
+            symm_buffer.gin_direct_dispatch = True
+            symm_buffer.gin_outbox_depth = 64
+            for flag, value in (
+                    ('DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE', '1'),
+                    ('DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS', '8')):
+                with self.subTest(flag=flag), mock.patch.dict(os.environ, {flag: value}):
+                    with self.assertRaisesRegex(RuntimeError, 'COMBINE_EXPERTS_PER_WAVE=0'):
+                        symm_buffer._collective_validate_gin_config(
+                            {'enabled': True}, 9, 64, 4, 8, 'gdaki')
+
+    def test_single_context_valid_raw_mode_is_recorded_without_extra_collective(self):
+        with mock.patch.dict(os.environ, {
+                'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '1'}):
+            symm_buffer = _uninitialized_symm_buffer()
+            symm_buffer.gin_active_fast_path = True
+            symm_buffer.gin_bulk_combine = True
+            symm_buffer.gin_direct_dispatch = True
+            symm_buffer.gin_outbox_depth = 64
+            symm_buffer._collective_validate_gin_config(
+                {'enabled': True}, 9, 64, 4, 8, 'gdaki')
+        self.all_gather_object.assert_called_once()
+        gathered_config = self.all_gather_object.call_args.args[1]
+        self.assertEqual(gathered_config['single_combine_context'], '1')
+        self.assertEqual(gathered_config['combine_experts_per_wave'], '0')
+        self.assertEqual(gathered_config['combine_barrier_warps'], '1')
+
+    def test_protocol_change_contract_is_documented_without_hot_path_collective(self):
+        self.assertIn('caller-enforced rank agreement', SymmBuffer.enable_gin.__doc__)
+        launch_guard = inspect.getsource(SymmBuffer._require_launchable_transport)
+        self.assertNotIn('all_gather', launch_guard)
+
+    def test_retired_experiments_fail_collectively_even_when_single_mode_is_off(self):
+        for mode in ('0', '1'):
+            for flag, value in (
+                    ('DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE', '8'),
+                    ('DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS', '8'),
+                    ('DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE', '00'),
+                    ('DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS', '01')):
+                with self.subTest(mode=mode, flag=flag), mock.patch.dict(os.environ, {
+                        'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': mode, flag: value}):
+                    self.all_gather_object.reset_mock()
+                    with self.assertRaisesRegex(RuntimeError, 'retired experiments'):
+                        _uninitialized_symm_buffer()._collective_validate_gin_config(
+                            {'enabled': True}, 9, 64, 4, 8, 'gdaki')
+                    self.all_gather_object.assert_called_once()
+
+    def test_rank_skewed_bulk_combine_fails_before_uid_or_auxiliary_init(self):
+        symm_buffer = _uninitialized_symm_buffer()
+        symm_buffer.gin_active_fast_path = True
+        symm_buffer.gin_bulk_combine = True
+        symm_buffer.gin_outbox_depth = 64
+
+        def skew(output, local, group):
+            output[:] = [local.copy() for _ in range(group.size())]
+            output[7]['bulk_combine'] = False
+
+        self.all_gather_object.side_effect = skew
+        with mock.patch.object(
+                mega._C, 'megamoe_gin_build_info',
+                return_value={'enabled': True}), mock.patch.object(
+                mega._C, 'get_megamoe_gin_unique_id') as get_uid, mock.patch.object(
+                mega._C, 'create_megamoe_gin_context') as create, mock.patch.object(
+                mega.dist, 'broadcast') as broadcast:
+            with self.assertRaisesRegex(
+                    RuntimeError, 'configuration mismatch across ranks'):
+                symm_buffer.enable_gin()
+
+        get_uid.assert_not_called()
+        create.assert_not_called()
+        broadcast.assert_not_called()
+
+    def test_rank_skewed_direct_dispatch_fails_before_uid_or_auxiliary_init(self):
+        symm_buffer = _uninitialized_symm_buffer()
+        symm_buffer.gin_active_fast_path = True
+        symm_buffer.gin_direct_dispatch = True
+
+        def skew(output, local, group):
+            output[:] = [local.copy() for _ in range(group.size())]
+            output[7]['direct_dispatch'] = False
+
+        self.all_gather_object.side_effect = skew
+        with mock.patch.object(
+                mega._C, 'megamoe_gin_build_info',
+                return_value={'enabled': True}), mock.patch.object(
+                mega._C, 'get_megamoe_gin_unique_id') as get_uid, mock.patch.object(
+                mega._C, 'create_megamoe_gin_context') as create, mock.patch.object(
+                mega.dist, 'broadcast') as broadcast:
+            with self.assertRaisesRegex(
+                    RuntimeError, 'configuration mismatch across ranks'):
                 symm_buffer.enable_gin()
 
         get_uid.assert_not_called()

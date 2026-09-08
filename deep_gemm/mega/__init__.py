@@ -1,3 +1,4 @@
+import os
 import torch
 import types
 import warnings
@@ -36,17 +37,29 @@ class SymmBuffer:
                  gin_completion_batch: int = 1,
                  gin_combine_chunk_bytes: int = 7168,
                  gin_outbox_depth: int = 8,
-                 gin_queue_depth: int = 64):
+                 gin_queue_depth: int = 64,
+                 gin_combine_issue_wave: int = 8,
+                 gin_active_fast_path: bool = False,
+                 gin_bulk_combine: bool = False,
+                 gin_direct_dispatch: bool = False):
         assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+        if gin_bulk_combine and not enable_gin:
+            raise ValueError('gin_bulk_combine requires enable_gin=True')
+        if gin_direct_dispatch and not enable_gin:
+            raise ValueError('gin_direct_dispatch requires enable_gin=True')
         if enable_gin:
-            # The first fused path has only been made correct for one
-            # completion per readiness wave.  Reject other tunings before the
-            # symmetric allocation/rendezvous: 2/4/8 remain available to the
-            # standalone GIN probes, but must not silently enter MegaMoE.
-            if gin_completion_batch != 1:
+            if gin_completion_batch not in (1, 2, 4, 8):
                 raise ValueError(
-                    'fused MegaMoE GIN currently requires '
-                    'gin_completion_batch=1')
+                    'fused MegaMoE GIN completion batching must be one of '
+                    'gin_completion_batch=1, 2, 4, or 8')
+            if gin_combine_issue_wave not in (1, 2, 4, 8):
+                raise ValueError(
+                    'fused MegaMoE GIN combine issue wave must be one of '
+                    'gin_combine_issue_wave=1, 2, 4, or 8')
+            if gin_queue_depth < 64:
+                raise ValueError(
+                    'the fused MegaMoE GIN target requires '
+                    'gin_queue_depth >= 64')
             if mma_type != 'fp8xfp4':
                 raise ValueError('the first fused MegaMoE GIN path requires mma_type=fp8xfp4')
             if hidden % 512 != 0:
@@ -54,12 +67,45 @@ class SymmBuffer:
             if (2 * hidden) % gin_combine_chunk_bytes != 0:
                 raise ValueError(
                     'MegaMoE GIN combine chunk bytes must divide one BF16 output row')
+            if gin_bulk_combine:
+                if not gin_active_fast_path:
+                    raise ValueError(
+                        'gin_bulk_combine requires gin_active_fast_path=True '
+                        'for world-uniform runtime eligibility consensus')
+                expected_shape = (896, 16, 3584, 3072, 0)
+                actual_shape = (num_experts, num_topk, hidden,
+                                intermediate_hidden, num_shared_experts)
+                if actual_shape != expected_shape:
+                    raise ValueError(
+                        'gin_bulk_combine currently requires '
+                        'E896/topk16/H3584/I3072 with no shared experts')
+                if gin_outbox_depth != 64:
+                    raise ValueError(
+                        'gin_bulk_combine currently requires '
+                        'gin_outbox_depth=64')
+            if gin_direct_dispatch:
+                if not gin_active_fast_path:
+                    raise ValueError(
+                        'gin_direct_dispatch requires gin_active_fast_path=True '
+                        'for world-uniform runtime eligibility consensus')
+                expected_shape = (16, 896, 16, 3584, 3072, 0)
+                actual_shape = (group.size(), num_experts, num_topk, hidden,
+                                intermediate_hidden, num_shared_experts)
+                if actual_shape != expected_shape:
+                    raise ValueError(
+                        'gin_direct_dispatch currently requires '
+                        'EP16/E896/topk16/H3584/I3072 with no shared experts')
+                if num_max_tokens_per_rank < 384:
+                    raise ValueError(
+                        'gin_direct_dispatch requires '
+                        'num_max_tokens_per_rank >= 384')
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
+        self.num_shared_experts = num_shared_experts
 
         # Allocate a symmetric buffer
         num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
@@ -68,7 +114,8 @@ class SymmBuffer:
             hidden, intermediate_hidden,
             mma_type, activation,
             num_shared_experts,
-            enable_gin, gin_completion_batch, gin_outbox_depth
+            enable_gin, gin_completion_batch, gin_outbox_depth,
+            gin_bulk_combine, gin_active_fast_path, gin_direct_dispatch
         )
         allocator = torch if group.size() == 1 else symm_mem
         # Keep the allocator's communicator lookup key identical to the
@@ -116,7 +163,11 @@ class SymmBuffer:
         self.gin_completion_batch = gin_completion_batch
         self.gin_combine_chunk_bytes = gin_combine_chunk_bytes
         self.gin_outbox_depth = gin_outbox_depth
+        self.gin_combine_issue_wave = gin_combine_issue_wave
         self.gin_queue_depth = gin_queue_depth
+        self.gin_active_fast_path = bool(gin_active_fast_path)
+        self.gin_bulk_combine = bool(gin_bulk_combine)
+        self.gin_direct_dispatch = bool(gin_direct_dispatch)
         if enable_gin:
             self.enable_gin(queue_depth=gin_queue_depth)
 
@@ -158,6 +209,7 @@ class SymmBuffer:
             'num_topk': self.num_topk,
             'hidden': self.hidden,
             'intermediate_hidden': self.intermediate_hidden,
+            'num_shared_experts': self.num_shared_experts,
             'gin_layout_enabled': self._gin_layout_enabled,
             'context_state': context_state,
             'context_count': context_count,
@@ -169,6 +221,18 @@ class SymmBuffer:
             'completion_batch': self.gin_completion_batch,
             'combine_chunk_bytes': self.gin_combine_chunk_bytes,
             'outbox_depth': self.gin_outbox_depth,
+            'combine_issue_wave': self.gin_combine_issue_wave,
+            'active_fast_path': self.gin_active_fast_path,
+            'bulk_combine': self.gin_bulk_combine,
+            'direct_dispatch': self.gin_direct_dispatch,
+            # Keep raw strings until after the collective: a rank-local
+            # parse failure would strand peers in communicator setup.
+            'single_combine_context': os.environ.get(
+                'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT', '0'),
+            'combine_experts_per_wave': os.environ.get(
+                'DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE', '0'),
+            'combine_barrier_warps': os.environ.get(
+                'DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS', '1'),
         }
         gathered = [None] * self.group.size()
         dist.all_gather_object(gathered, local_config, group=self.group)
@@ -184,6 +248,19 @@ class SymmBuffer:
                 + ', '.join(map(str, mismatched_ranks)))
 
         errors = []
+        if (canonical['combine_experts_per_wave'] != '0'
+                or canonical['combine_barrier_warps'] != '1'):
+            errors.append(
+                'retired experiments are unsupported in the clean single-context build; '
+                'requires DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE=0 and '
+                'DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS=1')
+        if canonical['single_combine_context'] not in ('0', '1'):
+            errors.append(
+                'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT must be exactly 0 or 1')
+        elif canonical['single_combine_context'] == '1':
+            if not (canonical['bulk_combine'] and canonical['direct_dispatch']):
+                errors.append(
+                    'single_combine_context requires bulk_combine and direct_dispatch')
         if canonical['world_size'] != 16:
             errors.append('world_size must be exactly 16')
         if not canonical['gin_layout_enabled']:
@@ -196,20 +273,40 @@ class SymmBuffer:
             errors.append('context_count must be at least 9')
         if canonical['queue_depth'] != canonical['layout_queue_depth']:
             errors.append('queue_depth differs from construction-time layout tuning')
-        if canonical['queue_depth'] < 0:
-            errors.append('queue_depth must be non-negative')
-        if canonical['world_barrier_count'] < 3:
-            errors.append('world_barrier_count must be at least 3')
+        if canonical['queue_depth'] < 64:
+            errors.append('queue_depth must be at least 64')
+        if canonical['world_barrier_count'] < 4:
+            errors.append('world_barrier_count must be at least 4')
         if canonical['expected_lsa_size'] != 8:
             errors.append('expected_lsa_size must be exactly 8')
         if canonical['required_gin_type'] not in ('gdaki', 'proxy', 'gpi', 'any'):
             errors.append('required_gin_type must be gdaki, proxy, gpi, or any')
-        if canonical['completion_batch'] != 1:
-            errors.append('completion_batch must be exactly 1 for fused MegaMoE')
+        if canonical['completion_batch'] not in (1, 2, 4, 8):
+            errors.append('completion_batch must be 1, 2, 4, or 8')
         if canonical['combine_chunk_bytes'] not in (256, 1792, 3584, 7168):
             errors.append('combine_chunk_bytes is unsupported')
-        if canonical['outbox_depth'] not in (4, 8, 16):
-            errors.append('outbox_depth must be 4, 8, or 16')
+        if canonical['outbox_depth'] not in (4, 8, 16, 64):
+            errors.append('outbox_depth must be 4, 8, 16, or 64')
+        if canonical['combine_issue_wave'] not in (1, 2, 4, 8):
+            errors.append('combine_issue_wave must be 1, 2, 4, or 8')
+        if canonical['direct_dispatch']:
+            if not canonical['active_fast_path']:
+                errors.append(
+                    'direct_dispatch requires active_fast_path for '
+                    'world-uniform runtime eligibility consensus')
+            direct_shape = (
+                canonical['world_size'], canonical['num_experts'],
+                canonical['num_topk'], canonical['hidden'],
+                canonical['intermediate_hidden'],
+                canonical['num_shared_experts'],
+            )
+            if direct_shape != (16, 896, 16, 3584, 3072, 0):
+                errors.append(
+                    'direct_dispatch requires '
+                    'EP16/E896/topk16/H3584/I3072 with no shared experts')
+            if canonical['num_max_tokens_per_rank'] < 384:
+                errors.append(
+                    'direct_dispatch requires num_max_tokens_per_rank >= 384')
         if errors:
             raise RuntimeError(
                 'MegaMoE GIN collective configuration rejected: '
@@ -289,7 +386,7 @@ class SymmBuffer:
     def enable_gin(self,
                    context_count: int = 9,
                    queue_depth: Optional[int] = None,
-                   world_barrier_count: int = 3,
+                   world_barrier_count: int = 4,
                    expected_lsa_size: int = 8,
                    required_gin_type: str = 'gdaki'):
         """Collectively enable the 2x8 direct-GIN transport for this buffer.
@@ -297,6 +394,12 @@ class SymmBuffer:
         Every rank in ``self.group`` must call this method in the same order.
         Unsupported NCCL, GIN, or rank/topology configurations fail explicitly;
         this method never falls back to the existing NVLink path.
+
+        Protocol experiment environment settings are checked collectively at
+        context creation, not on the kernel hot path. Changing those settings
+        afterward (including when capturing another graph specialization)
+        requires caller-enforced rank agreement and identical launch ordering.
+        Graph replay retains the protocol specialization captured in that graph.
         """
         if queue_depth is None:
             queue_depth = self.gin_queue_depth
@@ -331,7 +434,9 @@ class SymmBuffer:
             context_count, queue_depth, world_barrier_count,
             expected_lsa_size, required_gin_type,
             self.gin_completion_batch, self.gin_combine_chunk_bytes,
-            self.gin_outbox_depth)
+            self.gin_outbox_depth, self.gin_combine_issue_wave,
+            self.gin_active_fast_path, self.gin_bulk_combine,
+            self.gin_direct_dispatch)
         return self._gin_context
 
     def _release_buffer_storage(self):
@@ -386,7 +491,11 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
                                  gin_completion_batch: int = 1,
                                  gin_combine_chunk_bytes: int = 7168,
                                  gin_outbox_depth: int = 8,
-                                 gin_queue_depth: int = 64) -> SymmBuffer:
+                                 gin_queue_depth: int = 64,
+                                 gin_combine_issue_wave: int = 8,
+                                 gin_active_fast_path: bool = False,
+                                 gin_bulk_combine: bool = False,
+                                 gin_direct_dispatch: bool = False) -> SymmBuffer:
     # Align token count
     num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
 
@@ -408,7 +517,11 @@ def get_symm_buffer_for_mega_moe(group: dist.ProcessGroup,
         gin_completion_batch=gin_completion_batch,
         gin_combine_chunk_bytes=gin_combine_chunk_bytes,
         gin_outbox_depth=gin_outbox_depth,
-        gin_queue_depth=gin_queue_depth
+        gin_combine_issue_wave=gin_combine_issue_wave,
+        gin_queue_depth=gin_queue_depth,
+        gin_active_fast_path=gin_active_fast_path,
+        gin_bulk_combine=gin_bulk_combine,
+        gin_direct_dispatch=gin_direct_dispatch,
     )
 
 

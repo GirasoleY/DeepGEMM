@@ -45,14 +45,32 @@ get_symm_buffer_size_for_mega_moe(
     const int& num_shared_experts = 0,
     const bool& enable_gin = false,
     const int& gin_completion_batch = 1,
-    const int& gin_outbox_depth = 8) {
+    const int& gin_outbox_depth = 8,
+    const bool& gin_bulk_combine = false,
+    const bool& gin_active_fast_path = false,
+    const bool& gin_direct_dispatch = false) {
     DG_HOST_ASSERT(num_experts % num_ranks == 0);
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(num_shared_experts >= 0);
+    DG_HOST_ASSERT(not gin_bulk_combine or
+                   (enable_gin and num_ranks == 16 and num_experts == 896 and
+                    num_topk == 16 and hidden == 3584 and
+                    intermediate_hidden == 3072 and
+                    num_shared_experts == 0 and gin_outbox_depth == 64));
+    DG_HOST_ASSERT(not gin_direct_dispatch or
+                   (enable_gin and gin_active_fast_path and num_ranks == 16 and
+                    num_experts == 896 and num_topk == 16 and hidden == 3584 and
+                    intermediate_hidden == 3072 and num_shared_experts == 0 and
+                    num_max_tokens_per_rank >= 384));
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
     const auto num_sms = device_runtime->get_num_sms();
+    DG_HOST_ASSERT(
+        not gin_direct_dispatch or
+        static_cast<int64_t>(num_sms) *
+                layout::kMegaMoeGinNumDispatchWarps * (hidden / 32) >=
+            layout::kMegaMoeGinDirectDispatchStorageBytes);
     const auto num_experts_per_rank = num_experts / num_ranks;
     const auto num_active_topk = std::min(num_topk, num_experts_per_rank);
     const auto num_max_routed_tokens = num_max_tokens_per_rank * num_ranks * num_active_topk;
@@ -93,7 +111,8 @@ get_symm_buffer_size_for_mega_moe(
         enable_gin,
         enable_gin ? static_cast<uint32_t>(num_sms) : 0u,
         static_cast<uint32_t>(gin_completion_batch),
-        static_cast<uint32_t>(gin_outbox_depth)
+        static_cast<uint32_t>(gin_outbox_depth),
+        gin_bulk_combine
     );
 
     // Check SF buffer requirements
@@ -110,7 +129,7 @@ get_symm_buffer_size_for_mega_moe(
         DG_HOST_ASSERT(gin_completion_batch == 1 or gin_completion_batch == 2 or
                        gin_completion_batch == 4 or gin_completion_batch == 8);
         DG_HOST_ASSERT(gin_outbox_depth == 4 or gin_outbox_depth == 8 or
-                       gin_outbox_depth == 16);
+                       gin_outbox_depth == 16 or gin_outbox_depth == 64);
         DG_HOST_ASSERT(num_sms > 0);
     }
 
@@ -274,6 +293,16 @@ static void fp8_fp4_mega_moe(
         if (not gin_context->active())
             throw std::runtime_error(
                 "MegaMoE GIN context is inactive; refusing legacy NVLink fallback");
+        // Debug-mode whole-buffer zeroing happens after the asynchronous
+        // kernel launch below.  A registered GIN buffer contains persistent
+        // VA readiness generations (and the direct-dispatch epoch), so one
+        // rank zeroing early could make a later stale signal satisfy another
+        // rank's CUDA-Graph replay.  Reject before JIT/enqueue instead of
+        // trying to preserve selected regions after launch.
+        if (get_env<int>("DG_COMM_KERNEL_DEBUG") != 0)
+            throw std::runtime_error(
+                "DG_COMM_KERNEL_DEBUG must be 0 while a MegaMoE GIN context "
+                "is live; whole-buffer debug zeroing is not GIN-safe");
         DG_HOST_ASSERT(gin_context->rank() == rank_idx);
         DG_HOST_ASSERT(gin_context->world_size() == num_ranks);
         DG_HOST_ASSERT(gin_context->buffer_bytes() ==
@@ -289,10 +318,19 @@ static void fp8_fp4_mega_moe(
         static_cast<int>(gin_transport_opt->completion_batch) : 1;
     const auto gin_outbox_depth = enable_gin ?
         static_cast<int>(gin_transport_opt->outbox_depth) : 8;
+    const bool gin_bulk_combine = enable_gin and
+        gin_transport_opt->bulk_combine != 0;
+    const bool gin_active_fast_path = enable_gin and
+        gin_transport_opt->active_fast_path != 0;
+    const bool gin_direct_dispatch = enable_gin and
+        gin_transport_opt->direct_dispatch != 0;
     if (enable_gin) {
-        // The standalone probe owns the B=1/2/4/8 sweep.  The first fused
-        // prototype intentionally publishes one route per completion wave.
-        DG_HOST_ASSERT(gin_completion_batch == 1);
+        DG_HOST_ASSERT(gin_completion_batch == 1 or gin_completion_batch == 2 or
+                       gin_completion_batch == 4 or gin_completion_batch == 8);
+        DG_HOST_ASSERT(gin_transport_opt->combine_issue_wave == 1 or
+                       gin_transport_opt->combine_issue_wave == 2 or
+                       gin_transport_opt->combine_issue_wave == 4 or
+                       gin_transport_opt->combine_issue_wave == 8);
         DG_HOST_ASSERT(hidden % 512 == 0);
         DG_HOST_ASSERT(
             (hidden * static_cast<int>(sizeof(uint16_t))) %
@@ -302,13 +340,17 @@ static void fp8_fp4_mega_moe(
     constexpr bool enable_gin = false;
     constexpr int gin_completion_batch = 1;
     constexpr int gin_outbox_depth = 8;
+    constexpr bool gin_bulk_combine = false;
+    constexpr bool gin_active_fast_path = false;
+    constexpr bool gin_direct_dispatch = false;
 #endif
     const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
         num_ranks, num_experts,
         num_max_tokens_per_rank, num_topk,
         hidden, intermediate_hidden,
         "fp8xfp4", activation, num_shared_experts,
-        enable_gin, gin_completion_batch, gin_outbox_depth
+        enable_gin, gin_completion_batch, gin_outbox_depth,
+        gin_bulk_combine, gin_active_fast_path, gin_direct_dispatch
     );
 #ifdef DG_MEGAMOE_GIN
     // The Python allocator returns an exact legacy or GIN-expanded layout. If
@@ -373,6 +415,19 @@ static void bf16_mega_moe(
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
 ) {
+#ifdef DG_MEGAMOE_GIN
+    // Although the public Python wrapper rejects BF16 launches on a GIN
+    // allocation, the raw pybind entry point remains callable.  Preserve the
+    // address-level GIN invariant here as well: debug-mode zeroing would erase
+    // persistent VA-signal generations after the asynchronous BF16 launch.
+    // Reject before any JIT lookup or kernel enqueue.
+    const auto gin_context = gin::find_megamoe_gin_context(sym_buffer.data_ptr());
+    if (gin_context != nullptr and get_env<int>("DG_COMM_KERNEL_DEBUG") != 0)
+        throw std::runtime_error(
+            "DG_COMM_KERNEL_DEBUG must be 0 while a MegaMoE GIN context "
+            "is live; whole-buffer debug zeroing is not GIN-safe");
+#endif
+
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     DG_HOST_ASSERT(activation == "swiglu");
