@@ -75,6 +75,11 @@ class CombineSweepContracts(unittest.TestCase):
             self.assertEqual(reducer["required_scratch_extent_bytes"], 62720)
             self.assertEqual(reducer["added_barriers"], 0)
             self.assertTrue(reducer["policy_not_device_observation"])
+            self.assertEqual(reducer["address_preparation"],
+                             "lane_local_token_row_pointer_preload_before_chunk_loop")
+            self.assertIs(reducer["full_warp_pointer_gather_before_elected_issuer"], True)
+            self.assertIs(type(reducer["metadata_resolution_passes_per_active_remote_assignment_per_token"]), int)
+            self.assertEqual(reducer["metadata_resolution_passes_per_active_remote_assignment_per_token"], 1)
             self.assertTrue(reducer["source_inverse_written_during_actual_pack"])
             self.assertTrue(reducer["received_count_and_put_visibility_preserved"])
             self.assertIn("async_global_proxy_fence", reducer["target_visibility_to_tma_proxy"])

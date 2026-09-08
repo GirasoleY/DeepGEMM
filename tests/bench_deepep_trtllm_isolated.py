@@ -917,7 +917,7 @@ def dispatch_candidate_metadata(flags):
     if combine_enabled and (not enabled or flags.get("DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT") != "1"):
         raise ValueError("combine overlap metadata requires dispatch overlap1 and single context1")
     return {
-        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_direct_reduce" if combine_enabled else
+        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_direct_reduce_preload" if combine_enabled else
                              "direct_control_first_dispatch" if enabled else
                              "clean_single_combine_context_only"),
         "combine_overlap_contract": {
@@ -934,6 +934,9 @@ def dispatch_candidate_metadata(flags):
                 "additional_source_local_ordinal_bytes": 3072,
                 "required_scratch_extent_bytes": 62720,
                 "fit_policy": "combine_overlap_eligible_and_source_local_inverse_map_fits",
+                "address_preparation": "lane_local_token_row_pointer_preload_before_chunk_loop",
+                "full_warp_pointer_gather_before_elected_issuer": True,
+                "metadata_resolution_passes_per_active_remote_assignment_per_token": 1,
                 "source_inverse_written_during_actual_pack": True,
                 "remote_inputs": "owner_packet_payload_via_original_assignment_inverse",
                 "local_shared_inputs": "unchanged_combine_buffer",

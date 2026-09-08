@@ -195,3 +195,60 @@ overwrites its ordinal with the actual current packing order.
         if not self.cleanup_done or self.inflight_reads or len(self.results) != self.tokens:
             raise ProtocolError("complete reduction and cleanup before next generation")
         self.retired = True
+
+
+class PreloadedTokenRows:
+    """R5 address-preparation model: one symbolic pointer per warp lane.
+
+The tuple represents 32 distinct lanes, not an array held by each device
+thread. Packet metadata is validated once at construction. Later chunk reads
+use the retained row address, with original slot order supplied by the caller.
+Existing DirectReduceGeneration tests separately cover read retirement.
+"""
+
+    def __init__(self, model, token):
+        model._active()
+        if not model.direct or not model.counts_checked or not model.async_proxy_bridged:
+            raise ProtocolError("preload requires eligible direct visibility and proxy bridge")
+        if model.handoff_done or not 0 <= token < model.tokens:
+            raise ProtocolError("preload requires a live token before retirement")
+        self.model, self.generation, self.token = model, model.generation, token
+        self.metadata_reads, self.chunk_reads = [], []
+        pointers = [None] * 32
+        for lane, expert in enumerate(model.ids[token]):
+            if expert < 0:
+                continue
+            destination, owner = token * 16 + lane, expert // 56
+            if owner // 8 == model.source // 8:
+                pointers[lane] = ("local", destination)
+                continue
+            model.inverse_reads.add(destination)
+            self.metadata_reads.append(("inverse", destination))
+            ordinal = model.inverse[destination]
+            packet = model.packets[owner]
+            self.metadata_reads.append(("count", destination))
+            if not 0 <= ordinal < len(packet):
+                raise ProtocolError("ordinal outside received packet")
+            self.metadata_reads.append(("destination", destination))
+            if packet[ordinal][0] != destination:
+                raise ProtocolError("packet destination disagrees with original top-k slot")
+            pointers[lane] = ("packet", owner, ordinal)
+        if model.shared is not None:
+            pointers[16] = ("shared", token)
+        self.pointers = tuple(pointers)
+
+    def read(self, slot, chunk_byte_offset=0):
+        model = self.model
+        if model.retired or model.generation != self.generation or model.handoff_done:
+            raise ProtocolError("cached row pointer cannot cross storage retirement or generation")
+        if not 0 <= slot < 32 or self.pointers[slot] is None:
+            raise ProtocolError("masked/inactive lanes must not be selected")
+        if chunk_byte_offset < 0 or chunk_byte_offset % 16:
+            raise ProtocolError("chunk offset must retain TMA alignment")
+        pointer = self.pointers[slot]
+        self.chunk_reads.append((slot, chunk_byte_offset))
+        if pointer[0] == "local":
+            return model.local[pointer[1]]
+        if pointer[0] == "shared":
+            return model.shared[pointer[1]]
+        return model.packets[pointer[1]][pointer[2]][1]

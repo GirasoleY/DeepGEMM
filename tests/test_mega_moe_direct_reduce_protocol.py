@@ -1,11 +1,11 @@
-"""R4 CPU models/source contracts, not CUDA or numerical runtime evidence."""
+"""Direct-reducer CPU models/source contracts, not CUDA runtime evidence."""
 
 from pathlib import Path
 import random
 import unittest
 
 from mega_moe_gin_direct_reduce_protocol import (
-    DirectReduceGeneration, ProtocolError, bf16, ordered_reduce,
+    DirectReduceGeneration, PreloadedTokenRows, ProtocolError, bf16, ordered_reduce,
 )
 import test_mega_moe_combine_overlap_helper as helper_contract
 
@@ -233,6 +233,109 @@ class DirectReduceModelTests(unittest.TestCase):
         self.assertEqual(ordered_reduce([values[0][0], values[0][2], values[0][1]]), 0.0)
 
 
+class DirectPreloadModelTests(unittest.TestCase):
+    @staticmethod
+    def ready(model):
+        model.acquire_world_put()
+        model.grid2()
+        model.check_packet_counts()
+        model.bridge_async_proxy()
+
+    def test_all_lanes_preload_once_and_both_chunks_keep_original_slot_order(self):
+        for source in (0, 7, 8, 15):
+            model = DirectReduceGeneration(source)
+            ids, values = fixture(48, seed=source + 100)
+            model.begin(0, ids, values)
+            self.ready(model)
+            for token, row in enumerate(ids):
+                cached = PreloadedTokenRows(model, token)
+                remote_count = sum(expert >= 0 and expert // 448 != source // 8
+                                   for expert in row)
+                self.assertEqual(len(cached.metadata_reads), 3 * remote_count)
+                metadata = tuple(cached.metadata_reads)
+                slots = [slot for slot, expert in enumerate(row) if expert >= 0]
+                for chunk_offset in (0, 3584):
+                    result = ordered_reduce([cached.read(slot, chunk_offset) for slot in slots])
+                    self.assertEqual(result, baseline([row], [values[token]])[0])
+                self.assertEqual(tuple(cached.metadata_reads), metadata)
+                self.assertEqual(cached.chunk_reads,
+                                 [(slot, offset) for offset in (0, 3584) for slot in slots])
+
+    def test_preload_does_not_reorder_cancelling_remote_local_remote_sum(self):
+        ids, values = [[-1] * 16], [[0.0] * 16]
+        ids[0][:3], values[0][:3] = [448, 0, 449], [2 ** 25, -2 ** 25, 1.0]
+        model = DirectReduceGeneration()
+        model.begin(0, ids, values)
+        self.ready(model)
+        cached = PreloadedTokenRows(model, 0)
+        for offset in (0, 3584):
+            self.assertEqual(ordered_reduce([cached.read(slot, offset) for slot in (0, 1, 2)]), 1.0)
+            self.assertEqual(ordered_reduce([cached.read(slot, offset) for slot in (0, 2, 1)]), 0.0)
+
+    def test_local_masked_shared_lanes_never_consult_stale_inverse(self):
+        ids, values = fixture(32, kind="local")
+        ids[0][3] = -1
+        model = DirectReduceGeneration()
+        model.inverse = {slot: 99999 for slot in range(17)}
+        model.begin(0, ids, values, shared=[0.25] * 32)
+        self.ready(model)
+        cached = PreloadedTokenRows(model, 0)
+        self.assertEqual(cached.metadata_reads, [])
+        self.assertFalse(model.inverse_reads)
+        self.assertEqual(cached.read(16), 0.25)
+        self.assertEqual(cached.read(1), values[0][1])
+        for slot in (3, 17, 31):
+            with self.assertRaisesRegex(ProtocolError, "masked/inactive"):
+                cached.read(slot)
+
+    def test_invalid_remote_ordinal_and_wrong_destination_fail_during_preload(self):
+        for bad in (768, 1):
+            model = DirectReduceGeneration()
+            ids, values = fixture(48, kind="hot")
+            model.begin(0, ids, values)
+            self.ready(model)
+            model.inverse[0] = bad
+            with self.assertRaises(ProtocolError):
+                PreloadedTokenRows(model, 0)
+
+    def test_preload_requires_visibility_and_cannot_survive_generation_reuse(self):
+        model = DirectReduceGeneration()
+        ids, values = fixture(32, kind="hot")
+        model.begin(0, ids, values)
+        with self.assertRaises(ProtocolError):
+            PreloadedTokenRows(model, 0)
+        self.ready(model)
+        cached = PreloadedTokenRows(model, 0)
+        self.assertEqual(cached.read(0), values[0][0])
+        complete(model)
+        with self.assertRaises(ProtocolError):
+            cached.read(0)
+        ids1, values1 = fixture(32, kind="hot", seed=7)
+        model.begin(1, ids1, values1)
+        self.ready(model)
+        with self.assertRaises(ProtocolError):
+            cached.read(0)
+        fresh = PreloadedTokenRows(model, 0)
+        self.assertEqual(fresh.read(0), values1[0][0])
+
+    def test_t48_t64_t48_only_eligible_generation_preloads(self):
+        model = DirectReduceGeneration()
+        for generation, tokens in enumerate((48, 64, 48)):
+            ids, values = fixture(tokens, kind="hot", seed=generation)
+            model.begin(generation, ids, values)
+            model.acquire_world_put()
+            model.grid2()
+            model.check_packet_counts()
+            if model.direct:
+                model.bridge_async_proxy()
+                cached = PreloadedTokenRows(model, tokens - 1)
+                self.assertEqual(cached.read(15, 3584), values[-1][15])
+            else:
+                with self.assertRaises(ProtocolError):
+                    PreloadedTokenRows(model, 0)
+            self.assertEqual(complete(model), baseline(ids, values))
+
+
 class DirectReduceSourceContracts(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -339,21 +442,50 @@ int main() {
 
     def test_remote_only_inverse_and_fullwarp_gather_before_tma_issuer(self):
         source = self.kernel
+        preload_start = source.index("uint64_t cached_combine_row_ptr = 0;")
+        chunks = source.index("// Iterate all chunks", preload_start)
+        preload = source[preload_start:chunks]
+        self.assertIn("use_gin_direct_reduce and stored_topk_slot_idx >= 0", preload)
+        self.assertLess(preload.index("if (lane_idx < kNumTopk)"),
+                        preload.index("get_combine_direct_reduce_ordinal_ptr("))
+        self.assertLess(preload.index("if (not gin_transport.is_same_lsa_peer(owner))"),
+                        preload.index("get_combine_direct_reduce_ordinal_ptr("))
+        self.assertIn("token_topk_idx = token_idx * kNumTopk + lane_idx", preload)
+        self.assertIn("DG_DEVICE_ASSERT(stored_topk_slot_idx < kNumExperts)", preload)
+        self.assertIn("DG_DEVICE_ASSERT(ordinal < received_count)", preload)
+        self.assertIn("DG_DEVICE_ASSERT(destination == token_topk_idx)", preload)
+        self.assertIn("get_bulk_combine_record_payload_ptr(", preload)
+        self.assertIn("buffer.combine_token_buffer.get_rank_buffer(lane_idx)", preload)
+        self.assertNotIn("cached_combine_row_ptr[", source)
         begin = source.index("const auto move_mask_and_load =")
         end = source.index("// Load the first selection", begin)
         body = source[begin:end]
-        self.assertLess(body.index("selected_expert = __shfl_sync("), body.index("if (cute::elect_one_sync())"))
-        remote = body.index("if (not gin_transport.is_same_lsa_peer(owner))")
-        inverse = body.index("get_combine_direct_reduce_ordinal_ptr(")
-        self.assertLess(remote, inverse)
-        self.assertIn("use_gin_direct_reduce and slot_idx < kNumTopk", body)
-        self.assertIn("DG_DEVICE_ASSERT(ordinal < received_count)", body)
-        self.assertIn("DG_DEVICE_ASSERT(destination == token_topk_idx)", body)
-        self.assertIn("get_bulk_combine_record_payload_ptr(", body)
+        self.assertLess(body.index("selected_combine_row_ptr = __shfl_sync("),
+                        body.index("if (cute::elect_one_sync())"))
+        self.assertIn("static_cast<unsigned long long>(cached_combine_row_ptr)", body)
+        self.assertIn("reinterpret_cast<void*>(selected_combine_row_ptr)", body)
+        self.assertIn("chunk_byte_offset", body)
+        self.assertNotIn("get_combine_direct_reduce_ordinal_ptr(", body)
+        self.assertNotIn("get_bulk_combine_packet_count_ptr(", body)
+        self.assertNotIn("get_bulk_combine_record_destination_ptr(", body)
         self.assertIn("buffer.combine_token_buffer.get_rank_buffer(slot_idx)", body)
-        self.assertNotIn("count_staging_buffer", body)
-        self.assertNotIn("get_expert_send_count", body)
-        self.assertNotIn("get_bulk_combine_return_index", body)
+        for forbidden in ("count_staging_buffer", "get_expert_send_count",
+                          "get_bulk_combine_return_index"):
+            self.assertNotIn(forbidden, preload + body)
+
+    def test_one_pointer_per_lane_refreshed_per_token_before_chunks(self):
+        source = self.kernel
+        preload = source.index("uint64_t cached_combine_row_ptr = 0;")
+        token_loop = source.rindex("for (uint32_t token_idx =", 0, preload)
+        chunks = source.index("for (uint32_t chunk =", preload)
+        mask = source.index("const uint32_t slot_idx = __ffs(mask) - 1;", chunks)
+        gather = source.index("selected_combine_row_ptr = __shfl_sync(", mask)
+        self.assertLess(token_loop, preload)
+        self.assertLess(preload, chunks)
+        self.assertLess(chunks, mask)
+        self.assertLess(mask, gather)
+        self.assertEqual(source.count("uint64_t cached_combine_row_ptr = 0;"), 1)
+        self.assertNotIn("__shfl_sync", source[preload:chunks])
 
     def test_single_proxy_fence_only_for_direct_reader_after_visibility_before_tma(self):
         source = self.kernel

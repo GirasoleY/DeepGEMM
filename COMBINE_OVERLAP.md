@@ -64,6 +64,18 @@ One explicit async-global proxy fence per epilogue thread before reduction
 bridges the retained target visibility into the TMA async proxy. It is not a
 network completion mechanism or an added local/world barrier.
 
+R5 changes only address preparation in that direct reader. Each valid slot's
+lane resolves one64-bit row pointer once per token, before the chunk loop.
+Remote lanes keep the exact ordinal/count and original-destination checks;
+masked lanes never read stale inverse/header entries, and local/shared lanes
+cache their original combine-buffer row. A full-warp64-bit shuffle selects the
+pointer for each original ascending slot before the elected TMA issuer adds
+the unchanged chunk offset. There is one cached pointer per lane, not a
+per-thread pointer array. Sender coalescing, all flushes, proxy fence, fallback,
+scratch layout and lifetime handoffs remain exactly R4. Reduced metadata
+dependency depth is a hypothesis; generated register/spill checks and GPU
+accuracy/timing remain required, with no promised latency saving.
+
 Only remote scatter and its third epilogue grid are removed on the eligible
 path. The existing second epilogue/dispatch handoff is moved after all reducer
 input TMA waits, including participation by CTAs with no output tokens.
@@ -91,6 +103,6 @@ control35.120/35.296us. Those windows include count checks/CTA arrival spread;
 they are not isolated copy costs or promised savings. These software intervals
 do not prove physical NIC/MMA overlap or isolate pure posting cost.
 
-Execution records: /Users/girasoley/dev/projects/novita-b300-vllm/artifacts/20260908/megamoe-direct-reduce/
+Execution records: /Users/girasoley/dev/projects/novita-b300-vllm/artifacts/20260908/megamoe-direct-preload/
 Prior evidence: ../megamoe-expert-ready/, ../megamoe-peer-ready/,
-and ../megamoe-ready-coalesce/.
+../megamoe-ready-coalesce/ and ../megamoe-direct-reduce/.

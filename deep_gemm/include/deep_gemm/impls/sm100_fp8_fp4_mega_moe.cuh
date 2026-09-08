@@ -4125,6 +4125,49 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 (kNumSharedExperts > 0 and lane_idx == kNumTopk ? static_cast<int>(kNumTopk) : -1);
             const uint32_t total_mask = __ballot_sync(0xffffffff, stored_topk_slot_idx >= 0);
 
+            // Each valid slot's lane resolves its row once per token, in
+            // parallel, then reuses one pointer across all chunks. Inactive
+            // lanes never consult the inverse map; local/shared slots retain
+            // their original combine-buffer row. The final Put/grid2/proxy
+            // handoff above has already published the immutable packet data.
+            uint64_t cached_combine_row_ptr = 0;
+            if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
+#ifdef DG_MEGAMOE_GIN
+                if (use_gin_direct_reduce and stored_topk_slot_idx >= 0) {
+                    cached_combine_row_ptr = reinterpret_cast<uint64_t>(
+                        buffer.combine_token_buffer.get_rank_buffer(lane_idx)
+                            .get_data_buffer(token_idx).get_base_ptr());
+                    if (lane_idx < kNumTopk) {
+                        DG_DEVICE_ASSERT(stored_topk_slot_idx < kNumExperts);
+                        const uint32_t owner =
+                            static_cast<uint32_t>(stored_topk_slot_idx) / kNumExpertsPerRank;
+                        if (not gin_transport.is_same_lsa_peer(owner)) {
+                            const uint32_t token_topk_idx = token_idx * kNumTopk + lane_idx;
+                            // Only current active remote assignments read
+                            // these source-packed ordinals. Validate both the
+                            // packet bound and original destination identity.
+                            const uint32_t ordinal =
+                                *buffer.gin_workspace.get_combine_direct_reduce_ordinal_ptr(
+                                    token_topk_idx);
+                            const uint32_t owner_in_lsa = owner %
+                                static_cast<uint32_t>(gin_transport.dev_comm.lsaSize);
+                            const uint32_t received_count = ptx::ld_acq_sys(
+                                buffer.gin_workspace.get_bulk_combine_packet_count_ptr(
+                                    /*send=*/ false, owner_in_lsa));
+                            DG_DEVICE_ASSERT(ordinal < received_count);
+                            const uint32_t destination = ptx::ld_acq_sys(
+                                buffer.gin_workspace.get_bulk_combine_record_destination_ptr(
+                                    /*send=*/ false, owner_in_lsa, ordinal));
+                            DG_DEVICE_ASSERT(destination == token_topk_idx);
+                            cached_combine_row_ptr = reinterpret_cast<uint64_t>(
+                                buffer.gin_workspace.get_bulk_combine_record_payload_ptr(
+                                    /*send=*/ false, owner_in_lsa, ordinal));
+                        }
+                    }
+                }
+#endif
+            }
+
             // Iterate all chunks
             for (uint32_t chunk = 0; chunk < kNumChunks; ++ chunk) {
                 const uint32_t chunk_byte_offset = chunk * kNumChunkBytes;
@@ -4137,13 +4180,16 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t slot_idx = __ffs(mask) - 1;
                         mask ^= 1 << slot_idx;
 
-                        int selected_expert = -1;
+                        uint64_t selected_combine_row_ptr = 0;
                         if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
-                            if (use_gin_direct_reduce and slot_idx < kNumTopk) {
+                            if (use_gin_direct_reduce) {
                                 // This is a full-warp gather, never inside the
-                                // elected TMA issuer's divergent branch.
-                                selected_expert = __shfl_sync(
-                                    0xffffffffu, stored_topk_slot_idx, slot_idx);
+                                // elected TMA issuer's divergent branch. The
+                                // original ascending slot order is unchanged.
+                                selected_combine_row_ptr = __shfl_sync(
+                                    0xffffffffu,
+                                    static_cast<unsigned long long>(cached_combine_row_ptr),
+                                    slot_idx);
                             }
                         }
 
@@ -4154,38 +4200,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                                     .get_data_buffer(token_idx).get_base_ptr(),
                                 chunk_byte_offset);
                             if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
-#ifdef DG_MEGAMOE_GIN
-                                if (use_gin_direct_reduce and slot_idx < kNumTopk) {
-                                    DG_DEVICE_ASSERT(selected_expert >= 0 and
-                                                     selected_expert < kNumExperts);
-                                    const uint32_t owner =
-                                        static_cast<uint32_t>(selected_expert) / kNumExpertsPerRank;
-                                    if (not gin_transport.is_same_lsa_peer(owner)) {
-                                        const uint32_t token_topk_idx = token_idx * kNumTopk + slot_idx;
-                                        // Active remote assignments are each
-                                        // overwritten by actual source packing
-                                        // this launch. Local/masked/shared slots
-                                        // never consult an inverse-map entry.
-                                        const uint32_t ordinal =
-                                            *buffer.gin_workspace.get_combine_direct_reduce_ordinal_ptr(
-                                                token_topk_idx);
-                                        const uint32_t owner_in_lsa = owner %
-                                            static_cast<uint32_t>(gin_transport.dev_comm.lsaSize);
-                                        const uint32_t received_count = ptx::ld_acq_sys(
-                                            buffer.gin_workspace.get_bulk_combine_packet_count_ptr(
-                                                /*send=*/ false, owner_in_lsa));
-                                        DG_DEVICE_ASSERT(ordinal < received_count);
-                                        const uint32_t destination = ptx::ld_acq_sys(
-                                            buffer.gin_workspace.get_bulk_combine_record_destination_ptr(
-                                                /*send=*/ false, owner_in_lsa, ordinal));
-                                        DG_DEVICE_ASSERT(destination == token_topk_idx);
-                                        src_ptr = math::advance_ptr<uint8_t>(
-                                            buffer.gin_workspace.get_bulk_combine_record_payload_ptr(
-                                                /*send=*/ false, owner_in_lsa, ordinal),
-                                            chunk_byte_offset);
-                                    }
+                                if (use_gin_direct_reduce) {
+                                    src_ptr = math::advance_ptr<uint8_t>(
+                                        reinterpret_cast<void*>(selected_combine_row_ptr),
+                                        chunk_byte_offset);
                                 }
-#endif
                             }
                             ptx::tma_load_1d(combine_load_buffer[i], src_ptr, combine_load_barriers[i], kNumChunkBytes);
                             ptx::mbarrier_arrive_and_set_tx(combine_load_barriers[i], kNumChunkBytes);

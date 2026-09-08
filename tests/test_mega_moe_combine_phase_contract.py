@@ -66,6 +66,11 @@ class CombinePhaseContract(unittest.TestCase):
         self.assertEqual(result["direct_reducer"]["required_scratch_extent_bytes"], 62720)
         self.assertEqual(result["direct_reducer"]["additional_source_local_ordinal_bytes"], 3072)
         self.assertTrue(result["direct_reducer"]["policy_not_device_observation"])
+        self.assertEqual(result["direct_reducer"]["address_preparation"],
+                         "lane_local_token_row_pointer_preload_before_chunk_loop")
+        self.assertIs(result["direct_reducer"]["full_warp_pointer_gather_before_elected_issuer"], True)
+        self.assertIs(type(result["direct_reducer"]["metadata_resolution_passes_per_active_remote_assignment_per_token"]), int)
+        self.assertEqual(result["direct_reducer"]["metadata_resolution_passes_per_active_remote_assignment_per_token"], 1)
         self.assertEqual(result["direct_reducer"]["added_barriers"], 0)
         self.assertIn("async_global_proxy_fence", result["direct_reducer"]["target_visibility_to_tma_proxy"])
         self.assertIn("deferred_until_all_local_packet_reads_complete", result["direct_reducer"]["cleanup_handoff"])

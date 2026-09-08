@@ -28,11 +28,17 @@ class ComparisonContractTest(unittest.TestCase):
                  "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
                  "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1"}
         metadata = comparison.dispatch_candidate_metadata(flags)
-        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_ready_coalesced_direct_reduce")
+        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_ready_coalesced_direct_reduce_preload")
         contract = metadata["combine_overlap_contract"]
         self.assertEqual(contract["requested_raw"], "1")
         self.assertTrue(contract["requested"])
         reducer = contract["direct_reducer"]
+        self.assertEqual(reducer["address_preparation"],
+                         "lane_local_token_row_pointer_preload_before_chunk_loop")
+        self.assertIs(reducer["full_warp_pointer_gather_before_elected_issuer"], True)
+        self.assertIs(type(reducer["metadata_resolution_passes_per_active_remote_assignment_per_token"]), int)
+        self.assertEqual(reducer["metadata_resolution_passes_per_active_remote_assignment_per_token"], 1)
+        self.assertTrue(reducer["policy_not_device_observation"])
         self.assertTrue(reducer["requested"])
         self.assertTrue(reducer["source_inverse_written_during_actual_pack"])
         self.assertTrue(reducer["received_count_and_put_visibility_preserved"])
