@@ -1658,6 +1658,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     first_total + second_inclusive -
                                     second_count;
 
+                                if constexpr (kMegaMoeGinCombineOverlap) {
+                                    if (use_gin_combine_overlap) {
+                                        // All 32 lanes participate, including
+                                        // zero-padded experts56..63. Save the
+                                        // masks during the existing count scan,
+                                        // not in a new pre-submission scan.
+                                        const uint32_t first_nonempty = __ballot_sync(
+                                            0xffffffffu, first_count != 0);
+                                        const uint32_t second_nonempty = __ballot_sync(
+                                            0xffffffffu, second_count != 0);
+                                        if (lane_idx == 0) {
+                                            *buffer.gin_workspace.get_combine_overlap_nonempty_mask_ptr(
+                                                source_lane, 0u) = first_nonempty;
+                                            *buffer.gin_workspace.get_combine_overlap_nonempty_mask_ptr(
+                                                source_lane, 1u) = second_nonempty;
+                                        }
+                                    }
+                                }
+
                                 DG_DEVICE_ASSERT(
                                     first_count <=
                                     layout::kMegaMoeGinDirectDispatchMaxTokens);
@@ -1747,20 +1766,42 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     remote_source, local_expert) = count;
 
                                 uint32_t route_prefix = 0;
+                                uint32_t nonempty_mask = 0;
+                                const uint32_t expert_group = local_expert / 32u;
+                                const bool mask_writer = local_expert == 31u or
+                                    local_expert + 1u == kNumExpertsPerRank;
                                 #pragma unroll
                                 for (uint32_t prior_expert = 0;
                                      prior_expert < local_expert;
                                      ++prior_expert) {
-                                    route_prefix += static_cast<uint32_t>(
+                                    const uint32_t prior_count = static_cast<uint32_t>(
                                         packed_counts[prior_expert]);
+                                    route_prefix += prior_count;
+                                    if constexpr (kMegaMoeGinCombineOverlap) {
+                                        // Exactly experts31/55 write one mask
+                                        // per source, using count loads already
+                                        // needed for their scalar prefix. No
+                                        // atomic OR or additional count scan.
+                                        if (use_gin_combine_overlap and mask_writer and
+                                            prior_expert / 32u == expert_group and
+                                            prior_count != 0)
+                                            nonempty_mask |= 1u << (prior_expert % 32u);
+                                    }
                                 }
                                 DG_DEVICE_ASSERT(
                                     route_prefix + count <= layout::
                                         kMegaMoeGinDirectDispatchMaxRoutes);
                                 if constexpr (kMegaMoeGinCombineOverlap) {
-                                    if (use_gin_combine_overlap)
+                                    if (use_gin_combine_overlap) {
                                         *buffer.gin_workspace.get_combine_overlap_prefix_ptr(
                                             source_lane, local_expert) = route_prefix;
+                                        if (mask_writer) {
+                                            if (count != 0)
+                                                nonempty_mask |= 1u << (local_expert % 32u);
+                                            *buffer.gin_workspace.get_combine_overlap_nonempty_mask_ptr(
+                                                source_lane, expert_group) = nonempty_mask;
+                                        }
+                                    }
                                 }
                                 const auto* packed_routes =
                                     buffer.gin_workspace
@@ -2300,12 +2341,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const uint32_t peer = remote_base + lane_idx;
                 uint32_t sent_records = 0;
                 uint32_t expected_fragments[kNumExpertGroups];
-                bool retired[kNumExpertGroups];
-                uint32_t remaining_experts = 0;
+                bool discovered[kNumExpertGroups];
+                uint32_t ready_masks[kNumExpertGroups];
+                uint32_t pending[kNumExpertGroups];
                 // Counts are exact, published before pulls, and remain live
                 // until the existing second dispatch/epilogue handoff. Read
                 // lane-owned cells directly: no varying-index scheduler query
                 // or row/metadata reconstruction belongs in this progress loop.
+                // Each peer loads just its two saved nonempty masks, avoiding
+                // a new 56-expert setup scan before the first submission.
                 #pragma unroll
                 for (uint32_t group = 0; group < kNumExpertGroups; ++group) {
                     const uint32_t expert = group * 32u + lane_idx;
@@ -2314,87 +2358,109 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         const uint32_t tokens = static_cast<uint32_t>(
                             *workspace.get_expert_recv_count_sum_ptr(expert));
                         target = math::ceil_div(tokens, BLOCK_M) * kNumL2Fragments;
-                        if (target == 0)
-                            *buffer.gin_workspace.get_combine_overlap_sent_ptr(expert) = 1;
                     }
                     expected_fragments[group] = target;
-                    retired[group] = target == 0;
-                    remaining_experts += __popc(__ballot_sync(
-                        0xffffffffu, target != 0));
+                    discovered[group] = target == 0;
+                    ready_masks[group] = 0;
+                    pending[group] = peer_lane
+                        ? *buffer.gin_workspace.get_combine_overlap_nonempty_mask_ptr(
+                              lane_idx, group)
+                        : 0u;
+                    if (group == 1u)
+                        DG_DEVICE_ASSERT((pending[group] >> (kNumExpertsPerRank - 32u)) == 0);
                 }
 
-                while (remaining_experts != 0) {
-                    uint32_t ready_masks[kNumExpertGroups];
+                // Every lane stays in the uniform outer loop, including idle
+                // peers and lanes8..31 which discover the other experts. Peer
+                // lanes may choose DIFFERENT experts in the same PUT round.
+                while (__any_sync(0xffffffffu, (pending[0] | pending[1]) != 0)) {
                     // Parallel readiness probes for experts0..31 and32..55.
-                    // Never block on an unfinished earlier expert. A producer
-                    // updates only its own expert counter and never waits for
-                    // the NIC, drainer, or reuse of an output slot.
+                    // Discovery is monotonic and common to the warp; sending
+                    // to one peer never retires readiness for another peer.
+                    // Producers never wait for the NIC or reuse these slabs.
                     #pragma unroll
                     for (uint32_t group = 0; group < kNumExpertGroups; ++group) {
                         const uint32_t expert = group * 32u + lane_idx;
-                        bool ready = false;
-                        if (not retired[group]) {
+                        bool newly_ready = false;
+                        if (not discovered[group]) {
                             const uint32_t completed =
                                 comm::mega_moe_gin_combine_ready_acquire(
                                     buffer.gin_workspace.get_combine_overlap_ready_ptr(expert));
                             DG_DEVICE_ASSERT(completed <= expected_fragments[group]);
-                            ready = completed == expected_fragments[group];
+                            newly_ready = completed == expected_fragments[group];
+                            discovered[group] = newly_ready;
                         }
-                        ready_masks[group] = __ballot_sync(0xffffffffu, ready);
+                        ready_masks[group] |= __ballot_sync(0xffffffffu, newly_ready);
                     }
-                    #pragma unroll
-                    for (uint32_t group = 0; group < kNumExpertGroups; ++group) {
-                        uint32_t ready_mask = ready_masks[group];
-                        while (ready_mask != 0) {
-                            const uint32_t selected_lane = __ffs(ready_mask) - 1;
-                            const uint32_t expert = group * 32u + selected_lane;
-                            const uint32_t target = __shfl_sync(
-                                0xffffffffu, expected_fragments[group], selected_lane);
-                            DG_GIN_TRACE_FIRST_IF(lane_idx == 0, 99);
-                            if (peer_lane) {
-                                // Poll discovery is not a substitute for each
-                                // issuing lane's acquire of ALL M×N producers.
-                                // The subsequent required-system PUT bridges
-                                // this complete expert's acquired device writes.
-                                uint32_t completed;
-                                do {
-                                    completed = comm::mega_moe_gin_combine_ready_acquire(
-                                        buffer.gin_workspace.get_combine_overlap_ready_ptr(expert));
-                                    DG_DEVICE_ASSERT(completed <= target);
-                                } while (completed != target);
-                                const uint32_t count = static_cast<uint32_t>(
-                                    *workspace.get_expert_recv_count_ptr(peer, expert));
-                                const uint32_t prefix =
-                                    *buffer.gin_workspace.get_combine_overlap_prefix_ptr(lane_idx, expert);
-                                DG_DEVICE_ASSERT(prefix + count <=
-                                    layout::kMegaMoeGinBulkCombineMaxTokens * kNumTopk);
-                                if (count != 0) {
-                                    // Issue this ready expert NOW. No pending
-                                    // full-scan coalescing and no metadata walk.
-                                    comm::mega_moe_gin_put_bulk_combine_span(
-                                        gin_transport, peer, /*context_stripe=*/ 0u,
-                                        sym_buffer.get_base_ptr(),
-                                        buffer.gin_workspace.get_bulk_combine_record_ptr(
-                                            /*send=*/ true, lane_idx, prefix),
-                                        buffer.gin_workspace.get_bulk_combine_record_ptr(
-                                            /*send=*/ false, owner_lane, prefix),
-                                        count * buffer.gin_workspace.bulk_record_bytes,
-                                        /*diagnostic_peer_lane=*/ lane_idx);
-                                    sent_records += count;
-                                }
-                            }
-                            __syncwarp();
-                            if (lane_idx == selected_lane) {
-                                retired[group] = true;
-                                *buffer.gin_workspace.get_combine_overlap_sent_ptr(expert) = 1;
-                            }
-                            --remaining_experts;
-                            ready_mask &= ready_mask - 1u;
-                        }
+
+                    const uint32_t available_first = pending[0] & ready_masks[0];
+                    const uint32_t available_second = pending[1] & ready_masks[1];
+                    const uint32_t selected_group = available_first != 0 ? 0u : 1u;
+                    const uint32_t selected_mask = available_first != 0
+                        ? available_first : available_second;
+                    const bool issue = peer_lane and selected_mask != 0;
+                    const uint32_t selected_lane = selected_mask != 0
+                        ? static_cast<uint32_t>(__ffs(selected_mask) - 1) : 0u;
+                    // Both shuffles are full-warp and use fixed source groups.
+                    // Shuffling expected_fragments[selected_group] once would
+                    // select the SOURCE lane's group, not this peer's group.
+                    const uint32_t first_target = __shfl_sync(
+                        0xffffffffu, expected_fragments[0], selected_lane);
+                    const uint32_t second_target = __shfl_sync(
+                        0xffffffffu, expected_fragments[1], selected_lane);
+                    const uint32_t target = selected_group == 0u
+                        ? first_target : second_target;
+#if DG_MEGAMOE_GIN_DIAGNOSTICS
+                    const uint32_t issuing_lanes = __ballot_sync(0xffffffffu, issue);
+                    DG_GIN_TRACE_FIRST_IF(lane_idx == 0 and issuing_lanes != 0, 99);
+#endif
+
+                    if (issue) {
+                        const uint32_t expert = selected_group * 32u + selected_lane;
+                        DG_DEVICE_ASSERT(expert < kNumExpertsPerRank and target != 0);
+                        // Each issuer acquires ALL M×N producer contributions
+                        // for its own selected expert. ncclCoopThread then
+                        // submits the same single nonaggregate per-expert PUT;
+                        // no other peer's selection or future readiness gates it.
+                        uint32_t completed;
+                        do {
+                            completed = comm::mega_moe_gin_combine_ready_acquire(
+                                buffer.gin_workspace.get_combine_overlap_ready_ptr(expert));
+                            DG_DEVICE_ASSERT(completed <= target);
+                        } while (completed != target);
+                        const uint32_t count = static_cast<uint32_t>(
+                            *workspace.get_expert_recv_count_ptr(peer, expert));
+                        const uint32_t prefix =
+                            *buffer.gin_workspace.get_combine_overlap_prefix_ptr(lane_idx, expert);
+                        DG_DEVICE_ASSERT(count != 0 and prefix + count <=
+                            layout::kMegaMoeGinBulkCombineMaxTokens * kNumTopk);
+                        comm::mega_moe_gin_put_bulk_combine_span(
+                            gin_transport, peer, /*context_stripe=*/ 0u,
+                            sym_buffer.get_base_ptr(),
+                            buffer.gin_workspace.get_bulk_combine_record_ptr(
+                                /*send=*/ true, lane_idx, prefix),
+                            buffer.gin_workspace.get_bulk_combine_record_ptr(
+                                /*send=*/ false, owner_lane, prefix),
+                            count * buffer.gin_workspace.bulk_record_bytes,
+                            /*diagnostic_peer_lane=*/ lane_idx);
+                        sent_records += count;
+                        pending[selected_group] &= ~(1u << selected_lane);
                     }
+                    __syncwarp();
                 }
 
                 DG_GIN_TRACE_IF(lane_idx == 0, 100);
+                // Preserve the old scratch partition with one writer per
+                // expert. These entries now mean ALL remote submissions are
+                // queued (vacuously true for local/empty experts), not that
+                // computation or remote visibility has completed. They are
+                // bookkeeping only, never a producer/receiver readiness flag.
+                #pragma unroll
+                for (uint32_t group = 0; group < kNumExpertGroups; ++group) {
+                    const uint32_t expert = group * 32u + lane_idx;
+                    if (expert < kNumExpertsPerRank)
+                        *buffer.gin_workspace.get_combine_overlap_sent_ptr(expert) = 1;
+                }
                 if (peer_lane) {
                     uint32_t expected_records = 0;
                     for (uint32_t expert = 0; expert < kNumExpertsPerRank; ++expert)

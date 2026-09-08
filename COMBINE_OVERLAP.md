@@ -1,47 +1,51 @@
-# Completed-block combine experiment
+# Peer-parallel expert-ready combine experiment
 
-Status on 2026-09-08: source prepared and independently reviewed; 259 local
-CPU tests passed. CUDA compilation, device accuracy/liveness, and timings are
-pending. This is not a newly GPU-validated checkpoint or a measured speedup.
+Status on2026-09-08: R2 source prepared; CUDA and GPU validation pending.
+R1 expert-ready source remains at cd1aaf9 and its separate deployment.
+R1 passed its short GPU correctness screen but regressed to784/795us for
+half/all remote versus390/411us controls; it is not a selected strategy.
 
-This is a separate opt-in experiment on dispatch checkpoint `ee1b644`, not a
-compute-only EP1 replacement. Compute math, tile selection, scheduler, SM count
-and warp roles remain unchanged. `FUSED_OVERLAP.md` describes the validated
-dispatch baseline; its reported results do not validate this new combine mode.
+This remains one fused MegaMoE kernel, not an EP1 compute replacement.
+The existing dispatch-overlap and single-combine-context paths stay fixed.
+Compute math, tiling, scheduler, SM count and warp allocation are unchanged.
+DG_MEGAMOE_GIN_COMBINE_OVERLAP=1 is opt-in; default0 retains the baseline.
 
-`DG_MEGAMOE_GIN_COMBINE_OVERLAP=1` requires the selected dispatch-overlap and
-single-context-combine modes. Default0 preserves the prior path. Runtime local
-or T64/ineligible launches retain their old behavior. An actual-BM scratch fit
-guard also falls back without changing registered allocation or offsets.
+Dispatch saves exact source/expert prefixes and two nonempty masks per peer
+during its existing count scan. Scratch is2304B after57344B direct control:
+56 ready counts,56 final-bookkeeping entries,8x56 prefixes and8x2 mask words.
+Existing offsets and registered allocation are unchanged. Exact per-rank fit
+requires59648B of available tail storage; ineligible/fallback launches retain
+their prior behavior, and the next eligible dispatch overwrites every mask.
 
-The L2 epilogue's existing full-thread barrier publishes each completed N
-fragment through a device-release counter. A logical M-block becomes ready
-only after all its N fragments finish. SM0 dispatch warp0, after its own pulls,
-acquires those counters and sends ready compact record spans. It scans around
-unfinished blocks and merges only adjacent, entirely ready per-peer records.
-No producer waits for sends or reuses the immutable output slab.
+Each expert becomes ready after all actual M-block/N-fragment producers
+publish through the existing epilogue barrier and device-release counter.
+Hot experts are not truncated or sized from a balanced-load hint.
 
-Readiness uses full logical pool blocks, never reusable ring indices. Both
-counter and claimed-state arrays alias only the unused tail after the compact
-direct-control storage. Initialize them on every eligible invocation, including
-after a fallback. Every issuing lane acquires readiness; GIN's explicit system
-release then publishes producer data before NIC access. Default non-aggregate
-PUTs retain queue-credit checks and doorbell submission.
+SM0 dispatch warp0 starts draining only after its own pulls. All32 lanes
+discover ready experts with uniform ballots. Each peer lane selects its own
+pending ready expert, so different peers may issue different expert spans in
+one warp round. Two uniform fixed-group target shuffles precede peer-specific
+selection; each issuer independently acquires the exact producer target.
+The unchanged required-system, nonaggregate GIN PUT publishes that span.
+Pending bits clear only after submission, with no wait for future readiness,
+new metadata scan, packet coalescing or new communication warp.
 
-Flush early sends before the original dispatch/epilogue handoff. Publish only
-the packet count header at the original late point, retaining the final world
-Put barrier, scatter and reduction. This prevents duplicate payload sends and
-keeps the receiver's startup count-clear ordering unchanged.
+Readiness discovery is monotonic and shared, while pending state is peer-local.
+A send to one peer cannot retire another peer's pending expert. The preserved
+sent array is final bookkeeping only, not compute or remote-visibility proof.
+Late flushes, count headers, world Put completion, scatter, ordered reduction
+and cleanup retain their existing protocol and lifetime boundaries.
 
-Validation entry point: `tests/bench_mega_moe_combine_overlap.py`, which reuses
-the dispatch runner's native sparse oracle, exact counts, bitwise comparisons,
-graph payload changes, fixed-T extreme imbalance and T48/64/48 lifetime gates.
-It fixes dispatch1/SC1 and varies only combine0/1/0. Dense native-reference
-accuracy is separate, with unchanged numerical thresholds and identical
-context/weights/storage for the combine0 control.
+Validation: tests/bench_mega_moe_combine_overlap.py compares combine0/1/0 in
+one allocation, with native sparse, bitwise, hot/masked/asymmetric, changed
+payload and T48/64/48 graph-reuse gates. Separate random-dense native accuracy
+and fresh matched DeepEP/TRT pipeline measurements are required to accept a
+performance winner. No numerical threshold is relaxed.
 
-Current execution status and raw evidence belong in
-`dev/novita-b300-vllm/artifacts/20260908/megamoe-combine-overlap/` in the shared
-workspace. Local source/helper tests do not establish CUDA compilation, device
-correctness, queue-wrap liveness, or a performance improvement. Diagnostics of
-early PUT issue versus remaining epilogue work are not physical IB/MMA traces.
+R1 diagnostics observed earliest issue about93us before last epilogue, but
+all payloads were queued about404/415us AFTER last epilogue for half/all remote.
+These same-GPU software intervals motivate independent peer selection; they
+do not prove physical NIC/MMA overlap or isolate pure posting cost.
+
+Execution records: /Users/girasoley/dev/projects/novita-b300-vllm/artifacts/20260908/megamoe-peer-ready/
+R1 evidence: ../megamoe-expert-ready/ within that artifact parent.

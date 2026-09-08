@@ -4,8 +4,9 @@ Descriptors depend only on exact dispatch counts. Producer identities are
 explicit here to detect missing/duplicate publications; the real counter is an
 integer, not a set. Local completion and remote visibility remain distinct.
 Fallback spans below describe logical record coverage, not the number of PUTs
-in the unchanged row fallback. The historical completed-M-block model is
-retained in its original module.
+in the unchanged row fallback. ExpertReadyGeneration retains the R1 common
+expert-selection model; PeerReadyGeneration specifies R2 peer-local masks.
+Neither model simulates warp scheduling, NIC credits, or elapsed time.
 """
 
 from dataclasses import dataclass
@@ -206,3 +207,146 @@ class ExpertReadyGeneration:
                 any(len(done) != target for done, target in zip(self.releases, self.targets)):
             raise ProtocolError("producer/consumer work remains before reset")
         self.retired = True
+
+
+class PeerReadyGeneration(ExpertReadyGeneration):
+    """R2: common monotonic readiness discovery, independent peer selection.
+
+    A wave selects at most one ready expert per peer. Each peer issues only its
+    own contiguous saved-prefix span and clears its own pending bit afterward.
+    Two conceptual full-warp target gathers always occur before issue, even
+    when peers select different groups or have no work. Actual CUDA collective
+    participation/order is checked separately against the runtime source.
+    """
+
+    NUM_EXPERTS = 56
+    GROUP_MASKS = (0xffffffff, 0x00ffffff)
+
+    def begin(self, generation, counts, **kwargs):
+        counts = tuple(tuple(row) for row in counts)
+        if counts and len(counts[0]) > self.NUM_EXPERTS:
+            raise ValueError("at most 56 expert mask bits are supported")
+        super().begin(generation, counts, **kwargs)
+        self.nonempty_masks = {
+            peer: tuple(sum(1 << (expert % 32)
+                            for expert in range(group * 32,
+                                                min((group + 1) * 32, len(self.totals)))
+                            if self.descriptors[peer, expert][1])
+                        for group in range(2))
+            for peer in self.peers
+        }
+        self.pending_masks = {peer: list(masks)
+                              for peer, masks in self.nonempty_masks.items()}
+        self.discovered_masks = [0, 0]
+        self.target_gathers = []
+        self.sent_bookkeeping = set()
+
+    def _validate_masks(self):
+        for peer in self.peers:
+            for group in range(2):
+                pending = self.pending_masks[peer][group]
+                if type(pending) is not int or pending < 0 or \
+                        pending & ~self.GROUP_MASKS[group] or \
+                        pending & ~self.nonempty_masks[peer][group]:
+                    raise ProtocolError("pending masks must retain only valid nonempty expert bits")
+
+    def poll_ready_masks(self, generation):
+        self._check(generation)
+        self._validate_masks()
+        for expert, target in enumerate(self.targets):
+            # Runtime initializes zero-target discovery as already finished,
+            # without setting a ready bit; no peer can need such an expert.
+            if target and len(self.releases[expert]) == target:
+                self.discovered_masks[expert // 32] |= 1 << (expert % 32)
+        return tuple(self.discovered_masks)
+
+    def select_wave(self, generation):
+        """Select independently from ready AND pending, never pending alone."""
+        ready = self.poll_ready_masks(generation)
+        selections = {}
+        for peer in self.peers:
+            selections[peer] = None
+            for group in range(2):
+                available = ready[group] & self.pending_masks[peer][group]
+                if available:
+                    lane = (available & -available).bit_length() - 1
+                    selections[peer] = group * 32 + lane
+                    break
+        # Both group gathers are unconditional; a selected lane may differ for
+        # each peer. Out-of-range group-1 lanes and idle peers have safe values.
+        gathered = [{}, {}]
+        for group in range(2):
+            for peer, expert in selections.items():
+                lane = 0 if expert is None else expert % 32
+                index = group * 32 + lane
+                gathered[group][peer] = self.targets[index] if index < len(self.targets) else 0
+        self.target_gathers.append(tuple(gathered))
+        return {
+            peer: (expert, None if expert is None else gathered[expert // 32][peer])
+            for peer, expert in selections.items()
+        }
+
+    def issue_expert(self, generation, expert):
+        raise ProtocolError("R2 issues each peer span independently, not one common expert")
+
+    def issue_peer(self, generation, peer, expert, *, selected_target=None):
+        self._check(generation)
+        self._validate_masks()
+        if not self.early or self.headers or peer not in self.peers or \
+                not 0 <= expert < len(self.totals):
+            raise ProtocolError("invalid peer publication phase")
+        group, bit = expert // 32, 1 << (expert % 32)
+        if not self.pending_masks[peer][group] & bit:
+            raise ProtocolError("peer/expert span is empty or already published")
+        if selected_target is not None and selected_target != self.targets[expert]:
+            raise ProtocolError("selected target must come from the correct expert group")
+        if len(self.releases[expert]) != self.targets[expert]:
+            raise ProtocolError("all actual M-block/N-fragment producers required")
+        if peer not in self.acquires[expert]:
+            raise ProtocolError("each actual issuer must acquire selected readiness")
+        begin, count = self.descriptors[peer, expert]
+        span = ExpertSpan(generation, peer, expert, begin, count)
+        records = {(peer, ordinal) for ordinal in range(begin, begin + count)}
+        if records & self.issued_records:
+            raise ProtocolError("overlapping or duplicate record span")
+        self.spans.append(span)
+        self.issued_records.update(records)
+        # Represents helper return, not remote delivery or even local flush.
+        self.pending_masks[peer][group] &= ~bit
+        return span
+
+    def finish_queuing(self, generation):
+        self._check(generation)
+        self._validate_masks()
+        if any(any(masks) for masks in self.pending_masks.values()):
+            raise ProtocolError("every peer must queue every nonempty span")
+        # Sent storage is only end-of-drain bookkeeping. A local-only expert
+        # may still be computing, so these words cannot imply compute-ready.
+        self.sent_bookkeeping = set(range(len(self.totals)))
+
+    def drain_ready(self, generation, peer_order=None):
+        self._check(generation)
+        if not self.early:
+            return ()
+        peer_order = self.peers if peer_order is None else tuple(peer_order)
+        if len(peer_order) != len(self.peers) or set(peer_order) != set(self.peers):
+            raise ProtocolError("wave must visit every peer exactly once")
+        emitted = []
+        while True:
+            selections = self.select_wave(generation)
+            if all(expert is None for expert, _ in selections.values()):
+                break
+            for peer in peer_order:
+                expert, target = selections[peer]
+                if expert is not None:
+                    self.acquire(generation, expert, peer)
+                    emitted.append(self.issue_peer(generation, peer, expert,
+                                                   selected_target=target))
+        if not any(any(masks) for masks in self.pending_masks.values()):
+            self.finish_queuing(generation)
+        return tuple(emitted)
+
+    def flush_payloads(self, generation):
+        if self.early:
+            self.finish_queuing(generation)
+        super().flush_payloads(generation)

@@ -68,13 +68,18 @@ static constexpr uint32_t kMegaMoeGinDirectDispatchStorageBytes =
 // their storage bound is independent of imbalance or the selected BLOCK_M.
 static constexpr uint32_t kMegaMoeGinCombineOverlapNumExperts =
     kMegaMoeGinDirectDispatchExpertsPerRank;
+static constexpr uint32_t kMegaMoeGinCombineOverlapNumExpertGroups =
+    (kMegaMoeGinCombineOverlapNumExperts + 31u) / 32u;
 CUTLASS_HOST_DEVICE constexpr uint64_t
 get_mega_moe_gin_combine_overlap_scratch_bytes() {
     // 56 ready counts, 56 sent entries, and one saved prefix for each of the
-    // eight remote sources ×56 experts. Counts stay in their existing cells.
-    // No registered allocation or legacy offset changes.
+    // eight remote sources ×56 experts, followed by two nonempty-expert masks
+    // per source. Counts stay in their existing cells; the appended masks do
+    // not change any existing prefix, registered allocation or legacy offset.
     return (2ull + kMegaMoeGinDirectDispatchNumPeers) * sizeof(uint32_t) *
-        kMegaMoeGinCombineOverlapNumExperts;
+               kMegaMoeGinCombineOverlapNumExperts +
+           uint64_t(kMegaMoeGinDirectDispatchNumPeers) * sizeof(uint32_t) *
+               kMegaMoeGinCombineOverlapNumExpertGroups;
 }
 
 // Pool capacity for shared expert token pool: worst-case total tokens + per-expert BLOCK_M alignment padding, among all possible BLOCK_M
@@ -674,6 +679,17 @@ struct MegaMoeGinWorkspace {
         DG_UNIFIED_ASSERT(source_lane < kMegaMoeGinDirectDispatchNumPeers);
         return get_combine_overlap_ready_ptr(local_expert) +
             (2u + source_lane) * kMegaMoeGinCombineOverlapNumExperts;
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_combine_overlap_nonempty_mask_ptr(
+            const uint32_t source_lane, const uint32_t expert_group) const {
+        DG_UNIFIED_ASSERT(source_lane < kMegaMoeGinDirectDispatchNumPeers);
+        DG_UNIFIED_ASSERT(expert_group < kMegaMoeGinCombineOverlapNumExpertGroups);
+        return get_combine_overlap_ready_ptr(0) +
+            (2u + kMegaMoeGinDirectDispatchNumPeers) *
+                kMegaMoeGinCombineOverlapNumExperts +
+            source_lane * kMegaMoeGinCombineOverlapNumExpertGroups + expert_group;
     }
 
     CUTLASS_HOST_DEVICE

@@ -1,4 +1,4 @@
-"""Accuracy-gated dynamic expert-ready COMBINE experiment; no compute tuning.
+"""Accuracy-gated peer-parallel expert-ready COMBINE; no compute tuning.
 
 Two-node torchrun, eight ranks/node:
   python tests/bench_mega_moe_combine_overlap.py --decode-mns 8 --output RESULT.json
@@ -30,11 +30,14 @@ def combine_contract(mode):
         "effective_policy_not_device_observation": True,
         "eligible_policy": "remote direct+bulk, all actual expert M/N producers complete, per-rank expert metadata fits",
         "counter_storage_fit_is_per_rank": True,
-        "counter_storage_capacity_policy": "56 expert ready counts + 56 sent entries + 8*56 saved source/expert prefixes",
-        "expert_metadata_storage_bytes": 2240,
+        "counter_storage_capacity_policy": "56 expert ready counts + 56 sent entries + 8*56 saved source/expert prefixes + 8*2 nonempty mask words",
+        "expert_metadata_storage_bytes": 2304,
         "expert_readiness_target_policy": "ceil(actual_expert_assignments / actual_block_m) * (hidden / actual_block_n)",
         "send_range_policy": "dispatch_saved_source_expert_prefix_and_existing_exact_count",
-        "ready_selection_policy": "warp_parallel_dynamic_experts_immediate_issue_no_full_pass_coalescing",
+        "ready_selection_policy": "warp_parallel_readiness_peer_independent_expert_immediate_issue",
+        "nonempty_masks_saved_during_existing_dispatch_prefix_scan": True,
+        "payload_span_granularity_unchanged_one_nonempty_peer_expert": True,
+        "warp_collectives_remain_uniform_outside_peer_specific_issue": True,
         "fit_failure_keeps_existing_full_packet_sc1_protocol": True,
         "completed_expert_payload_may_issue_early": bool(mode),
         "hot_experts_wait_for_all_actual_m_blocks_without_count_truncation": True,

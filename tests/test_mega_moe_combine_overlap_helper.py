@@ -86,7 +86,8 @@ class CombineOverlapHelperContract(unittest.TestCase):
                            source.index("// Pool capacity")]
         methods = "\n".join(function_source(source, name) for name in (
             "combine_overlap_alias_fits", "get_combine_overlap_ready_ptr",
-            "get_combine_overlap_sent_ptr", "get_combine_overlap_prefix_ptr"))
+            "get_combine_overlap_sent_ptr", "get_combine_overlap_prefix_ptr",
+            "get_combine_overlap_nonempty_mask_ptr"))
         self.compile_and_run(r'''
 #include <array>
 #include <cassert>
@@ -110,12 +111,14 @@ struct Workspace {
 };
 int main() {
     static_assert(kMegaMoeGinCombineOverlapNumExperts == 56);
-    static_assert(get_mega_moe_gin_combine_overlap_scratch_bytes() == 2240);
+    static_assert(kMegaMoeGinCombineOverlapNumExpertGroups == 2);
+    static_assert(get_mega_moe_gin_combine_overlap_scratch_bytes() == 2304);
     static_assert(kMegaMoeGinDirectDispatchStorageBytes == 57344);
     alignas(128) std::array<uint8_t, 100000> storage{};
     Workspace workspace{{storage.data(), storage.size()}};
     const uint64_t required = kMegaMoeGinDirectDispatchStorageBytes +
         get_mega_moe_gin_combine_overlap_scratch_bytes();
+    assert(required == 59648);
     workspace.scale_scratch_buffer.bytes = required - 1;
     assert(!workspace.combine_overlap_alias_fits());
     workspace.scale_scratch_buffer.bytes = required;
@@ -123,6 +126,7 @@ int main() {
     auto* ready = workspace.get_combine_overlap_ready_ptr(0);
     auto* sent = workspace.get_combine_overlap_sent_ptr(0);
     auto* prefixes = workspace.get_combine_overlap_prefix_ptr(0, 0);
+    auto* masks = workspace.get_combine_overlap_nonempty_mask_ptr(0, 0);
     assert(reinterpret_cast<uint8_t*>(ready) ==
            storage.data() + kMegaMoeGinDirectDispatchStorageBytes);
     assert(sent == ready + 56);
@@ -136,11 +140,21 @@ int main() {
             *prefix = peer * 56 + expert;
         }
     }
-    assert(reinterpret_cast<uint8_t*>(workspace.get_combine_overlap_prefix_ptr(7, 55) + 1)
+    assert(workspace.get_combine_overlap_prefix_ptr(7, 55) + 1 == masks);
+    assert(reinterpret_cast<uint8_t*>(masks) == storage.data() + 57344 + 2240);
+    for (uint32_t peer = 0; peer < 8; ++peer) {
+        for (uint32_t group = 0; group < 2; ++group) {
+            auto* mask = workspace.get_combine_overlap_nonempty_mask_ptr(peer, group);
+            assert(mask == masks + peer * 2 + group);
+            *mask = group ? 0x00ffffffu : 0xffffffffu;
+        }
+    }
+    assert(reinterpret_cast<uint8_t*>(workspace.get_combine_overlap_nonempty_mask_ptr(7, 1) + 1)
            == storage.data() + required);
     *ready = 448; *sent = 1;
     assert(*ready == 448 && *sent == 1);
     assert(*workspace.get_combine_overlap_prefix_ptr(7, 55) == 447);
+    assert(*workspace.get_combine_overlap_nonempty_mask_ptr(7, 1) == 0x00ffffffu);
     workspace.scale_scratch_buffer.bytes = 128ull * 4 * 112;
     assert(!workspace.combine_overlap_alias_fits());
     workspace.scale_scratch_buffer.bytes = 148ull * 4 * 112;

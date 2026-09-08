@@ -917,21 +917,28 @@ def dispatch_candidate_metadata(flags):
     if combine_enabled and (not enabled or flags.get("DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT") != "1"):
         raise ValueError("combine overlap metadata requires dispatch overlap1 and single context1")
     return {
-        "candidate_family": ("direct_control_first_dispatch_expert_ready_combine" if combine_enabled else
+        "candidate_family": ("direct_control_first_dispatch_peer_ready_combine" if combine_enabled else
                              "direct_control_first_dispatch" if enabled else
                              "clean_single_combine_context_only"),
         "combine_overlap_contract": {
             "requested_raw": combine_raw, "requested": combine_enabled,
             "readiness_unit": "complete expert output, using actual expert assignment counts",
             "producer_target": "ceil(actual expert assignments / actual BM) * (H / BN)",
-            "early_payload_policy": "dynamically select any ready expert; immediately issue each nonempty per-peer contiguous expert span",
+            "combine_schedule": "peer_parallel_ready_expert_spans_then_late_header",
+            "ready_selection_policy": "warp_parallel_readiness_peer_independent_expert_immediate_issue",
+            "early_payload_policy": "each peer independently selects a pending ready expert and immediately issues its nonempty contiguous span",
+            "readiness_tracking": "common monotonic discovered-ready experts; independent per-peer pending-ready selection",
+            "submission_granularity": "one nonaggregate PUT per nonempty (peer, expert); no batching",
             "span_descriptors": "saved dispatch source/expert prefixes and existing exact assignment counts; no return-record metadata walk",
+            "nonempty_masks": "two uint32 expert masks per peer; saved at dispatch and immutable until launch completion",
+            "sent_entry_role": "final all-peer submission-complete bookkeeping, not early readiness",
             "eligibility": "existing remote direct+bulk eligibility and per-rank expert-ready storage fit",
             "scratch_layout": {
                 "ready_uint32": 56, "sent_uint32": 56,
                 "saved_source_expert_prefix_uint32": 8 * 56,
-                "tail_bytes": 2240, "direct_control_bytes": 57344,
-                "required_scratch_bytes": 59584,
+                "saved_source_nonempty_mask_uint32": 8 * 2,
+                "tail_bytes": 2304, "direct_control_bytes": 57344,
+                "required_scratch_bytes": 59648,
                 "byte_capacity_depends_on_bm": False,
             },
             "fit_failure": "unchanged full-packet SC1 combine",

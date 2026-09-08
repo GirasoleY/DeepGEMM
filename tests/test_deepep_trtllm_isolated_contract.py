@@ -28,7 +28,7 @@ class ComparisonContractTest(unittest.TestCase):
                  "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
                  "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1"}
         metadata = comparison.dispatch_candidate_metadata(flags)
-        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_expert_ready_combine")
+        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_peer_ready_combine")
         contract = metadata["combine_overlap_contract"]
         self.assertEqual(contract["requested_raw"], "1")
         self.assertTrue(contract["requested"])
@@ -36,11 +36,17 @@ class ComparisonContractTest(unittest.TestCase):
         self.assertEqual(contract["producer_target"],
                          "ceil(actual expert assignments / actual BM) * (H / BN)")
         self.assertIn("saved dispatch source/expert prefixes", contract["span_descriptors"])
-        self.assertIn("dynamically select any ready expert", contract["early_payload_policy"])
+        self.assertIn("each peer independently selects", contract["early_payload_policy"])
+        self.assertEqual(contract["combine_schedule"], "peer_parallel_ready_expert_spans_then_late_header")
+        self.assertEqual(contract["ready_selection_policy"],
+                         "warp_parallel_readiness_peer_independent_expert_immediate_issue")
+        self.assertIn("no batching", contract["submission_granularity"])
+        self.assertIn("not early readiness", contract["sent_entry_role"])
         layout = contract["scratch_layout"]
-        self.assertEqual(layout["tail_bytes"], 4 * (56 + 56 + 8 * 56))
+        self.assertEqual(layout["saved_source_nonempty_mask_uint32"], 16)
+        self.assertEqual(layout["tail_bytes"], 4 * (56 + 56 + 8 * 56 + 8 * 2))
         self.assertEqual(layout["required_scratch_bytes"], layout["tail_bytes"] + layout["direct_control_bytes"])
-        self.assertEqual(layout["required_scratch_bytes"], 59584)
+        self.assertEqual(layout["required_scratch_bytes"], 59648)
         self.assertFalse(layout["byte_capacity_depends_on_bm"])
         self.assertFalse(contract["physical_overlap_measured"])
         self.assertIn("not device branch", contract["basis"])

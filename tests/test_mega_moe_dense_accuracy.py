@@ -17,8 +17,10 @@ accumulator lands on a different BF16 rounding boundary. It is a tolerance
 budget, not a proof about arbitrary intermediate FP8 errors. Historical fixed
 absolute-gate failures remain reported. Enabled combine overlap must match
 combine0 BITWISE while dispatch overlap and single-context COMBINE stay1.
-The candidate releases complete expert outputs as they become ready, using
-actual assignment counts and saved dispatch prefixes. Its fixed scratch-fit
+Each peer independently selects complete pending expert outputs as they become
+ready, using actual assignment counts, saved dispatch prefixes and saved
+nonempty-expert masks. Each nonempty peer/expert still uses one PUT, without
+batching. The fixed scratch-fit
 policy is recorded, not asserted as a measured device branch or NIC overlap.
 Otherwise enabled dispatch overlap must match
 dispatch0 BITWISE while single-context COMBINE stays1. With overlap disabled,
@@ -535,14 +537,21 @@ def worker(options, args):
                   "combine_overlap_effective_policy_not_device_observation": {
                       "readiness_unit": "complete expert output, using actual expert assignment counts",
                       "producer_target": "ceil(actual expert assignments / actual BM) * (H / BN)",
-                      "early_payload_policy": "dynamically select any ready expert; immediately issue each nonempty per-peer contiguous expert span",
+                      "combine_schedule": "peer_parallel_ready_expert_spans_then_late_header",
+                      "ready_selection_policy": "warp_parallel_readiness_peer_independent_expert_immediate_issue",
+                      "early_payload_policy": "each peer independently selects a pending ready expert and immediately issues its nonempty contiguous span",
+                      "readiness_tracking": "common monotonic discovered-ready experts; independent per-peer pending-ready selection",
+                      "submission_granularity": "one nonaggregate PUT per nonempty (peer, expert); no batching",
                       "span_descriptors": "saved dispatch source/expert prefixes and existing exact assignment counts; no return-record metadata walk",
+                      "nonempty_masks": "two uint32 expert masks per peer; saved at dispatch and immutable until launch completion",
+                      "sent_entry_role": "final all-peer submission-complete bookkeeping, not early readiness",
                       "requires": "existing remote direct+bulk eligibility and per-rank expert-ready storage fit",
                       "scratch_layout": {
                           "ready_uint32": 56, "sent_uint32": 56,
                           "saved_source_expert_prefix_uint32": 8 * 56,
-                          "tail_bytes": 2240, "direct_control_bytes": 57344,
-                          "required_scratch_bytes": 59584,
+                          "saved_source_nonempty_mask_uint32": 8 * 2,
+                          "tail_bytes": 2304, "direct_control_bytes": 57344,
+                          "required_scratch_bytes": 59648,
                           "byte_capacity_depends_on_bm": False},
                       "fit_failure": "unchanged full-packet SC1 combine",
                       "local_and_t64_paths": "unchanged local path or non-direct fallback",

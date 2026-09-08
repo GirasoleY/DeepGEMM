@@ -157,7 +157,7 @@ def _kernel_configuration(args, *, environment=None):
     if combine_raw == "1" and not (single_raw == "1" and dispatch_raw == "1"):
         raise ValueError("combine_overlap requires single_combine_context=1 and dispatch_overlap=1")
     combine_schedule = (
-        "dynamic_ready_expert_spans_then_late_header" if combine_raw == "1"
+        "peer_parallel_ready_expert_spans_then_late_header" if combine_raw == "1"
         else "post_compute_full_packet"
     )
     return {
@@ -174,10 +174,12 @@ def _kernel_configuration(args, *, environment=None):
             "all_local": "unchanged_local_path",
         },
         "combine_ready_expert_policy": {
-            "metadata_storage_bytes": 2240,
+            "metadata_storage_bytes": 2304,
             "span_lookup": "dispatch_saved_source_expert_prefix_and_existing_count",
             "readiness_target": "ceil(actual_expert_assignments / actual_block_m) * (hidden / actual_block_n)",
-            "selection": "warp_parallel_dynamic_ready_experts_immediate_issue",
+            "selection": "warp_parallel_readiness_peer_independent_expert_immediate_issue",
+            "nonempty_masks_saved_during_existing_dispatch_prefix_scan": True,
+            "payload_span_granularity_unchanged_one_nonempty_peer_expert": True,
             "no_token_metadata_rescan": True,
             "hot_expert_readiness_is_coarser_not_count_truncated": True,
             "policy_is_device_observation": False,
