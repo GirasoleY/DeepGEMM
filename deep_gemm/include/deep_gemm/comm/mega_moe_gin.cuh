@@ -307,6 +307,167 @@ NCCL_DEVICE_INLINE void mega_moe_gin_publish_direct_dispatch(
     mega_moe_gin_trace(transport, blockIdx.x, 24u + context_stripe);
 }
 
+// Control-first experiment: close the compact count/route PUT with its own
+// StrongVA terminal. This deliberately does not flush or wait: the receiver
+// can reconstruct exact scheduling counts while the later payload progresses.
+// The caller must publish all control writers before entry and preserve the
+// source slab until its eventual per-(context, peer) flush has completed.
+NCCL_DEVICE_INLINE void mega_moe_gin_publish_direct_control_async(
+    const MegaMoeGinTransport& transport,
+    const uint32_t peer,
+    const uint32_t context_stripe,
+    const void* local_window_base,
+    const void* local_control,
+    void* remote_control,
+    const uint32_t control_bytes,
+    void* remote_control_ready) {
+    constexpr uint32_t kDirectCountBytes = 56u * sizeof(uint64_t);
+    constexpr uint32_t kDirectMaxControlBytes =
+        kDirectCountBytes + 48u * 16u * sizeof(uint32_t);
+    DG_DEVICE_ASSERT(context_stripe <
+                     static_cast<uint32_t>(transport.dev_comm.lsaSize));
+    DG_DEVICE_ASSERT(control_bytes >= kDirectCountBytes and
+                     control_bytes <= kDirectMaxControlBytes);
+    DG_DEVICE_ASSERT(transport.window_offset(
+                         local_window_base, remote_control_ready) %
+                         sizeof(uint64_t) == 0);
+    ncclGin gin{transport.dev_comm,
+                static_cast<int>(transport.data_context(context_stripe)),
+                NCCL_GIN_RESOURCE_SHARING_GPU};
+    gin.put(
+        ncclTeamWorld(transport.dev_comm), static_cast<int>(peer),
+        transport.window,
+        transport.window_offset(local_window_base, remote_control),
+        transport.window,
+        transport.window_offset(local_window_base, local_control),
+        control_bytes,
+        ncclGin_StrongVASignalInc{
+            transport.window,
+            transport.window_offset(local_window_base, remote_control_ready)},
+        ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+        cuda::thread_scope_device, cuda::thread_scope_device,
+        ncclGinOptFlagsDefault);
+}
+
+// One full-source SoA payload, not one request/completion per assignment.
+// Use the same (context, peer) issuer as control_async, after its control PUT.
+// The final weight PUT closes this aggregate chain with a DISTINCT StrongVA
+// terminal. An inactive pair still signals once, keeping payload generations
+// aligned across empty-route and CUDA Graph replays. No local completion is
+// requested here; the caller later flushes/waits once before source reuse.
+// Control readiness alone never authorizes activation/SF/weight reads.
+NCCL_DEVICE_INLINE void mega_moe_gin_publish_direct_payload_async(
+    const MegaMoeGinTransport& transport,
+    const uint32_t peer,
+    const uint32_t context_stripe,
+    const void* local_window_base,
+    const bool publish_inputs,
+    const void* local_activation,
+    void* remote_activation,
+    const uint32_t activation_bytes,
+    const void* local_scale,
+    void* remote_scale,
+    const uint32_t scale_bytes,
+    const void* local_weights,
+    void* remote_weights,
+    const uint32_t weight_bytes,
+    void* remote_payload_ready) {
+    DG_DEVICE_ASSERT(context_stripe <
+                     static_cast<uint32_t>(transport.dev_comm.lsaSize));
+    DG_DEVICE_ASSERT(transport.window_offset(
+                         local_window_base, remote_payload_ready) %
+                         sizeof(uint64_t) == 0);
+    ncclGin gin{transport.dev_comm,
+                static_cast<int>(transport.data_context(context_stripe)),
+                NCCL_GIN_RESOURCE_SHARING_GPU};
+    const auto world = ncclTeamWorld(transport.dev_comm);
+    const ncclGin_StrongVASignalInc ready{
+        transport.window,
+        transport.window_offset(local_window_base, remote_payload_ready)};
+    if (publish_inputs) {
+        DG_DEVICE_ASSERT(activation_bytes > 0 and scale_bytes > 0 and
+                         weight_bytes > 0);
+        gin.put(world, static_cast<int>(peer), transport.window,
+                transport.window_offset(local_window_base, remote_activation),
+                transport.window,
+                transport.window_offset(local_window_base, local_activation),
+                activation_bytes, ncclGin_None{}, ncclGin_None{},
+                ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_device,
+                cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
+        gin.put(world, static_cast<int>(peer), transport.window,
+                transport.window_offset(local_window_base, remote_scale),
+                transport.window,
+                transport.window_offset(local_window_base, local_scale),
+                scale_bytes, ncclGin_None{}, ncclGin_None{}, ncclCoopThread{},
+                ncclGin_None{}, cuda::thread_scope_device,
+                cuda::thread_scope_device, ncclGinOptFlagsAggregateRequests);
+        gin.put(world, static_cast<int>(peer), transport.window,
+                transport.window_offset(local_window_base, remote_weights),
+                transport.window,
+                transport.window_offset(local_window_base, local_weights),
+                weight_bytes, ready, ncclGin_None{}, ncclCoopThread{},
+                ncclGin_None{}, cuda::thread_scope_device,
+                cuda::thread_scope_device, ncclGinOptFlagsDefault);
+    } else {
+        // NCCL 2.30.7 gin.h exposes signal(RemoteAction, Coop, Descriptor,
+        // givenRelease, requiredRelease, optFlags); no dummy/zero-byte PUT.
+        gin.signal(world, static_cast<int>(peer), ready, ncclCoopThread{},
+                   ncclGin_None{}, cuda::thread_scope_device,
+                   cuda::thread_scope_device, ncclGinOptFlagsDefault);
+    }
+}
+
+// Keep the default publication (including its completion and diagnostics)
+// untouched. Only the opt-in specialization splits control and payload.
+// The two remote words are cumulative, never cleared per invocation: control
+// advances on every direct launch, payload only on control-first launches.
+// Callers must therefore track separate expected epochs when modes alternate.
+template <bool kControlFirst>
+NCCL_DEVICE_INLINE void mega_moe_gin_publish_direct_dispatch_ordered(
+    const MegaMoeGinTransport& transport,
+    const uint32_t peer,
+    const uint32_t context_stripe,
+    const void* local_window_base,
+    const bool publish_inputs,
+    const void* local_activation,
+    void* remote_activation,
+    const uint32_t activation_bytes,
+    const void* local_scale,
+    void* remote_scale,
+    const uint32_t scale_bytes,
+    const void* local_weights,
+    void* remote_weights,
+    const uint32_t weight_bytes,
+    const void* local_control,
+    void* remote_control,
+    const uint32_t control_bytes,
+    void* remote_control_ready,
+    void* remote_payload_ready) {
+    if constexpr (kControlFirst) {
+        DG_DEVICE_ASSERT(remote_control_ready != remote_payload_ready);
+        mega_moe_gin_trace(transport, blockIdx.x, 8u + context_stripe);
+        mega_moe_gin_publish_direct_control_async(
+            transport, peer, context_stripe, local_window_base,
+            local_control, remote_control, control_bytes,
+            remote_control_ready);
+        mega_moe_gin_publish_direct_payload_async(
+            transport, peer, context_stripe, local_window_base, publish_inputs,
+            local_activation, remote_activation, activation_bytes,
+            local_scale, remote_scale, scale_bytes,
+            local_weights, remote_weights, weight_bytes,
+            remote_payload_ready);
+        mega_moe_gin_trace(transport, blockIdx.x, 16u + context_stripe);
+    } else {
+        mega_moe_gin_publish_direct_dispatch(
+            transport, peer, context_stripe, local_window_base, publish_inputs,
+            local_activation, remote_activation, activation_bytes,
+            local_scale, remote_scale, scale_bytes,
+            local_weights, remote_weights, weight_bytes,
+            local_control, remote_control, control_bytes,
+            remote_control_ready);
+    }
+}
+
 NCCL_DEVICE_INLINE void mega_moe_gin_wait_direct_dispatch(
     const MegaMoeGinTransport& transport,
     const uint32_t context_stripe,

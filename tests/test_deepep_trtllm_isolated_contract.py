@@ -23,6 +23,33 @@ class FakeDist:
 
 
 class ComparisonContractTest(unittest.TestCase):
+    def test_dispatch_metadata_distinguishes_control_first_without_claiming_measured_overlap(self):
+        for raw, family in (("0", "clean_single_combine_context_only"),
+                            ("1", "direct_control_first_dispatch")):
+            flags = {"DG_MEGAMOE_GIN_DISPATCH_OVERLAP": raw}
+            metadata = comparison.dispatch_candidate_metadata(flags)
+            self.assertEqual(metadata["candidate_family"], family)
+            contract = metadata["dispatch_overlap_contract"]
+            self.assertEqual(contract["requested_raw"], raw)
+            self.assertEqual(contract["requested"], raw == "1")
+            self.assertEqual(contract["separate_payload_terminal_acquire_before_payload_reads"], raw == "1")
+            self.assertFalse(contract["compute_hints_tiling_sm_count_and_math_changed"])
+            self.assertIn("not a measured-overlap observation", contract["basis"])
+            self.assertEqual(flags, {"DG_MEGAMOE_GIN_DISPATCH_OVERLAP": raw})
+        for invalid in ("01", "2", 1, True):
+            with self.assertRaises(ValueError):
+                comparison.dispatch_candidate_metadata({"DG_MEGAMOE_GIN_DISPATCH_OVERLAP": invalid})
+
+    def test_dispatch_flag_is_gathered_and_retained_before_comparator_construction(self):
+        import inspect
+        source = inspect.getsource(comparison.main)
+        self.assertLess(source.index('"DG_MEGAMOE_GIN_DISPATCH_OVERLAP"'),
+                        source.index("dist.all_gather_object(rank_flags, flags)"))
+        self.assertLess(source.index("dist.all_gather_object(rank_flags, flags)"),
+                        source.index("comparator = DeepEPTRTLLM"))
+        self.assertIn('"megamoe_flags": flags', source)
+        self.assertIn("**dispatch_candidate_metadata(flags)", source)
+
     def test_clean_candidate_rejects_retired_knobs_even_when_context_mode_is_off(self):
         for name, invalid in (("DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE", "8"),
                               ("DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS", "8")):

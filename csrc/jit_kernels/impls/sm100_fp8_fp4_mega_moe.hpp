@@ -40,6 +40,7 @@ public:
         bool gin_preconsensus_pack;
         int gin_diagnostics;
         bool gin_single_combine_context;
+        bool gin_dispatch_overlap;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -87,6 +88,7 @@ public:
 #define DG_MEGAMOE_GIN_PRECONSENSUS_PACK {}
 #define DG_MEGAMOE_GIN_DIAGNOSTICS {}
 #define DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT {}
+#define DG_MEGAMOE_GIN_DISPATCH_OVERLAP {}
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -121,6 +123,7 @@ static void __instantiate_kernel() {{
     args.gin_preconsensus_pack ? "1" : "0",
     args.gin_diagnostics,
     args.gin_single_combine_context ? "1" : "0",
+    args.gin_dispatch_overlap ? "1" : "0",
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_shared_experts,
@@ -402,6 +405,14 @@ static void sm100_fp8_fp4_mega_moe(
     const bool gin_single_combine_context = gin_single_combine_context_value == "1";
     DG_HOST_ASSERT(not gin_single_combine_context or
                    (gin_bulk_combine and gin_direct_dispatch));
+    const auto gin_dispatch_overlap_value =
+        get_env<std::string>("DG_MEGAMOE_GIN_DISPATCH_OVERLAP", "0");
+    DG_HOST_ASSERT(gin_dispatch_overlap_value == "0" or
+                   gin_dispatch_overlap_value == "1");
+    const bool gin_dispatch_overlap = gin_dispatch_overlap_value == "1";
+    DG_HOST_ASSERT(not gin_dispatch_overlap or
+                   (gin_direct_dispatch and gin_bulk_combine and
+                    gin_preconsensus_pack));
 #else
     constexpr int gin_local_ablation_stage = 0;
     constexpr bool gin_active_fast_path = false;
@@ -413,6 +424,7 @@ static void sm100_fp8_fp4_mega_moe(
     constexpr bool gin_preconsensus_pack = false;
     constexpr int gin_diagnostics = 0;
     constexpr bool gin_single_combine_context = false;
+    constexpr bool gin_dispatch_overlap = false;
 #endif
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
@@ -437,6 +449,7 @@ static void sm100_fp8_fp4_mega_moe(
         .gin_preconsensus_pack = gin_preconsensus_pack,
         .gin_diagnostics = gin_diagnostics,
         .gin_single_combine_context = gin_single_combine_context,
+        .gin_dispatch_overlap = gin_dispatch_overlap,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

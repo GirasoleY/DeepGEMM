@@ -904,6 +904,27 @@ def validate_clean_experiment_environment():
             raise ValueError(f"clean ctx1 candidate requires retired {name}={required}")
 
 
+def dispatch_candidate_metadata(flags):
+    """Describe the selected transport path; do not infer measured overlap."""
+    raw = flags["DG_MEGAMOE_GIN_DISPATCH_OVERLAP"]
+    if raw not in ("0", "1"):
+        raise ValueError("dispatch overlap metadata requires a canonical0/1 flag")
+    enabled = raw == "1"
+    return {
+        "candidate_family": ("direct_control_first_dispatch" if enabled else
+                             "clean_single_combine_context_only"),
+        "dispatch_overlap_contract": {
+            "requested_raw": raw,
+            "requested": enabled,
+            "eligible_control_before_activation_scale_weight_payload": enabled,
+            "separate_payload_terminal_acquire_before_payload_reads": enabled,
+            "ineligible_and_local_only_paths": "unchanged fallback or skipped remote dispatch",
+            "compute_hints_tiling_sm_count_and_math_changed": False,
+            "basis": "selected transport flag and source contract, not a measured-overlap observation",
+        },
+    }
+
+
 def main():
     validate_clean_experiment_environment()
     comparison, args = parse_args()
@@ -923,6 +944,7 @@ def main():
             "DG_MEGAMOE_GIN_DISPATCH_WARP_SCAN", "DG_MEGAMOE_GIN_COOP_DIRECT_PACK",
             "DG_MEGAMOE_GIN_PRECONSENSUS_PACK",
             "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT",
+            "DG_MEGAMOE_GIN_DISPATCH_OVERLAP",
         )}
         rank_flags = [None] * dist.get_world_size()
         dist.all_gather_object(rank_flags, flags)
@@ -984,7 +1006,7 @@ def main():
             "runtime": comparator.api_evidence, "routes": routes,
             "recipe_kernel_profile": comparator.recipe_profile,
             "megamoe_flags": flags,
-            "candidate_family": "clean_single_combine_context_only",
+            **dispatch_candidate_metadata(flags),
             "combine_barrier_warps": 1,
             "expert_wave_implementation_present": False,
             "cooperative_barrier_implementation_present": False,

@@ -229,6 +229,12 @@ class SymmBuffer:
             # parse failure would strand peers in communicator setup.
             'single_combine_context': os.environ.get(
                 'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT', '0'),
+            'dispatch_overlap': os.environ.get(
+                'DG_MEGAMOE_GIN_DISPATCH_OVERLAP', '0'),
+            'preconsensus_pack': os.environ.get(
+                'DG_MEGAMOE_GIN_PRECONSENSUS_PACK', '0'),
+            'coop_direct_pack': os.environ.get(
+                'DG_MEGAMOE_GIN_COOP_DIRECT_PACK', '0'),
             'combine_experts_per_wave': os.environ.get(
                 'DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE', '0'),
             'combine_barrier_warps': os.environ.get(
@@ -261,6 +267,16 @@ class SymmBuffer:
             if not (canonical['bulk_combine'] and canonical['direct_dispatch']):
                 errors.append(
                     'single_combine_context requires bulk_combine and direct_dispatch')
+        if canonical['dispatch_overlap'] not in ('0', '1'):
+            errors.append(
+                'DG_MEGAMOE_GIN_DISPATCH_OVERLAP must be exactly 0 or 1')
+        elif canonical['dispatch_overlap'] == '1':
+            if not (canonical['bulk_combine'] and canonical['direct_dispatch']
+                    and canonical['preconsensus_pack'] == '1'
+                    and canonical['coop_direct_pack'] == '1'):
+                errors.append(
+                    'dispatch_overlap requires bulk_combine, direct_dispatch, '
+                    'PRECONSENSUS_PACK=1 and COOP_DIRECT_PACK=1')
         if canonical['world_size'] != 16:
             errors.append('world_size must be exactly 16')
         if not canonical['gin_layout_enabled']:

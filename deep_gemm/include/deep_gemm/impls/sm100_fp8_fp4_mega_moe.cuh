@@ -68,6 +68,10 @@
 #define DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT 0
 #endif
 
+#ifndef DG_MEGAMOE_GIN_DISPATCH_OVERLAP
+#define DG_MEGAMOE_GIN_DISPATCH_OVERLAP 0
+#endif
+
 // Retired experiment switches must not silently select an unsupported path.
 #if defined(DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE) && DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE != 0
 #error "Expert-wave combine is not part of the clean single-context candidate"
@@ -154,6 +158,16 @@ static_assert(not kMegaMoeGinPreconsensusPack or
                kMegaMoeGinActiveFastPath),
               "GIN pre-consensus pack requires cooperative direct pack and "
               "activity consensus");
+static constexpr bool kMegaMoeGinDispatchOverlap =
+    DG_MEGAMOE_GIN_DISPATCH_OVERLAP != 0;
+static_assert(DG_MEGAMOE_GIN_DISPATCH_OVERLAP == 0 or
+              DG_MEGAMOE_GIN_DISPATCH_OVERLAP == 1,
+              "Invalid MegaMoE GIN dispatch-overlap flag");
+static_assert(not kMegaMoeGinDispatchOverlap or
+              (kMegaMoeGinDirectDispatch and kMegaMoeGinBulkCombine and
+               kMegaMoeGinPreconsensusPack),
+              "GIN dispatch overlap requires prepacked direct dispatch and "
+              "bulk combine");
 
 template <
     uint32_t kNumMaxTokensPerRank,
@@ -939,6 +953,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 auto* epoch_ptr =
                     workspace.get_gin_direct_dispatch_epoch_ptr();
                 *epoch_ptr += 1;
+                if constexpr (kMegaMoeGinDispatchOverlap)
+                    *workspace.get_gin_dispatch_payload_epoch_ptr() += 1;
                 __threadfence();
             }
             __syncwarp();
@@ -981,8 +997,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         if constexpr (kMegaMoeGinPreconsensusPack) {
                             // The complete packet was prepared before the
                             // activity consensus.  Only the original eight
-                            // leaders reach the unchanged GIN publication,
-                            // and only after the world selected direct mode.
+                            // leaders issue GIN publication, and only after
+                            // the world selected direct mode. The overlap
+                            // experiment posts control first and defers source
+                            // completion until after this CTA's pulls.
                             if (use_gin_direct_dispatch and
                                 lane_idx < lsa_size) {
                                 DG_DEVICE_ASSERT(lsa_size == 8u);
@@ -1007,7 +1025,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     route_count <= num_tokens * kNumTopk);
                                 const uint32_t source_lane =
                                     sym_buffer.rank_idx % lsa_size;
-                                comm::mega_moe_gin_publish_direct_dispatch(
+                                comm::mega_moe_gin_publish_direct_dispatch_ordered<
+                                    kMegaMoeGinDispatchOverlap>(
                                     gin_transport, peer,
                                     /*context_stripe=*/ peer_in_lsa,
                                     sym_buffer.get_base_ptr(),
@@ -1043,7 +1062,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                             route_count),
                                     buffer.gin_workspace
                                         .get_direct_dispatch_ready_ptr(
-                                            /*send=*/ false, source_lane));
+                                            /*send=*/ false, source_lane),
+                                    buffer.gin_workspace
+                                        .get_direct_dispatch_payload_ready_ptr(
+                                            source_lane));
                             }
                         } else {
                         // Preserve lanes 0-7 as the sole GIN issuers while the
@@ -1508,8 +1530,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             /* Pullers require a post-barrier grid sync */ true);
 
                     // Every remote source emits exactly one terminal, even for
-                    // an inactive pair.  The acquire wait proves the source's
-                    // complete activation/SF/weight/control chain has settled.
+                    // an inactive pair. In the baseline this also covers all
+                    // payloads. With dispatch overlap it covers ONLY exact
+                    // counts and assignment metadata; pullers acquire each
+                    // source's separate payload terminal before mirror reads.
                     if (sm_idx == 0 and warp_idx == 0 and lane_idx < 8) {
                         const uint32_t owner_lane =
                             sym_buffer.rank_idx % 8u;
@@ -1803,6 +1827,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
 
+        // A whole-source payload is immutable through this launch. Cache one
+        // acquire per source per pull warp, not one poll per assignment. The
+        // baseline specialization eliminates this state and the waits below.
+        uint32_t gin_acquired_payload_sources = 0;
+
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
         DG_GIN_TRACE_IF(warp_idx == 0 and lane_idx == 0, 6);
@@ -2025,6 +2054,28 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (use_gin_direct_dispatch) {
                         const uint32_t source_lane =
                             current_rank_in_expert_idx % lsa_size;
+                        if constexpr (kMegaMoeGinDispatchOverlap) {
+                            const uint32_t source_bit = 1u << source_lane;
+                            if ((gin_acquired_payload_sources & source_bit) == 0) {
+                                // Control arrival permits scheduling, not
+                                // reading activation/SF/weights. The elected
+                                // thread acquires the StrongVA payload terminal
+                                // and hands that visibility to the full warp
+                                // before any mirror load or TMA issue.
+                                if (cute::elect_one_sync()) {
+                                    comm::mega_moe_gin_wait_direct_dispatch(
+                                        gin_transport,
+                                        /*context_stripe=*/ sym_buffer.rank_idx % lsa_size,
+                                        sym_buffer.get_base_ptr(),
+                                        buffer.gin_workspace
+                                            .get_direct_dispatch_payload_ready_ptr(
+                                                source_lane),
+                                        *workspace.get_gin_dispatch_payload_epoch_ptr());
+                                }
+                                __syncwarp();
+                                gin_acquired_payload_sources |= source_bit;
+                            }
+                        }
                         src_base_ptr = buffer.gin_workspace
                             .get_direct_input_token_ptr(
                                 source_lane, src_token_idx);
@@ -2162,6 +2213,36 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         DG_GIN_TRACE_IF(lane_idx == 0, 48u + warp_idx);
+        if constexpr (kUseGin and kMegaMoeGinDispatchOverlap) {
+#ifdef DG_MEGAMOE_GIN
+            // All eight peer chains were posted before the count rendezvous.
+            // Keep the input/control send storage alive, then complete each
+            // chain once here before cleanup may overwrite it. Crucially,
+            // no outbound flush gates count publication or compute startup.
+            if (use_gin_direct_dispatch and sm_idx == 1 and warp_idx == 0 and
+                lane_idx < 8u) {
+                // Retire every inbound terminal, including zero-assignment
+                // peers which no pull warp needed to read. This preserves the
+                // baseline's all-input-context remote completion before the
+                // later context-1-only combine rendezvous and graph reuse.
+                comm::mega_moe_gin_wait_direct_dispatch(
+                    gin_transport,
+                    /*context_stripe=*/ sym_buffer.rank_idx % 8u,
+                    sym_buffer.get_base_ptr(),
+                    buffer.gin_workspace
+                        .get_direct_dispatch_payload_ready_ptr(lane_idx),
+                    *workspace.get_gin_dispatch_payload_epoch_ptr());
+                const uint32_t peer =
+                    (1u - sym_buffer.rank_idx / 8u) * 8u + lane_idx;
+                ncclGinRequest_t request{};
+                comm::mega_moe_gin_flush_data_peer_async(
+                    gin_transport, peer, lane_idx, &request);
+                comm::mega_moe_gin_wait_data_peer(
+                    gin_transport, lane_idx, request);
+                DG_GIN_TRACE_IF(true, 24u + lane_idx);
+            }
+#endif
+        }
         if constexpr (kUseGinOutbox) {
 #ifdef DG_MEGAMOE_GIN
             // One warp drains the bounded block outbox in logical pool order.

@@ -5,6 +5,7 @@ The separate dense runner must still execute the full two-host device gates.
 """
 
 import math
+import inspect
 import os
 import unittest
 from unittest.mock import patch
@@ -13,6 +14,50 @@ import test_mega_moe_dense_accuracy as dense
 
 
 class TestDenseAccuracyPolicy(unittest.TestCase):
+    def test_dispatch_mode_requires_collective_canonical_boolean(self):
+        for value in ("0", "1"):
+            self.assertEqual(dense.validate_dispatch_modes([value] * 16), int(value))
+        for values in ([], ["0"] * 8 + ["1"] * 8, ["01"] * 16, ["2"] * 16,
+                       [True] * 16, [1] * 16):
+            with self.assertRaises(ValueError):
+                dense.validate_dispatch_modes(values)
+
+    def test_dispatch_baseline_changes_only_dispatch_and_requires_combine_one(self):
+        self.assertTrue(dense.baseline_control_required(0, 1, 1, 1))
+        baseline = dense.baseline_control_environment(1)
+        self.assertEqual(baseline[dense.SINGLE_CONTEXT_ENV], "1")
+        self.assertEqual(baseline[dense.DISPATCH_OVERLAP_ENV], "0")
+        for single_context in (0, 2):
+            with self.assertRaises(ValueError):
+                dense.validate_experiment_combination(0, 1, single_context, 1)
+        self.assertEqual(dense.baseline_control_environment(0)[dense.SINGLE_CONTEXT_ENV], "0")
+        self.assertFalse(dense.baseline_control_required(0, 1, 0, 0))
+
+    def test_dispatch_capture_scope_restores_candidate_flags_even_on_failure(self):
+        candidate = {dense.EXPERT_WIDTH_ENV: "0", dense.BARRIER_WIDTH_ENV: "1",
+                     dense.SINGLE_CONTEXT_ENV: "1", dense.DISPATCH_OVERLAP_ENV: "1"}
+        with patch.dict(os.environ, candidate, clear=True):
+            for fail in (False, True):
+                try:
+                    with patch.dict(os.environ, dense.baseline_control_environment(1)):
+                        self.assertEqual(os.environ[dense.SINGLE_CONTEXT_ENV], "1")
+                        self.assertEqual(os.environ[dense.DISPATCH_OVERLAP_ENV], "0")
+                        if fail:
+                            raise RuntimeError("capture failed")
+                except RuntimeError:
+                    self.assertTrue(fail)
+                self.assertEqual(dict(os.environ), candidate)
+
+    def test_dispatch_source_and_labels_are_explicit_without_numeric_gate_changes(self):
+        source = inspect.getsource(dense.worker)
+        self.assertLess(source.index("validate_dispatch_modes("), source.index("dg.get_symm_buffer_for_mega_moe("))
+        self.assertIn('"dispatch_overlap_requested_raw": candidate_environment[DISPATCH_OVERLAP_ENV]', source)
+        self.assertIn('"dispatch0-combine1-control/"', source)
+        self.assertIn('"baseline_control_environment": baseline_environment', source)
+        self.assertIn('"candidate_transport_environment": candidate_environment', source)
+        self.assertIn('"dense-source-unchanged"', source)
+        self.assertIn('"source": source', source)
+
     def test_relative_and_elementwise_gates_are_both_required(self):
         self.assertEqual(dense.numerical_gate_errors(True, 0.001, 0.0, 0.001), [])
         self.assertTrue(dense.numerical_gate_errors(True, 0.00101, 0.0, 0.001))

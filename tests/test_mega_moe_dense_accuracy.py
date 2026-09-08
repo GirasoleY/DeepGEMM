@@ -15,10 +15,11 @@ per-element rounding budget: one BF16 ULP per expert contribution plus one
 final BF16 rounding ULP. This accounts for cancellation when one expert's GEMM
 accumulator lands on a different BF16 rounding boundary. It is a tolerance
 budget, not a proof about arbitrary intermediate FP8 errors. Historical fixed
-absolute-gate failures remain reported. Enabled single-context mode
-must also match the baseline graph BITWISE on the same inputs, weights, and
-context and the original one-warp, all-context combine barrier. Retired expert
-waves and cooperative barrier widths are rejected even in control mode.
+absolute-gate failures remain reported. Enabled dispatch overlap must match
+dispatch0 BITWISE while single-context COMBINE stays1. With overlap disabled,
+enabled single-context mode retains its original all-context-COMBINE baseline.
+Both comparisons use identical inputs, weights, context and compute settings.
+Retired expert waves and cooperative barrier widths remain rejected.
 """
 
 from __future__ import annotations
@@ -37,6 +38,20 @@ import test_mega_moe_accuracy as accuracy
 EXPERT_WIDTH_ENV = "DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE"
 BARRIER_WIDTH_ENV = "DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS"
 SINGLE_CONTEXT_ENV = "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT"
+DISPATCH_OVERLAP_ENV = "DG_MEGAMOE_GIN_DISPATCH_OVERLAP"
+
+
+def source_fingerprint():
+    root = Path(__file__).resolve().parents[1]
+    names = ("tests/test_mega_moe_dense_accuracy.py", "tests/test_mega_moe_accuracy.py",
+             "deep_gemm/mega/__init__.py", "csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp",
+             "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh",
+             "deep_gemm/include/deep_gemm/comm/mega_moe_gin.cuh",
+             "deep_gemm/include/deep_gemm/layout/mega_moe.cuh")
+    files = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in names}
+    return {"files_sha256": files, "combined_sha256": hashlib.sha256(
+        json.dumps(files, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+        "scope": "listed source files, not loaded-binary attestation"}
 
 
 def parse_args():
@@ -202,7 +217,7 @@ def transport_gate_errors(eager_equal, control_equal):
     if not eager_equal:
         errors.append("same-input CUDA graph output differs bitwise from eager")
     if not control_equal:
-        errors.append("communication experiment differs bitwise from same-context baseline graph (expert width 0, barrier width 1, single context 0)")
+        errors.append("communication experiment differs bitwise from the selected same-context baseline graph")
     return errors
 
 
@@ -231,8 +246,19 @@ def validate_barrier_widths(values):
     return width
 
 
-def baseline_control_environment():
-    return {EXPERT_WIDTH_ENV: "0", BARRIER_WIDTH_ENV: "1", SINGLE_CONTEXT_ENV: "0"}
+def baseline_control_environment(dispatch_overlap=0):
+    if type(dispatch_overlap) is not int or dispatch_overlap not in (0, 1):
+        raise ValueError("dispatch overlap mode must be0 or1")
+    return {EXPERT_WIDTH_ENV: "0", BARRIER_WIDTH_ENV: "1",
+            SINGLE_CONTEXT_ENV: "1" if dispatch_overlap else "0", DISPATCH_OVERLAP_ENV: "0"}
+
+
+def validate_dispatch_modes(values):
+    if not values or any(value not in ("0", "1") for value in values):
+        raise ValueError("invalid dispatch overlap mode; requires canonical0/1")
+    if len(set(values)) != 1:
+        raise ValueError("dispatch overlap mode differs across ranks")
+    return int(values[0])
 
 
 def validate_single_context_modes(values):
@@ -247,14 +273,18 @@ def validate_single_context_modes(values):
     return mode
 
 
-def validate_experiment_combination(experts_per_wave, barrier_warps, single_context):
+def validate_experiment_combination(experts_per_wave, barrier_warps, single_context, dispatch_overlap=0):
     if experts_per_wave != 0 or barrier_warps != 1:
         raise ValueError("retired experiments are unsupported; requires expert waves off and barrier width one")
+    if dispatch_overlap not in (0, 1):
+        raise ValueError("invalid dispatch overlap mode")
+    if dispatch_overlap and single_context != 1:
+        raise ValueError("dispatch overlap dense gate requires single-context COMBINE1")
 
 
-def baseline_control_required(experts_per_wave, barrier_warps, single_context=0):
-    validate_experiment_combination(experts_per_wave, barrier_warps, single_context)
-    return single_context != 0
+def baseline_control_required(experts_per_wave, barrier_warps, single_context=0, dispatch_overlap=0):
+    validate_experiment_combination(experts_per_wave, barrier_warps, single_context, dispatch_overlap)
+    return bool(single_context or dispatch_overlap)
 
 
 def check_output(harness, case, expected, rounding_budget, options, label,
@@ -352,15 +382,24 @@ def worker(options, args):
         if world != 16 or len(set(hostnames)) != 2:
             raise RuntimeError("dense GIN gate requires two hosts and 16 ranks")
         configurations = [None] * world
+        source = source_fingerprint()
         candidate_environment = {EXPERT_WIDTH_ENV: os.environ.get(EXPERT_WIDTH_ENV, "0"),
                                  BARRIER_WIDTH_ENV: os.environ.get(BARRIER_WIDTH_ENV, "1"),
-                                 SINGLE_CONTEXT_ENV: os.environ.get(SINGLE_CONTEXT_ENV, "0")}
-        dist.all_gather_object(configurations, candidate_environment)
-        expert_width = validate_expert_widths([item[EXPERT_WIDTH_ENV] for item in configurations])
-        barrier_width = validate_barrier_widths([item[BARRIER_WIDTH_ENV] for item in configurations])
-        single_context = validate_single_context_modes([item[SINGLE_CONTEXT_ENV] for item in configurations])
-        validate_experiment_combination(expert_width, barrier_width, single_context)
-        control_enabled = baseline_control_required(expert_width, barrier_width, single_context)
+                                 SINGLE_CONTEXT_ENV: os.environ.get(SINGLE_CONTEXT_ENV, "0"),
+                                 DISPATCH_OVERLAP_ENV: os.environ.get(DISPATCH_OVERLAP_ENV, "0")}
+        configuration = {"candidate_environment": candidate_environment, "source": source}
+        dist.all_gather_object(configurations, configuration)
+        if any(item["source"] != source for item in configurations):
+            raise ValueError("dense runner source differs across ranks")
+        environments = [item["candidate_environment"] for item in configurations]
+        expert_width = validate_expert_widths([item[EXPERT_WIDTH_ENV] for item in environments])
+        barrier_width = validate_barrier_widths([item[BARRIER_WIDTH_ENV] for item in environments])
+        single_context = validate_single_context_modes([item[SINGLE_CONTEXT_ENV] for item in environments])
+        dispatch_overlap = validate_dispatch_modes([item[DISPATCH_OVERLAP_ENV] for item in environments])
+        validate_experiment_combination(expert_width, barrier_width, single_context, dispatch_overlap)
+        control_enabled = baseline_control_required(expert_width, barrier_width, single_context, dispatch_overlap)
+        baseline_environment = baseline_control_environment(dispatch_overlap)
+        comparison_axis = "dispatch_overlap_with_combine1_fixed" if dispatch_overlap else "single_combine_context"
         experts = args.num_experts // world
         if (experts, args.hidden, args.intermediate_hidden, args.num_topk) != (56, 3584, 3072, 16):
             raise RuntimeError("dense gate requires actual H3584/I3072/E896/topk16")
@@ -388,12 +427,11 @@ def worker(options, args):
         harness = accuracy.AccuracyHarness(rank, args, inputs, weights, cases, buffer, torch, dist, dg)
         pointers = accuracy._input_storage_pointers(inputs, buffer)
         if control_enabled:
-            # Capture the original expert-width-0/barrier-width-1 kernel with
-            # exactly the same registered buffer, context, weights, and input
-            # storage, with single-context mode off. Restore all THREE candidate
+            # Change only the selected transport axis, keeping the registered
+            # buffer, context, weights and input storage. Restore all candidate
             # flags before capturing its graph;
             # subsequent environment changes cannot alter captured kernel nodes.
-            with patch.dict(os.environ, baseline_control_environment()):
+            with patch.dict(os.environ, baseline_environment):
                 control_graph = accuracy._capture_launch_only_graph(
                     harness, torch, dist, options.dense_routes[0])
         graph = accuracy._capture_launch_only_graph(harness, torch, dist, options.dense_routes[0])
@@ -434,7 +472,8 @@ def worker(options, args):
                     torch.cuda.synchronize()
                     control_output = harness.output.clone()
                     results.append(check_output(harness, case, expected, rounding_budget,
-                                                options, "width0-control/" + label))
+                                                options, ("dispatch0-combine1-control/" if dispatch_overlap
+                                                          else "single-context0-control/") + label))
                 harness.copy_inputs(case)
                 harness.stats.zero_()
                 harness.output.fill_(float("nan"))
@@ -445,6 +484,8 @@ def worker(options, args):
                                             control_snapshot=control_output))
         graph = control_graph = None
         torch.cuda.synchronize()
+        accuracy._collective_transition_check("dense-source-unchanged",
+            [] if source_fingerprint() == source else ["listed sources changed during dense gate"], dist)
         record = {"schema": "megamoe-dense-accuracy-v2", "status": "passed",
                   "shape": {"tokens_per_rank": args.num_tokens, "hidden": args.hidden,
                             "intermediate_hidden": args.intermediate_hidden,
@@ -458,6 +499,9 @@ def worker(options, args):
                   "retired_expert_wave_and_coop_width_experiments_supported": False,
                   "combine_barrier_warps_requested": barrier_width,
                   "single_combine_context_requested": single_context,
+                  "dispatch_overlap_requested": dispatch_overlap,
+                  "dispatch_overlap_requested_raw": candidate_environment[DISPATCH_OVERLAP_ENV],
+                  "transport_comparison_axis": comparison_axis,
                   "single_combine_context_effective_by_route": {
                       mode: bool(single_context and mode not in ("all_same_host", "all_masked"))
                       for mode in (*options.dense_routes, "all_masked")},
@@ -465,11 +509,15 @@ def worker(options, args):
                       mode: 0 if mode in ("all_same_host", "all_masked") else barrier_width
                       for mode in (*options.dense_routes, "all_masked")},
                   "candidate_environment": candidate_environment,
+                  "candidate_transport_environment": candidate_environment,
+                  "configuration": configuration,
+                  "source": source,
                   # Retain the legacy expert-width-0 evidence key: the new
                   # baseline also explicitly restores barrier width to one.
                   "bitwise_width0_control_enabled": control_enabled,
                   "bitwise_baseline_control_enabled": control_enabled,
-                  "baseline_control_environment": baseline_control_environment(),
+                  "baseline_control_environment": baseline_environment,
+                  "bitwise_dispatch0_combine1_control_enabled": bool(dispatch_overlap and control_enabled),
                   "control_uses_identical_context_weights_and_storage": True,
                   "oracle": "canonical_dequantized_FP32_matmul_BF16_SwiGLU_weight_MXFP8_FP32_matmul_BF16_ordered_combine",
                   "tf32": False, "fast_math": False, "heterogeneous_input_sf": True,

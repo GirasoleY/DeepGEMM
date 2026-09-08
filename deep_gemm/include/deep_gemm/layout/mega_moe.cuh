@@ -194,7 +194,8 @@ struct Workspace {
     // [88..95]: reserved (keeps the NIC mailboxes in their own 32-byte sector)
     // [96..103]: `uint64_t` GIN paired-decision launch epoch
     // [104..111]: `uint64_t` GIN direct-dispatch invocation epoch
-    // [112..127]: padding to isolate hot expert counters from barrier/schedule counters
+    // [112..119]: `uint64_t` GIN control-first payload invocation epoch
+    // [120..127]: padding to isolate hot expert counters from barrier/schedule counters
     static constexpr uint32_t kNumMaxGridSyncCounters = 4;
 
     template <uint32_t kIndex = 0>
@@ -264,6 +265,13 @@ struct Workspace {
     CUTLASS_DEVICE
     uint64_t* get_gin_direct_dispatch_epoch_ptr() const {
         return math::advance_ptr<uint64_t>(base, 104u);
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_gin_dispatch_payload_epoch_ptr() const {
+        // Separate from the control epoch: baseline direct invocations still
+        // increment the control terminal, but do not publish this terminal.
+        return math::advance_ptr<uint64_t>(base, 112u);
     }
 
     CUTLASS_DEVICE
@@ -654,6 +662,16 @@ struct MegaMoeGinWorkspace {
             const bool send, const uint32_t& peer_in_lsa) const {
         return static_cast<uint64_t*>(
             get_direct_dispatch_packet_ptr(send, peer_in_lsa));
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t* get_direct_dispatch_payload_ready_ptr(
+            const uint32_t& peer_in_lsa) const {
+        static_assert(kMegaMoeGinDirectDispatchReadyBytes >=
+                      2u * sizeof(uint64_t));
+        // Use the reserved second uint64_t of the existing receive header.
+        // No allocation or packet stride change; never reset between launches.
+        return get_direct_dispatch_ready_ptr(/*send=*/ false, peer_in_lsa) + 1;
     }
 
     CUTLASS_HOST_DEVICE
