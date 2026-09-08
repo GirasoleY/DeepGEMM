@@ -19,8 +19,9 @@ absolute-gate failures remain reported. Enabled combine overlap must match
 combine0 BITWISE while dispatch overlap and single-context COMBINE stay1.
 Each peer independently selects complete pending expert outputs as they become
 ready, using actual assignment counts, saved dispatch prefixes and saved
-nonempty-expert masks. Each nonempty peer/expert still uses one PUT, without
-batching. The fixed scratch-fit
+nonempty-expert masks. Each PUT joins at most eight already-ready contiguous
+expert spans, with a fixed compile-time cap and no future-readiness fill wait.
+The fixed scratch-fit
 policy is recorded, not asserted as a measured device branch or NIC overlap.
 Otherwise enabled dispatch overlap must match
 dispatch0 BITWISE while single-context COMBINE stays1. With overlap disabled,
