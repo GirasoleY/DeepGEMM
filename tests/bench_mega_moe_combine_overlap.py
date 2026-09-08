@@ -1,4 +1,4 @@
-"""Accuracy-gated completed-block COMBINE experiment; no compute tuning.
+"""Accuracy-gated dynamic expert-ready COMBINE experiment; no compute tuning.
 
 Two-node torchrun, eight ranks/node:
   python tests/bench_mega_moe_combine_overlap.py --decode-mns 8 --output RESULT.json
@@ -28,11 +28,16 @@ def combine_contract(mode):
         "fixed_dispatch_overlap": 1, "fixed_single_combine_context": 1,
         "compute_tiling_sm_count_and_math_unchanged": True,
         "effective_policy_not_device_observation": True,
-        "eligible_policy": "remote direct+bulk, all N producers complete, per-rank counter storage fits",
+        "eligible_policy": "remote direct+bulk, all actual expert M/N producers complete, per-rank expert metadata fits",
         "counter_storage_fit_is_per_rank": True,
-        "counter_storage_capacity_policy": "ceil(16*48*16 / actual_block_m) + 55",
+        "counter_storage_capacity_policy": "56 expert ready counts + 56 sent entries + 8*56 saved source/expert prefixes",
+        "expert_metadata_storage_bytes": 2240,
+        "expert_readiness_target_policy": "ceil(actual_expert_assignments / actual_block_m) * (hidden / actual_block_n)",
+        "send_range_policy": "dispatch_saved_source_expert_prefix_and_existing_exact_count",
+        "ready_selection_policy": "warp_parallel_dynamic_experts_immediate_issue_no_full_pass_coalescing",
         "fit_failure_keeps_existing_full_packet_sc1_protocol": True,
-        "completed_block_payload_may_issue_early": bool(mode),
+        "completed_expert_payload_may_issue_early": bool(mode),
+        "hot_experts_wait_for_all_actual_m_blocks_without_count_truncation": True,
         "count_headers_and_final_sc1_put_barrier_remain_late": True,
         "t48_t64_t48_overlap_request_policy": [bool(mode), False, bool(mode)],
         "all_local_remote_combine_skipped": True,

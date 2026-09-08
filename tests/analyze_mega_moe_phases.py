@@ -25,6 +25,9 @@ PHASES = {
     62: "dispatch_cleanup_region_observation", 63: "cleanup_rendezvous_exit",
     96: "first_mma_task_acquired", 97: "first_mma_operands_ready",
     98: "mma_scheduling_loop_exit",
+    99: "first_ready_expert_selected",
+    100: "combine_payload_puts_queued",
+    101: "combine_payload_local_flush_done",
 }
 for base, label in ((8, "dispatch_issue_begin"), (16, "dispatch_puts_queued"),
                     (24, "dispatch_flush_done"), (32, "recv_ready_observed"),
@@ -104,6 +107,10 @@ def summarize_sample(sample: dict[str, Any]) -> dict[str, Any]:
         "epilogue_work_span_us": span((52,), (53,)),
         "tmem_free_to_combine_issue_us": span((54,), range(64, 72), "max", "min"),
         "combine_issue_to_last_flush_us": span(range(64, 72), range(80, 88)),
+        "first_ready_expert_selection_to_first_combine_issue_us": span((99,), range(64, 72), "min", "min"),
+        "first_combine_issue_to_all_payload_puts_queued_us": span(range(64, 72), (100,)),
+        "all_payload_puts_queued_to_payload_local_flush_us": span((100,), (101,)),
+        "payload_local_flush_to_combine_grid1_us": span((101,), (55,)),
         # Positive means first issue was observed before the final epilogue
         # loop-exit marker on THIS GPU. Neither endpoint measures NIC activity
         # or actual MMA completion; keep the signed value, including negatives.
@@ -173,6 +180,7 @@ def summarize_capture(capture: dict[str, Any]) -> dict[str, Any]:
             "With dispatch_overlap=1 slots32–39 observe control readiness, not payload readiness; slots24–31 are late sender flushes, not receiver payload timestamps.",
             "The signed first-combine-issue to last-epilogue-loop-exit interval is positive when issue was observed first on that GPU; it is an issue/remaining-epilogue observation, not physical IB or MMA overlap proof.",
             "With combine_overlap=1 first issue is retained in slots64–71, while slots72–79 include late headers and slots80–87 report header flush. Do not infer last-payload timing from either late observation.",
+            "Expert-ready variants add slots99–101: first selected expert, all payload puts queued, and payload local flush. These are software observations; local flush is not remote visibility. Older captures may omit them.",
             "Expert production completion uses max(last L2 epilogue fragment marker) over participating SMs; it is not a NIC visibility proof.",
             "Reduction end marks loop exit/last TMA store issue, not asynchronous store completion.",
             "Level 1 omits per-expert readiness; level 2 includes its instrumentation cost.",

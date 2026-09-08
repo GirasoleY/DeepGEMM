@@ -46,6 +46,27 @@ class PhaseAnalysisTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "entry marker"):
             summarize_sample(record)
 
+    def test_expert_ready_markers_separate_payload_from_late_headers(self):
+        record = sample()
+        row = record["sm_markers_ns"]["0"]
+        row.update({"99": 26000, "100": 40000, "101": 47000, "55": 49000,
+                    "72": 60000, "80": 70000})
+        metrics = summarize_sample(record)["metrics_us"]
+        self.assertEqual(metrics["first_ready_expert_selection_to_first_combine_issue_us"], 2.0)
+        self.assertEqual(metrics["first_combine_issue_to_all_payload_puts_queued_us"], 12.0)
+        self.assertEqual(metrics["all_payload_puts_queued_to_payload_local_flush_us"], 7.0)
+        self.assertEqual(metrics["payload_local_flush_to_combine_grid1_us"], 2.0)
+        row.update({"72": 80000, "80": 90000})
+        newer = summarize_sample(record)["metrics_us"]
+        for name in ("first_ready_expert_selection_to_first_combine_issue_us",
+                     "first_combine_issue_to_all_payload_puts_queued_us",
+                     "all_payload_puts_queued_to_payload_local_flush_us",
+                     "payload_local_flush_to_combine_grid1_us"):
+            self.assertEqual(metrics[name], newer[name])
+        old = summarize_sample(sample())["metrics_us"]
+        self.assertIsNone(old["first_ready_expert_selection_to_first_combine_issue_us"])
+        self.assertIsNone(old["all_payload_puts_queued_to_payload_local_flush_us"])
+
     def test_cleanup_region_can_include_combine_and_is_not_barrier_cost(self):
         record = sample()
         record["sm_markers_ns"]["0"].update({

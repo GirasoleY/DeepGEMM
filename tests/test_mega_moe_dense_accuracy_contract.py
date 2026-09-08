@@ -53,6 +53,18 @@ class TestDenseAccuracyPolicy(unittest.TestCase):
         self.assertIn('"combine0-dispatch1-sc1-control/"', source)
         self.assertIn('"combine_overlap_effective_policy_not_device_observation"', source)
         self.assertIn('"physical_overlap_measured": False', source)
+        self.assertIn('"producer_target": "ceil(actual expert assignments / actual BM) * (H / BN)"', source)
+        self.assertIn("saved dispatch source/expert prefixes", source)
+        self.assertIn("dynamically select any ready expert", source)
+        self.assertIn('"tail_bytes": 2240', source)
+        self.assertIn('"required_scratch_bytes": 59584', source)
+        self.assertIn('"byte_capacity_depends_on_bm": False', source)
+        self.assertIn('"compute_hints_tiling_sm_count_and_math_changed": False', source)
+
+    def test_source_manifest_includes_changed_expert_ready_layout(self):
+        source = inspect.getsource(dense.source_fingerprint)
+        self.assertIn('"deep_gemm/include/deep_gemm/layout/mega_moe.cuh"', source)
+        self.assertIn("not loaded-binary attestation", source)
 
     def test_dispatch_mode_requires_collective_canonical_boolean(self):
         for value in ("0", "1"):

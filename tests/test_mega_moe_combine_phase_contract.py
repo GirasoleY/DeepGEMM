@@ -60,7 +60,10 @@ class CombinePhaseContract(unittest.TestCase):
         self.assertFalse(baseline["combine_overlap_requested"])
         with mock.patch.dict(os.environ, candidate_env(), clear=True):
             result = capture._kernel_configuration(args())
-        self.assertEqual(result["combine_schedule"], "completed_block_spans_then_late_header")
+        self.assertEqual(result["combine_schedule"], "dynamic_ready_expert_spans_then_late_header")
+        self.assertTrue(result["combine_ready_expert_policy"]["no_token_metadata_rescan"])
+        self.assertEqual(result["combine_ready_expert_policy"]["metadata_storage_bytes"], 2240)
+        self.assertFalse(result["combine_ready_expert_policy"]["policy_is_device_observation"])
         self.assertTrue(result["combine_schedule_is_requested_policy_not_device_observation"])
         self.assertEqual(result["combine_overlap_effective_policy"][
             "bulk_direct_remote_but_scratch_alias_insufficient"], "post_compute_full_packet")

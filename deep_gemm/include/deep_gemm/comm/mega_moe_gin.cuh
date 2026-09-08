@@ -37,6 +37,8 @@ namespace deep_gemm::comm {
 // 64:72 combine issue, 72:80 combine queued, 80:88 combine local completion;
 // 88:96 reduction-loop exit per warp (last TMA STORE ISSUED, not settled);
 // 96 first MMA task acquired, 97 first MMA operands ready, 98 MMA loop exit;
+// 99 first ready expert selected, 100 all expert payload PUTs queued,
+// 101 expert payload flushes complete (same dispatch warp; not late headers);
 // 104:112 receiver wait entry, 112:120 scatter done per epilogue warp,
 // 120:128 reduction begin per epilogue warp. Other slots are reserved.
 // Times use each GPU's %globaltimer; never subtract across GPUs. Clear the

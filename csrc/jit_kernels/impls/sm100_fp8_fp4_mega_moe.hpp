@@ -424,7 +424,7 @@ static void sm100_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(not gin_combine_overlap or
                    (gin_single_combine_context and gin_dispatch_overlap and
                     gin_direct_dispatch and gin_bulk_combine));
-    // Scratch fit is checked against the actual BLOCK_M in the kernel.
+    // Fixed expert-counter/prefix scratch fit is checked in the kernel.
     // Insufficient tail space uses the unchanged whole-packet path; never
     // resize registered storage or change the selected compute configuration.
 #else

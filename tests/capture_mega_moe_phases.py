@@ -157,7 +157,7 @@ def _kernel_configuration(args, *, environment=None):
     if combine_raw == "1" and not (single_raw == "1" and dispatch_raw == "1"):
         raise ValueError("combine_overlap requires single_combine_context=1 and dispatch_overlap=1")
     combine_schedule = (
-        "completed_block_spans_then_late_header" if combine_raw == "1"
+        "dynamic_ready_expert_spans_then_late_header" if combine_raw == "1"
         else "post_compute_full_packet"
     )
     return {
@@ -168,10 +168,19 @@ def _kernel_configuration(args, *, environment=None):
         "combine_overlap_requested": combine_raw == "1",
         "combine_schedule_is_requested_policy_not_device_observation": True,
         "combine_overlap_effective_policy": {
-            "bulk_direct_remote_and_scratch_alias_fits_actual_block_m": combine_schedule,
+            "bulk_direct_remote_and_scratch_alias_fits_expert_metadata": combine_schedule,
             "bulk_direct_remote_but_scratch_alias_insufficient": "post_compute_full_packet",
             "remote_ineligible": "unchanged_fallback",
             "all_local": "unchanged_local_path",
+        },
+        "combine_ready_expert_policy": {
+            "metadata_storage_bytes": 2240,
+            "span_lookup": "dispatch_saved_source_expert_prefix_and_existing_count",
+            "readiness_target": "ceil(actual_expert_assignments / actual_block_m) * (hidden / actual_block_n)",
+            "selection": "warp_parallel_dynamic_ready_experts_immediate_issue",
+            "no_token_metadata_rescan": True,
+            "hot_expert_readiness_is_coarser_not_count_truncated": True,
+            "policy_is_device_observation": False,
         },
         "phase_marker_semantics": {
             "32_39": ("receiver_control_terminal_acquired_not_payload" if dispatch_raw == "1"
@@ -183,6 +192,9 @@ def _kernel_configuration(args, *, environment=None):
             "80_87": ("late_header_local_flush_not_last_payload_time" if combine_raw == "1"
                       else "whole_packet_local_flush_not_receiver_arrival"),
             "53": "epilogue_task_loop_exit_not_mma_completion_or_nic_visibility",
+            "99": "first_ready_expert_selected_software_observation",
+            "100": "all_combine_payload_puts_queued_not_remote_completion",
+            "101": "combine_payload_local_flush_not_remote_visibility",
         },
         "retired_expert_wave_and_coop_width_experiments_supported": False,
         "combine_barrier_warps_requested": barrier_warps,

@@ -28,11 +28,21 @@ class ComparisonContractTest(unittest.TestCase):
                  "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
                  "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1"}
         metadata = comparison.dispatch_candidate_metadata(flags)
-        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_completed_block_combine")
+        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_expert_ready_combine")
         contract = metadata["combine_overlap_contract"]
         self.assertEqual(contract["requested_raw"], "1")
         self.assertTrue(contract["requested"])
-        self.assertIn("counter storage fit", contract["eligibility"])
+        self.assertIn("expert-ready storage fit", contract["eligibility"])
+        self.assertEqual(contract["producer_target"],
+                         "ceil(actual expert assignments / actual BM) * (H / BN)")
+        self.assertIn("saved dispatch source/expert prefixes", contract["span_descriptors"])
+        self.assertIn("dynamically select any ready expert", contract["early_payload_policy"])
+        layout = contract["scratch_layout"]
+        self.assertEqual(layout["tail_bytes"], 4 * (56 + 56 + 8 * 56))
+        self.assertEqual(layout["required_scratch_bytes"], layout["tail_bytes"] + layout["direct_control_bytes"])
+        self.assertEqual(layout["required_scratch_bytes"], 59584)
+        self.assertFalse(layout["byte_capacity_depends_on_bm"])
+        self.assertFalse(contract["physical_overlap_measured"])
         self.assertIn("not device branch", contract["basis"])
         self.assertFalse(contract["compute_hints_tiling_sm_count_and_math_changed"])
         for invalid in ("01", "2", 1, True):

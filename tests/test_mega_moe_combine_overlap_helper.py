@@ -1,4 +1,4 @@
-"""CPU contracts for completed-block combine support, not GPU visibility proof.
+"""CPU contracts for expert-ready combine support, not GPU visibility proof.
 
 Compile the actual layout and PUT/flush helpers against typed host stubs; inspect
 the PTX-only publication functions for their explicit compiler memory ordering.
@@ -80,13 +80,13 @@ class CombineOverlapHelperContract(unittest.TestCase):
         self.assertGreater(body.rindex('asm volatile(""'), body.index("gin.put("))
         self.assertIn("64u + diagnostic_peer_lane, true", body)
 
-    def test_compiled_alias_capacity_offsets_and_fit(self):
+    def test_compiled_fixed_expert_prefix_alias_offsets_and_fit(self):
         source = LAYOUT.read_text()
         constants = source[source.index("static constexpr int kNumCandidateBlockMs"):
                            source.index("// Pool capacity")]
         methods = "\n".join(function_source(source, name) for name in (
             "combine_overlap_alias_fits", "get_combine_overlap_ready_ptr",
-            "get_combine_overlap_sent_ptr"))
+            "get_combine_overlap_sent_ptr", "get_combine_overlap_prefix_ptr"))
         self.compile_and_run(r'''
 #include <array>
 #include <cassert>
@@ -109,40 +109,42 @@ struct Workspace {
 ''' + methods + r'''
 };
 int main() {
-    static_assert(get_mega_moe_gin_combine_overlap_block_capacity(32) == 439);
-    static_assert(get_mega_moe_gin_combine_overlap_block_capacity(16) == 823);
-    static_assert(get_mega_moe_gin_combine_overlap_block_capacity(8) == 1591);
-    static_assert(get_mega_moe_gin_combine_overlap_block_capacity(0) == 0);
+    static_assert(kMegaMoeGinCombineOverlapNumExperts == 56);
+    static_assert(get_mega_moe_gin_combine_overlap_scratch_bytes() == 2240);
     static_assert(kMegaMoeGinDirectDispatchStorageBytes == 57344);
     alignas(128) std::array<uint8_t, 100000> storage{};
     Workspace workspace{{storage.data(), storage.size()}};
-    for (uint32_t bm : {8u, 16u, 32u, 64u, 96u, 128u, 192u}) {
-        const uint32_t capacity = get_mega_moe_gin_combine_overlap_block_capacity(bm);
-        const uint64_t required = kMegaMoeGinDirectDispatchStorageBytes +
-            get_mega_moe_gin_combine_overlap_scratch_bytes(bm);
-        workspace.scale_scratch_buffer.bytes = required - 1;
-        assert(!workspace.combine_overlap_alias_fits(bm));
-        workspace.scale_scratch_buffer.bytes = required;
-        assert(workspace.combine_overlap_alias_fits(bm));
-        auto* ready = workspace.get_combine_overlap_ready_ptr(bm, 0);
-        auto* sent = workspace.get_combine_overlap_sent_ptr(bm, 0);
-        assert(reinterpret_cast<uint8_t*>(ready) ==
-               storage.data() + kMegaMoeGinDirectDispatchStorageBytes);
-        assert(sent == ready + capacity);
-        assert(workspace.get_combine_overlap_ready_ptr(bm, capacity - 1) + 1 == sent);
-        assert(reinterpret_cast<uint8_t*>(workspace.get_combine_overlap_sent_ptr(
-                   bm, capacity - 1) + 1) == storage.data() + required);
-        *ready = 28; *sent = 1;
-        assert(*ready == 28 && *sent == 1);
+    const uint64_t required = kMegaMoeGinDirectDispatchStorageBytes +
+        get_mega_moe_gin_combine_overlap_scratch_bytes();
+    workspace.scale_scratch_buffer.bytes = required - 1;
+    assert(!workspace.combine_overlap_alias_fits());
+    workspace.scale_scratch_buffer.bytes = required;
+    assert(workspace.combine_overlap_alias_fits());
+    auto* ready = workspace.get_combine_overlap_ready_ptr(0);
+    auto* sent = workspace.get_combine_overlap_sent_ptr(0);
+    auto* prefixes = workspace.get_combine_overlap_prefix_ptr(0, 0);
+    assert(reinterpret_cast<uint8_t*>(ready) ==
+           storage.data() + kMegaMoeGinDirectDispatchStorageBytes);
+    assert(sent == ready + 56);
+    assert(prefixes == sent + 56);
+    assert(workspace.get_combine_overlap_ready_ptr(55) + 1 == sent);
+    assert(workspace.get_combine_overlap_sent_ptr(55) + 1 == prefixes);
+    for (uint32_t peer = 0; peer < 8; ++peer) {
+        for (uint32_t expert = 0; expert < 56; ++expert) {
+            auto* prefix = workspace.get_combine_overlap_prefix_ptr(peer, expert);
+            assert(prefix == prefixes + peer * 56 + expert);
+            *prefix = peer * 56 + expert;
+        }
     }
+    assert(reinterpret_cast<uint8_t*>(workspace.get_combine_overlap_prefix_ptr(7, 55) + 1)
+           == storage.data() + required);
+    *ready = 448; *sent = 1;
+    assert(*ready == 448 && *sent == 1);
+    assert(*workspace.get_combine_overlap_prefix_ptr(7, 55) == 447);
     workspace.scale_scratch_buffer.bytes = 128ull * 4 * 112;
-    assert(!workspace.combine_overlap_alias_fits(32));
+    assert(!workspace.combine_overlap_alias_fits());
     workspace.scale_scratch_buffer.bytes = 148ull * 4 * 112;
-    assert(workspace.combine_overlap_alias_fits(16));
-    assert(!workspace.combine_overlap_alias_fits(8));
-    assert(!workspace.combine_overlap_alias_fits(0));
-    assert(!workspace.combine_overlap_alias_fits(4));
-    assert(!workspace.combine_overlap_alias_fits(193));
+    assert(workspace.combine_overlap_alias_fits());
 }
 ''')
 
