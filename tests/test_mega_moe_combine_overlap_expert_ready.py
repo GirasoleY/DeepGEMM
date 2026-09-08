@@ -1,6 +1,7 @@
 """CPU numerical/protocol contracts; not generated-code or GPU evidence."""
 
 import ast
+from dataclasses import replace
 import math
 import random
 from pathlib import Path
@@ -8,7 +9,8 @@ import re
 import unittest
 
 from mega_moe_gin_expert_ready_protocol import (
-    ExpertReadyGeneration, PeerReadyGeneration, ProtocolError, saved_dispatch_prefixes,
+    ExpertReadyGeneration, PeerReadyGeneration, ReadyCoalesceGeneration,
+    ProtocolError, saved_dispatch_prefixes,
 )
 
 
@@ -48,7 +50,7 @@ class ExpertReadySourceContracts(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         cls.source = (root / "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh").read_text()
 
-    def test_drainer_uses_exact_targets_parallel_masks_and_immediate_spans(self):
+    def test_drainer_uses_exact_targets_parallel_masks_and_bounded_ready_batches(self):
         source = self.source
         after_pulls = source.index("DG_GIN_TRACE_IF(lane_idx == 0, 48u + warp_idx);")
         start = source.index("if (use_gin_combine_overlap and sm_idx == 0 and warp_idx == 0)", after_pulls)
@@ -62,31 +64,47 @@ class ExpertReadySourceContracts(unittest.TestCase):
         self.assertIn("math::constexpr_ceil_div(kNumExpertsPerRank, 32u)", body)
         self.assertIn("discovered[group] = target == 0", body)
         self.assertIn("ready_masks[group] |= __ballot_sync(0xffffffffu, newly_ready)", body)
-        self.assertIn("while (__any_sync(0xffffffffu, (pending[0] | pending[1]) != 0))", body)
+        self.assertIn("while (__any_sync(0xffffffffu, (pending_first | pending_second) != 0))", body)
         self.assertNotIn("while (ready_mask != 0)", body)
-        self.assertIn("pending[0] & ready_masks[0]", body)
-        self.assertIn("pending[1] & ready_masks[1]", body)
-        self.assertIn("(pending[group] >> (kNumExpertsPerRank - 32u)) == 0", body)
-        self.assertRegex(body, r"pending\[group\] = peer_lane\s*\?\s*\*buffer.gin_workspace."
+        self.assertIn("pending_first & ready_masks[0]", body)
+        self.assertIn("pending_second & ready_masks[1]", body)
+        self.assertNotRegex(re.sub(r"//[^\n]*", "", body), r"\bpending\[")
+        self.assertIn("(nonempty >> (kNumExpertsPerRank - 32u)) == 0", body)
+        self.assertRegex(body, r"nonempty = peer_lane\s*\?\s*\*buffer.gin_workspace."
                          r"get_combine_overlap_nonempty_mask_ptr\(\s*lane_idx, group\)\s*:\s*0u")
         self.assertRegex(body, r"first_target = __shfl_sync\(\s*0xffffffffu, "
                          r"expected_fragments\[0\], selected_lane\)")
         self.assertRegex(body, r"second_target = __shfl_sync\(\s*0xffffffffu, "
                          r"expected_fragments\[1\], selected_lane\)")
         self.assertNotIn("expected_fragments[selected_group]", re.sub(r"//[^\n]*", "", body))
-        self.assertLess(body.index("const uint32_t first_target"), body.index("if (issue)"))
-        self.assertLess(body.index("const uint32_t second_target"), body.index("if (issue)"))
-        selected = braced_block(body, body.index("if (issue)"))
-        acquire = selected.index("comm::mega_moe_gin_combine_ready_acquire(")
-        prefix = selected.index("get_combine_overlap_prefix_ptr(lane_idx, expert)")
-        issue = selected.index("comm::mega_moe_gin_put_bulk_combine_span(")
-        retire = selected.index("pending[selected_group] &= ~(1u << selected_lane)")
-        self.assertLess(acquire, prefix)
-        self.assertLess(prefix, issue)
-        self.assertLess(issue, retire)
-        self.assertIn("} while (completed != target)", selected[:prefix])
-        self.assertIn("/*context_stripe=*/ 0u", selected[issue:retire])
-        self.assertRegex(body, r"pending\[selected_group\] &= ~\(1u << selected_lane\);\s*}\s*__syncwarp\(\);")
+        self.assertIn("constexpr uint32_t kMaxReadyExpertsPerPut = 8u;", body)
+        self.assertRegex(body, r"stage < kMaxReadyExpertsPerPut and\s*__any_sync\(0xffffffffu, can_extend\)")
+        planner = braced_block(body, body.index("for (uint32_t stage = 0;"))
+        self.assertLess(planner.index("const uint32_t first_target"), planner.index("if (can_extend)"))
+        self.assertLess(planner.index("const uint32_t second_target"), planner.index("if (can_extend)"))
+        self.assertNotIn("ready_masks[", planner)
+        self.assertNotIn("mega_moe_gin_put_bulk_combine_span", planner)
+        self.assertNotIn("get_bulk_combine_record_ptr", planner)
+        self.assertRegex(planner, r"accept = batch_records == 0 or\s*prefix == batch_prefix \+ batch_records")
+        self.assertRegex(planner, r"if \(not accept\)\s*can_extend = false")
+        accepted = braced_block(planner, planner.index("if (accept)"))
+        acquire = accepted.index("comm::mega_moe_gin_combine_ready_acquire(")
+        self.assertLess(acquire, accepted.index("batch_records += count"))
+        self.assertIn("} while (completed != target)", accepted)
+        self.assertIn("accepted_first |= bit", accepted)
+        self.assertIn("accepted_second |= bit", accepted)
+        self.assertIn("available_first &= ~bit", accepted)
+        self.assertIn("available_second &= ~bit", accepted)
+        self.assertNotIn("pending_", accepted)
+        self.assertLess(body.index(planner) + len(planner), body.index("if (batch_records != 0)"))
+        submission = braced_block(body, body.index("if (batch_records != 0)"))
+        self.assertEqual(body.count("comm::mega_moe_gin_put_bulk_combine_span("), 1)
+        issue = submission.index("comm::mega_moe_gin_put_bulk_combine_span(")
+        self.assertLess(issue, submission.index("pending_first &= ~accepted_first"))
+        self.assertLess(issue, submission.index("pending_second &= ~accepted_second"))
+        self.assertIn("/*context_stripe=*/ 0u", submission)
+        self.assertIn("batch_records * buffer.gin_workspace.bulk_record_bytes", submission)
+        self.assertRegex(body, r"pending_second &= ~accepted_second;\s*}\s*__syncwarp\(\);")
         self.assertLess(body.index("DG_GIN_TRACE_IF(lane_idx == 0, 100)"),
                         body.index("get_combine_overlap_sent_ptr(expert) = 1"))
         self.assertLess(body.index("DG_GIN_TRACE_IF(lane_idx == 0, 100)"),
@@ -639,6 +657,259 @@ class PeerReadyModelTests(unittest.TestCase):
         with self.assertRaises(ProtocolError):
             model.retire(0)
         finish(model)
+
+
+class ReadyCoalesceModelTests(unittest.TestCase):
+    def test_all_ready_actual_route_totals_for_bounded_cpu_caps(self):
+        expected = {"half_remote": (90, 48, 27, 14), "all_remote": (112, 56, 28, 14)}
+        for mode, totals in expected.items():
+            counts = matched_owner_counts(mode)
+            for cap, puts in zip((1, 2, 4, 8), totals):
+                with self.subTest(mode=mode, cap=cap):
+                    model = ReadyCoalesceGeneration(range(8, 16), cap=cap)
+                    model.begin(0, counts)
+                    for expert in range(56):
+                        complete(model, expert)
+                    model.drain_ready(0)
+                    self.assertEqual(len(model.spans), puts)
+                    self.assertTrue(all(len(span.experts) <= cap for span in model.spans))
+                    self.assertEqual(sum(span.count for span in model.spans),
+                                     256 if mode == "half_remote" else 512)
+                    self.assertEqual(sum(len(span.experts) for span in model.spans), totals[0])
+                    self.assertEqual(model.descriptor_constructions, 1)
+                    finish(model)
+
+    def test_cap1_matches_r2_spans_and_exact_coverage(self):
+        rng = random.Random(20260910)
+        for trial in range(12):
+            counts = [[rng.randrange(3) for _ in range(56)] for _ in range(16)]
+            old = PeerReadyGeneration(range(8, 16))
+            new = ReadyCoalesceGeneration(range(8, 16), cap=1)
+            for model in (old, new):
+                model.begin(0, counts)
+            order = list(range(56)); rng.shuffle(order)
+            for expert in order:
+                for model in (old, new):
+                    complete(model, expert)
+                    if expert % 4 == 0:
+                        model.drain_ready(0)
+            old.drain_ready(0); new.drain_ready(0)
+            self.assertEqual([(span.peer, span.expert, span.begin, span.count) for span in old.spans],
+                             [(span.peer, span.experts[0], span.begin, span.count) for span in new.spans])
+            self.assertEqual(old.issued_records, new.issued_records)
+            finish(old); finish(new)
+
+    def test_zero_count_expert_gaps_merge_across31_32_and_partial_high_group(self):
+        counts = [[0] * 56 for _ in range(3)]
+        for expert, count in ((0, 1), (31, 33), (32, 2), (55, 1)):
+            counts[1][expert] = count
+        counts[2][32] = 65
+        model = ReadyCoalesceGeneration((0, 1, 2))
+        model.begin(0, counts)
+        for expert in (0, 31, 32, 55):
+            complete(model, expert)
+        plans = model.plan_wave(0)
+        self.assertEqual(plans[1].experts, (0, 31, 32, 55))
+        self.assertEqual(plans[1].targets, (28, 56, 84, 28))
+        self.assertEqual(plans[2].experts, (32,))
+        self.assertNotIn(0, plans)
+        self.assertEqual(model.planning_rounds[-1][1], 4)
+        for group0, group1 in model.target_gathers:
+            self.assertEqual(set(group0), {0, 1, 2})
+            self.assertEqual(set(group1), {0, 1, 2})
+        for plan in plans.values():
+            model.issue_batch(0, plan)
+        self.assertEqual(len(model.spans), 2)
+        finish(model)
+
+    def test_unready_positive_gap_stops_batch_but_not_later_ready_send(self):
+        model = ReadyCoalesceGeneration((0,))
+        model.begin(0, [[1, 2, 3]])
+        complete(model, 0); complete(model, 2)
+        first = model.plan_wave(0)[0]
+        self.assertEqual(first.experts, (0,))
+        model.issue_batch(0, first)
+        second = model.plan_wave(0)[0]
+        self.assertEqual((second.experts, second.begin, second.count), ((2,), 3, 3))
+        model.issue_batch(0, second)
+        self.assertEqual(model.pending_masks[0], [2, 0])
+        complete(model, 1)
+        model.drain_ready(0)
+        self.assertEqual(len(model.spans), 3)
+        finish(model)
+
+    def test_previously_sent_positive_gap_cannot_be_retransmitted_by_coalescing(self):
+        model = ReadyCoalesceGeneration((0,))
+        model.begin(0, [[1, 2, 3]])
+        complete(model, 1)
+        model.drain_ready(0)
+        complete(model, 0); complete(model, 2)
+        plan = model.plan_wave(0)[0]
+        self.assertEqual(plan.experts, (0,))
+        forged = replace(plan, experts=(0, 2), count=6, targets=(28, 28))
+        model.acquire(0, 2, 0)
+        with self.assertRaises(ProtocolError):
+            model.issue_batch(0, forged)
+        self.assertEqual(len(model.spans), 1)
+        model.drain_ready(0)
+        self.assertEqual([span.experts for span in model.spans], [(1,), (0,), (2,)])
+        self.assertEqual(len(model.issued_records), 6)
+        finish(model)
+
+    def test_frozen_snapshot_does_not_add_arriving_expert_mid_plan(self):
+        model = ReadyCoalesceGeneration((0,))
+        model.begin(0, [[1, 1, 1]])
+        complete(model, 0); complete(model, 2)
+        def arrive(stage, current):
+            if stage == 0:
+                complete(current, 1)
+        plan = model.plan_wave(0, stage_hook=arrive)[0]
+        self.assertEqual(plan.ready_snapshot, (5, 0))
+        self.assertEqual(plan.experts, (0,))
+        self.assertNotIn(0, model.acquires[1])
+        forged = replace(plan, experts=(0, 1, 2), count=3, targets=(28, 28, 28))
+        model.acquire(0, 1, 0); model.acquire(0, 2, 0)
+        with self.assertRaises(ProtocolError):
+            model.issue_batch(0, forged)
+        model.issue_batch(0, plan)
+        self.assertEqual(model.plan_wave(0)[0].experts, (1, 2))
+        model.drain_ready(0)
+        finish(model)
+
+    def test_every_contributor_acquired_and_bits_clear_only_after_put_return(self):
+        model = ReadyCoalesceGeneration((0, 1))
+        model.begin(0, [[1, 2, 3], [4, 0, 5]])
+        for expert in range(3):
+            complete(model, expert)
+        before = {peer: masks[:] for peer, masks in model.pending_masks.items()}
+        plans = model.plan_wave(0)
+        self.assertEqual(model.pending_masks, before)
+        model.acquires[1].remove(0)
+        with self.assertRaises(ProtocolError):
+            model.issue_batch(0, plans[0])
+        self.assertEqual(model.pending_masks, before)
+        model.acquire(0, 1, 0)
+        calls = []
+        def on_submit(current, batch):
+            self.assertEqual(current.pending_masks[batch.peer], before[batch.peer])
+            self.assertTrue(all(batch.peer in current.acquires[e] for e in batch.experts))
+            self.assertFalse(current.flushed)
+            calls.append(batch.peer)
+        for plan in plans.values():
+            model.issue_batch(0, plan, on_submit=on_submit)
+        self.assertEqual(calls, [0, 1])
+        self.assertEqual(model.pending_masks, {0: [0, 0], 1: [0, 0]})
+        with self.assertRaises(ProtocolError):
+            model.issue_batch(0, plans[0])
+        finish(model)
+
+    def test_arbitrary_peer_lengths_stop_independently_with_fixed_cap(self):
+        lengths = (0, 1, 2, 7, 8, 9, 16, 28)
+        counts = [[1] * length + [0] * (56 - length) for length in lengths]
+        model = ReadyCoalesceGeneration(range(8))
+        model.begin(0, counts)
+        for expert in range(56):
+            complete(model, expert)
+        plans = model.plan_wave(0)
+        self.assertEqual({peer: len(plan.experts) for peer, plan in plans.items()},
+                         {peer: min(length, 8) for peer, length in enumerate(lengths) if length})
+        self.assertEqual(model.planning_rounds[-1][1], 8)
+        for plan in plans.values():
+            model.issue_batch(0, plan)
+        model.drain_ready(0)
+        self.assertEqual(len(model.spans), sum((length + 7) // 8 for length in lengths))
+        self.assertTrue(all(stages <= 8 for _, stages, _ in model.planning_rounds))
+        finish(model)
+
+    def test_hot_empty_and_local_only_paths_keep_actual_lifetimes(self):
+        for tokens in (32, 48):
+            model = ReadyCoalesceGeneration(range(8, 16))
+            model.begin(0, [[tokens] * 16 + [0] * 40 for _ in range(16)])
+            self.assertEqual(model.targets[0], (16 * tokens // 32) * 28)
+            for expert in range(16):
+                complete(model, expert)
+            model.drain_ready(0)
+            self.assertEqual(len(model.spans), 16)
+            self.assertEqual(len(model.issued_records), 8 * 16 * tokens)
+            finish(model)
+        for local_count in (0, 65):
+            model = ReadyCoalesceGeneration((1,))
+            model.begin(0, [[local_count], [0]])
+            self.assertEqual(model.drain_ready(0), ())
+            model.flush_payloads(0)
+            if local_count:
+                with self.assertRaises(ProtocolError):
+                    model.publish_headers(0)
+                complete(model, 0)
+            finish(model)
+
+    def test_random_readiness_and_asymmetric_masks_are_disjoint_and_complete(self):
+        rng = random.Random(20260911)
+        for trial in range(36):
+            counts = [[rng.randrange(4) if rng.random() < .5 else 0
+                       for _ in range(56)] for _ in range(16)]
+            counts[8 + trial % 8] = [0] * 56
+            model = ReadyCoalesceGeneration(range(8, 16), cap=(1, 2, 4, 8)[trial % 4],
+                                            block_m=(16, 32, 64)[trial % 3])
+            model.begin(0, counts)
+            events = [(expert, block, fragment) for expert in range(56)
+                      for block in range(model.blocks[expert]) for fragment in range(28)]
+            rng.shuffle(events)
+            for index, event in enumerate(events):
+                model.release(0, *event)
+                if index % 83 == 0:
+                    model.drain_ready(0)
+            model.drain_ready(0)
+            expected = {(peer, ordinal) for peer in model.peers
+                        for ordinal in range(sum(counts[peer]))}
+            self.assertEqual(model.issued_records, expected)
+            self.assertEqual(sum(span.count for span in model.spans), len(expected))
+            self.assertTrue(all(span.ready_snapshot[e // 32] & (1 << (e % 32))
+                                for span in model.spans for e in span.experts))
+            self.assertTrue(all(len(span.experts) <= model.cap for span in model.spans))
+            finish(model)
+
+    def test_replay_fallback_and_remote_completion_remain_distinct(self):
+        model = ReadyCoalesceGeneration((1,))
+        old_span = None
+        for generation, (enabled, eligible, fits, tokens) in enumerate((
+                (False, True, True, 48), (True, True, True, 48),
+                (True, False, True, 64), (True, True, False, 48),
+                (True, True, True, 48), (False, True, True, 48))):
+            counts = [[0] * 56, [tokens] * 16 + [0] * 40]
+            model.begin(generation, counts, enabled=enabled, eligible=eligible, scratch_fits=fits)
+            self.assertFalse(model.planning_rounds or model.spans or model.flushed)
+            if old_span is not None:
+                with self.assertRaises(ProtocolError):
+                    model.settle(generation, old_span)
+            for expert in range(16):
+                complete(model, expert)
+            if model.early:
+                model.drain_ready(generation)
+            else:
+                self.assertEqual(model.plan_wave(generation), {})
+                model.publish_fallback(generation)
+            self.assertEqual(len(model.issued_records), tokens * 16)
+            model.flush_payloads(generation); model.publish_headers(generation)
+            model.headers_settled = True
+            with self.assertRaises(ProtocolError):
+                model.acquire_world_put(generation)
+            old_span = model.spans[0]
+            finish(model)
+
+    def test_invalid_cap_and_corrupt_batch_bounds_rejected(self):
+        for cap in (0, 3, 16, True):
+            with self.assertRaises(ValueError):
+                ReadyCoalesceGeneration((0,), cap=cap)
+        model = ReadyCoalesceGeneration((0,), cap=2)
+        model.begin(0, [[1, 1]])
+        complete(model, 0); complete(model, 1)
+        plan = model.plan_wave(0)[0]
+        for bad in (replace(plan, count=3), replace(plan, targets=(28, 56)),
+                    replace(plan, experts=(0, 0)), replace(plan, generation=-1)):
+            with self.assertRaises(ProtocolError):
+                model.issue_batch(0, bad)
+        self.assertFalse(model.spans or model.issued_records)
 
 
 if __name__ == "__main__":

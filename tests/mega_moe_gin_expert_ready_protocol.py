@@ -6,7 +6,8 @@ integer, not a set. Local completion and remote visibility remain distinct.
 Fallback spans below describe logical record coverage, not the number of PUTs
 in the unchanged row fallback. ExpertReadyGeneration retains the R1 common
 expert-selection model; PeerReadyGeneration specifies R2 peer-local masks.
-Neither model simulates warp scheduling, NIC credits, or elapsed time.
+ReadyCoalesceGeneration specifies R3 bounded ready-only contiguous batches.
+These models do not simulate warp scheduling, NIC credits, or elapsed time.
 """
 
 from dataclasses import dataclass
@@ -350,3 +351,150 @@ class PeerReadyGeneration(ExpertReadyGeneration):
         if self.early:
             self.finish_queuing(generation)
         super().flush_payloads(generation)
+
+
+@dataclass(frozen=True)
+class ReadyBatch:
+    generation: int
+    peer: int
+    experts: tuple
+    begin: int
+    count: int
+    targets: tuple
+    ready_snapshot: tuple
+
+
+class ReadyCoalesceGeneration(PeerReadyGeneration):
+    """R3 model; cap variations are CPU checks, not runtime tuning flags."""
+
+    def __init__(self, peers, *, cap=8, **kwargs):
+        if type(cap) is not int or cap not in (1, 2, 4, 8):
+            raise ValueError("CPU coalescing cap must be 1, 2, 4, or 8")
+        super().__init__(peers, **kwargs)
+        self.cap = cap
+
+    def begin(self, generation, counts, **kwargs):
+        super().begin(generation, counts, **kwargs)
+        self.planning_rounds = []
+
+    def plan_wave(self, generation, stage_hook=None):
+        """Snapshot once; new arrivals cannot extend this round's batches.
+
+        Every accepted contributor is acquired by its actual issuer while
+        planning. Every bounded stage gathers both fixed groups for all peers;
+        exhausted/gapped peers contribute safe idle selections until the warp
+        has no extendable peer. Pending masks do not change during planning.
+        """
+        self._check(generation)
+        if not self.early:
+            return {}
+        snapshot = self.poll_ready_masks(generation)
+        available = {peer: [snapshot[group] & self.pending_masks[peer][group]
+                            for group in range(2)] for peer in self.peers}
+        experts = {peer: [] for peer in self.peers}
+        starts, counts = dict.fromkeys(self.peers, 0), dict.fromkeys(self.peers, 0)
+        active = {peer for peer in self.peers if any(available[peer])}
+        stages = 0
+        for stage in range(self.cap):
+            if not active:
+                break
+            selections = {}
+            for peer in self.peers:
+                expert = None
+                if peer in active:
+                    for group in range(2):
+                        mask = available[peer][group]
+                        if mask:
+                            expert = group * 32 + (mask & -mask).bit_length() - 1
+                            break
+                selections[peer] = expert
+            gathered = [{}, {}]
+            for group in range(2):
+                for peer, expert in selections.items():
+                    index = group * 32 + (0 if expert is None else expert % 32)
+                    gathered[group][peer] = self.targets[index] if index < len(self.targets) else 0
+            self.target_gathers.append(tuple(gathered))
+            stages += 1
+            for peer, expert in selections.items():
+                if expert is None:
+                    active.discard(peer)
+                    continue
+                prefix, count = self.descriptors[peer, expert]
+                if experts[peer] and prefix != starts[peer] + counts[peer]:
+                    active.discard(peer)
+                    continue
+                if gathered[expert // 32][peer] != self.targets[expert] or not count:
+                    raise ProtocolError("invalid coalescing target or empty descriptor")
+                if not self.acquire(generation, expert, peer):
+                    raise ProtocolError("frozen ready contributor must acquire without future wait")
+                if not experts[peer]:
+                    starts[peer] = prefix
+                experts[peer].append(expert)
+                counts[peer] += count
+                available[peer][expert // 32] &= ~(1 << (expert % 32))
+                if not any(available[peer]):
+                    active.discard(peer)
+            if stage_hook is not None:
+                stage_hook(stage, self)
+        plans = {peer: ReadyBatch(generation, peer, tuple(experts[peer]), starts[peer],
+                                 counts[peer], tuple(self.targets[e] for e in experts[peer]), snapshot)
+                 for peer in self.peers if experts[peer]}
+        self.planning_rounds.append((snapshot, stages, plans))
+        return plans
+
+    def issue_batch(self, generation, batch, on_submit=None):
+        self._check(generation)
+        self._validate_masks()
+        if not self.early or self.headers or batch.generation != generation or \
+                batch.peer not in self.peers or not 1 <= len(batch.experts) <= self.cap or \
+                len(batch.targets) != len(batch.experts) or \
+                tuple(sorted(set(batch.experts))) != batch.experts:
+            raise ProtocolError("invalid bounded batch")
+        cursor = batch.begin
+        accepted = [0, 0]
+        for expert, target in zip(batch.experts, batch.targets):
+            if not 0 <= expert < len(self.totals):
+                raise ProtocolError("invalid batch expert")
+            group, bit = expert // 32, 1 << (expert % 32)
+            prefix, count = self.descriptors[batch.peer, expert]
+            if not self.pending_masks[batch.peer][group] & bit or \
+                    not batch.ready_snapshot[group] & bit or not count or prefix != cursor:
+                raise ProtocolError("batch crosses a positive gap or includes nonpending/nonready work")
+            if target != self.targets[expert] or len(self.releases[expert]) != target or \
+                    batch.peer not in self.acquires[expert]:
+                raise ProtocolError("every contributing expert requires the actual issuer's acquire")
+            cursor += count
+            accepted[group] |= bit
+        if cursor - batch.begin != batch.count:
+            raise ProtocolError("batch byte span must equal contributor union")
+        records = {(batch.peer, ordinal) for ordinal in range(batch.begin, cursor)}
+        if records & self.issued_records:
+            raise ProtocolError("batch repeats previously submitted records")
+        if on_submit is not None:
+            on_submit(self, batch)
+        # One helper return, then one commit of all accepted bits. This models
+        # neither implicit flush nor remote completion.
+        self.spans.append(batch)
+        self.issued_records.update(records)
+        for group in range(2):
+            self.pending_masks[batch.peer][group] &= ~accepted[group]
+        return batch
+
+    def drain_ready(self, generation, peer_order=None):
+        self._check(generation)
+        if not self.early:
+            return ()
+        peer_order = self.peers if peer_order is None else tuple(peer_order)
+        if len(peer_order) != len(self.peers) or set(peer_order) != set(self.peers):
+            raise ProtocolError("wave must visit every peer exactly once")
+        emitted = []
+        while True:
+            plans = self.plan_wave(generation)
+            if not plans:
+                break
+            for peer in peer_order:
+                if peer in plans:
+                    emitted.append(self.issue_batch(generation, plans[peer]))
+        if not any(any(masks) for masks in self.pending_masks.values()):
+            self.finish_queuing(generation)
+        return tuple(emitted)

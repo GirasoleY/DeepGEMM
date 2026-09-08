@@ -1,6 +1,9 @@
-# Peer-parallel expert-ready combine experiment
+# Ready-span coalesced combine experiment
 
-Status on2026-09-08: R2 source prepared; CUDA and GPU validation pending.
+Status on2026-09-08: R3 source prepared; CUDA and GPU validation pending.
+R2 peer-parallel source remains at48e349a and its separate deployment.
+R2 passed its short GPU correctness screen but regressed to475/501us for
+half/all remote versus390/409us controls; it is not a selected strategy.
 R1 expert-ready source remains at cd1aaf9 and its separate deployment.
 R1 passed its short GPU correctness screen but regressed to784/795us for
 half/all remote versus390/411us controls; it is not a selected strategy.
@@ -23,12 +26,17 @@ Hot experts are not truncated or sized from a balanced-load hint.
 
 SM0 dispatch warp0 starts draining only after its own pulls. All32 lanes
 discover ready experts with uniform ballots. Each peer lane selects its own
-pending ready expert, so different peers may issue different expert spans in
-one warp round. Two uniform fixed-group target shuffles precede peer-specific
-selection; each issuer independently acquires the exact producer target.
-The unchanged required-system, nonaggregate GIN PUT publishes that span.
-Pending bits clear only after submission, with no wait for future readiness,
-new metadata scan, packet coalescing or new communication warp.
+pending ready expert, so different peers may issue different expert spans.
+R3 freezes the current readiness snapshot and joins at most eight already-
+ready, physically adjacent expert spans per peer into one unchanged required-
+system, nonaggregate GIN PUT. Eight is a fixed compile-time cap, not a tuning
+hint. It never waits for future readiness to fill a batch, never bridges a
+positive unready/already-sent gap, and safely skips zero-length expert gaps.
+Two uniform fixed-group target shuffles precede each peer-specific selection;
+the issuing lane acquires every contributing expert's exact producer target.
+Scalar pending bits clear only after PUT submission. Uniform early stop avoids
+empty planning stages. There is no extra metadata, context, warp or SM.
+The bounded lookahead is not free: marker99 precedes first acquire/lookahead.
 
 Readiness discovery is monotonic and shared, while pending state is peer-local.
 A send to one peer cannot retire another peer's pending expert. The preserved
@@ -44,8 +52,10 @@ performance winner. No numerical threshold is relaxed.
 
 R1 diagnostics observed earliest issue about93us before last epilogue, but
 all payloads were queued about404/415us AFTER last epilogue for half/all remote.
-These same-GPU software intervals motivate independent peer selection; they
+R2 reduced firstissue-to-allqueued to179/202us, with firstissue still about
+93us before last epilogue. That residual interval motivates bounded ready-span
+coalescing. These same-GPU software intervals
 do not prove physical NIC/MMA overlap or isolate pure posting cost.
 
-Execution records: /Users/girasoley/dev/projects/novita-b300-vllm/artifacts/20260908/megamoe-peer-ready/
-R1 evidence: ../megamoe-expert-ready/ within that artifact parent.
+Execution records: /Users/girasoley/dev/projects/novita-b300-vllm/artifacts/20260908/megamoe-ready-coalesce/
+R1/R2 evidence: ../megamoe-expert-ready/ and ../megamoe-peer-ready/.

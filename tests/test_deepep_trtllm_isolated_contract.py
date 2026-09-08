@@ -28,7 +28,7 @@ class ComparisonContractTest(unittest.TestCase):
                  "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
                  "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1"}
         metadata = comparison.dispatch_candidate_metadata(flags)
-        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_peer_ready_combine")
+        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_ready_coalesced_combine")
         contract = metadata["combine_overlap_contract"]
         self.assertEqual(contract["requested_raw"], "1")
         self.assertTrue(contract["requested"])
@@ -37,10 +37,14 @@ class ComparisonContractTest(unittest.TestCase):
                          "ceil(actual expert assignments / actual BM) * (H / BN)")
         self.assertIn("saved dispatch source/expert prefixes", contract["span_descriptors"])
         self.assertIn("each peer independently selects", contract["early_payload_policy"])
-        self.assertEqual(contract["combine_schedule"], "peer_parallel_ready_expert_spans_then_late_header")
+        self.assertEqual(contract["combine_schedule"], "peer_parallel_ready_coalesced_spans_then_late_header")
         self.assertEqual(contract["ready_selection_policy"],
-                         "warp_parallel_readiness_peer_independent_expert_immediate_issue")
-        self.assertIn("no batching", contract["submission_granularity"])
+                         "warp_parallel_readiness_peer_independent_bounded_ready_coalescing")
+        self.assertIn("fixed cap8", contract["submission_granularity"])
+        self.assertEqual(contract["ready_batch_max_experts"], 8)
+        self.assertTrue(contract["ready_batch_cap_is_compile_time_constant"])
+        self.assertTrue(contract["frozen_ready_snapshot_no_fill_wait"])
+        self.assertTrue(contract["issuer_acquires_every_batched_expert"])
         self.assertIn("not early readiness", contract["sent_entry_role"])
         layout = contract["scratch_layout"]
         self.assertEqual(layout["saved_source_nonempty_mask_uint32"], 16)

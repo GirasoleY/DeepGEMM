@@ -2326,6 +2326,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // drainer may wait here without creating a producer/handoff cycle.
             if (use_gin_combine_overlap and sm_idx == 0 and warp_idx == 0) {
                 constexpr uint32_t kNumL2Fragments = L2_SHAPE_N / BLOCK_N;
+                constexpr uint32_t kMaxReadyExpertsPerPut = 8u;
                 constexpr uint32_t kNumExpertGroups =
                     math::constexpr_ceil_div(kNumExpertsPerRank, 32u);
                 DG_STATIC_ASSERT(kNumExpertsPerRank ==
@@ -2343,7 +2344,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 uint32_t expected_fragments[kNumExpertGroups];
                 bool discovered[kNumExpertGroups];
                 uint32_t ready_masks[kNumExpertGroups];
-                uint32_t pending[kNumExpertGroups];
+                uint32_t pending_first = 0;
+                uint32_t pending_second = 0;
                 // Counts are exact, published before pulls, and remain live
                 // until the existing second dispatch/epilogue handoff. Read
                 // lane-owned cells directly: no varying-index scheduler query
@@ -2362,18 +2364,22 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     expected_fragments[group] = target;
                     discovered[group] = target == 0;
                     ready_masks[group] = 0;
-                    pending[group] = peer_lane
+                    const uint32_t nonempty = peer_lane
                         ? *buffer.gin_workspace.get_combine_overlap_nonempty_mask_ptr(
                               lane_idx, group)
                         : 0u;
-                    if (group == 1u)
-                        DG_DEVICE_ASSERT((pending[group] >> (kNumExpertsPerRank - 32u)) == 0);
+                    if (group == 0u) {
+                        pending_first = nonempty;
+                    } else {
+                        DG_DEVICE_ASSERT((nonempty >> (kNumExpertsPerRank - 32u)) == 0);
+                        pending_second = nonempty;
+                    }
                 }
 
                 // Every lane stays in the uniform outer loop, including idle
                 // peers and lanes8..31 which discover the other experts. Peer
-                // lanes may choose DIFFERENT experts in the same PUT round.
-                while (__any_sync(0xffffffffu, (pending[0] | pending[1]) != 0)) {
+                // lanes may choose DIFFERENT expert spans in the same round.
+                while (__any_sync(0xffffffffu, (pending_first | pending_second) != 0)) {
                     // Parallel readiness probes for experts0..31 and32..55.
                     // Discovery is monotonic and common to the warp; sending
                     // to one peer never retires readiness for another peer.
@@ -2393,58 +2399,106 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         ready_masks[group] |= __ballot_sync(0xffffffffu, newly_ready);
                     }
 
-                    const uint32_t available_first = pending[0] & ready_masks[0];
-                    const uint32_t available_second = pending[1] & ready_masks[1];
-                    const uint32_t selected_group = available_first != 0 ? 0u : 1u;
-                    const uint32_t selected_mask = available_first != 0
-                        ? available_first : available_second;
-                    const bool issue = peer_lane and selected_mask != 0;
-                    const uint32_t selected_lane = selected_mask != 0
-                        ? static_cast<uint32_t>(__ffs(selected_mask) - 1) : 0u;
-                    // Both shuffles are full-warp and use fixed source groups.
-                    // Shuffling expected_fragments[selected_group] once would
-                    // select the SOURCE lane's group, not this peer's group.
-                    const uint32_t first_target = __shfl_sync(
-                        0xffffffffu, expected_fragments[0], selected_lane);
-                    const uint32_t second_target = __shfl_sync(
-                        0xffffffffu, expected_fragments[1], selected_lane);
-                    const uint32_t target = selected_group == 0u
-                        ? first_target : second_target;
-#if DG_MEGAMOE_GIN_DIAGNOSTICS
-                    const uint32_t issuing_lanes = __ballot_sync(0xffffffffu, issue);
-                    DG_GIN_TRACE_FIRST_IF(lane_idx == 0 and issuing_lanes != 0, 99);
-#endif
-
-                    if (issue) {
+                    // Freeze this round's ready snapshot. Coalesce at most
+                    // eight already-ready nonempty experts per peer; never
+                    // wait for future readiness or keep a batch across polls.
+                    uint32_t available_first = pending_first & ready_masks[0];
+                    uint32_t available_second = pending_second & ready_masks[1];
+                    uint32_t accepted_first = 0;
+                    uint32_t accepted_second = 0;
+                    uint32_t batch_prefix = 0;
+                    uint32_t batch_records = 0;
+                    bool can_extend = peer_lane and
+                        (available_first | available_second) != 0;
+                    for (uint32_t stage = 0; stage < kMaxReadyExpertsPerPut and
+                         __any_sync(0xffffffffu, can_extend); ++stage) {
+                        const uint32_t selected_group = available_first != 0 ? 0u : 1u;
+                        const uint32_t selected_mask = can_extend
+                            ? (available_first != 0 ? available_first : available_second)
+                            : 0u;
+                        const uint32_t selected_lane = selected_mask != 0
+                            ? static_cast<uint32_t>(__ffs(selected_mask) - 1) : 0u;
+                        // Every lane participates, even when its batch ended.
+                        // Gather fixed groups separately: one varying-group
+                        // shuffle would use the SOURCE lane's selected group.
+                        const uint32_t first_target = __shfl_sync(
+                            0xffffffffu, expected_fragments[0], selected_lane);
+                        const uint32_t second_target = __shfl_sync(
+                            0xffffffffu, expected_fragments[1], selected_lane);
+                        const uint32_t target = selected_group == 0u
+                            ? first_target : second_target;
                         const uint32_t expert = selected_group * 32u + selected_lane;
-                        DG_DEVICE_ASSERT(expert < kNumExpertsPerRank and target != 0);
-                        // Each issuer acquires ALL M×N producer contributions
-                        // for its own selected expert. ncclCoopThread then
-                        // submits the same single nonaggregate per-expert PUT;
-                        // no other peer's selection or future readiness gates it.
-                        uint32_t completed;
-                        do {
-                            completed = comm::mega_moe_gin_combine_ready_acquire(
-                                buffer.gin_workspace.get_combine_overlap_ready_ptr(expert));
-                            DG_DEVICE_ASSERT(completed <= target);
-                        } while (completed != target);
-                        const uint32_t count = static_cast<uint32_t>(
-                            *workspace.get_expert_recv_count_ptr(peer, expert));
-                        const uint32_t prefix =
-                            *buffer.gin_workspace.get_combine_overlap_prefix_ptr(lane_idx, expert);
-                        DG_DEVICE_ASSERT(count != 0 and prefix + count <=
+                        uint32_t count = 0;
+                        uint32_t prefix = 0;
+                        bool accept = false;
+                        if (can_extend) {
+                            DG_DEVICE_ASSERT(expert < kNumExpertsPerRank and target != 0);
+                            count = static_cast<uint32_t>(
+                                *workspace.get_expert_recv_count_ptr(peer, expert));
+                            prefix = *buffer.gin_workspace.get_combine_overlap_prefix_ptr(
+                                lane_idx, expert);
+                            DG_DEVICE_ASSERT(count != 0 and prefix + count <=
+                                layout::kMegaMoeGinBulkCombineMaxTokens * kNumTopk);
+                            // Zero-count experts occupy no records and may be
+                            // skipped. An unready or previously sent positive
+                            // span leaves a gap, which must never be bridged.
+                            accept = batch_records == 0 or
+                                prefix == batch_prefix + batch_records;
+                            if (not accept)
+                                can_extend = false;
+                        }
+#if DG_MEGAMOE_GIN_DIAGNOSTICS
+                        const uint32_t accepting_lanes = __ballot_sync(0xffffffffu, accept);
+                        // Includes first-batch lookahead in99-to-first-issue,
+                        // even when peer lane0 itself has nothing to send.
+                        DG_GIN_TRACE_FIRST_IF(lane_idx == 0 and accepting_lanes != 0, 99);
+#endif
+                        if (accept) {
+                            // The SAME issuer acquires ALL M×N contributors
+                            // for EVERY included expert before the one PUT's
+                            // required-system publication. Discovery alone
+                            // never substitutes for these per-issuer acquires.
+                            uint32_t completed;
+                            do {
+                                completed = comm::mega_moe_gin_combine_ready_acquire(
+                                    buffer.gin_workspace.get_combine_overlap_ready_ptr(expert));
+                                DG_DEVICE_ASSERT(completed <= target);
+                            } while (completed != target);
+                            if (batch_records == 0)
+                                batch_prefix = prefix;
+                            batch_records += count;
+                            const uint32_t bit = 1u << selected_lane;
+                            if (selected_group == 0u) {
+                                accepted_first |= bit;
+                                available_first &= ~bit;
+                            } else {
+                                accepted_second |= bit;
+                                available_second &= ~bit;
+                            }
+                            can_extend = (available_first | available_second) != 0;
+                        }
+                    }
+
+                    if (batch_records != 0) {
+                        DG_DEVICE_ASSERT(peer_lane and batch_prefix + batch_records <=
                             layout::kMegaMoeGinBulkCombineMaxTokens * kNumTopk);
+                        // One closed Default PUT; no aggregate flag or new
+                        // context. A singleton is sent as soon as this bounded
+                        // ready-only planning finishes, with no batch-fill wait.
                         comm::mega_moe_gin_put_bulk_combine_span(
                             gin_transport, peer, /*context_stripe=*/ 0u,
                             sym_buffer.get_base_ptr(),
                             buffer.gin_workspace.get_bulk_combine_record_ptr(
-                                /*send=*/ true, lane_idx, prefix),
+                                /*send=*/ true, lane_idx, batch_prefix),
                             buffer.gin_workspace.get_bulk_combine_record_ptr(
-                                /*send=*/ false, owner_lane, prefix),
-                            count * buffer.gin_workspace.bulk_record_bytes,
+                                /*send=*/ false, owner_lane, batch_prefix),
+                            batch_records * buffer.gin_workspace.bulk_record_bytes,
                             /*diagnostic_peer_lane=*/ lane_idx);
-                        sent_records += count;
-                        pending[selected_group] &= ~(1u << selected_lane);
+                        sent_records += batch_records;
+                        // Keep pending state live until submission returns.
+                        // Scalar masks avoid a varying-index local-array store.
+                        pending_first &= ~accepted_first;
+                        pending_second &= ~accepted_second;
                     }
                     __syncwarp();
                 }

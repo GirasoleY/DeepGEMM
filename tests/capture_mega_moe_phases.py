@@ -157,7 +157,7 @@ def _kernel_configuration(args, *, environment=None):
     if combine_raw == "1" and not (single_raw == "1" and dispatch_raw == "1"):
         raise ValueError("combine_overlap requires single_combine_context=1 and dispatch_overlap=1")
     combine_schedule = (
-        "peer_parallel_ready_expert_spans_then_late_header" if combine_raw == "1"
+        "peer_parallel_ready_coalesced_spans_then_late_header" if combine_raw == "1"
         else "post_compute_full_packet"
     )
     return {
@@ -177,9 +177,13 @@ def _kernel_configuration(args, *, environment=None):
             "metadata_storage_bytes": 2304,
             "span_lookup": "dispatch_saved_source_expert_prefix_and_existing_count",
             "readiness_target": "ceil(actual_expert_assignments / actual_block_m) * (hidden / actual_block_n)",
-            "selection": "warp_parallel_readiness_peer_independent_expert_immediate_issue",
+            "selection": "warp_parallel_readiness_peer_independent_bounded_ready_coalescing",
             "nonempty_masks_saved_during_existing_dispatch_prefix_scan": True,
-            "payload_span_granularity_unchanged_one_nonempty_peer_expert": True,
+            "payload_span_granularity_unchanged_one_nonempty_peer_expert": False,
+            "ready_batch_max_experts": 8,
+            "ready_batch_cap_is_compile_time_constant": True,
+            "frozen_ready_snapshot_no_fill_wait": True,
+            "issuer_acquires_every_batched_expert": True,
             "no_token_metadata_rescan": True,
             "hot_expert_readiness_is_coarser_not_count_truncated": True,
             "policy_is_device_observation": False,

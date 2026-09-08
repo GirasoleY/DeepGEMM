@@ -60,12 +60,16 @@ class CombinePhaseContract(unittest.TestCase):
         self.assertFalse(baseline["combine_overlap_requested"])
         with mock.patch.dict(os.environ, candidate_env(), clear=True):
             result = capture._kernel_configuration(args())
-        self.assertEqual(result["combine_schedule"], "peer_parallel_ready_expert_spans_then_late_header")
+        self.assertEqual(result["combine_schedule"], "peer_parallel_ready_coalesced_spans_then_late_header")
         self.assertTrue(result["combine_ready_expert_policy"]["no_token_metadata_rescan"])
         self.assertEqual(result["combine_ready_expert_policy"]["metadata_storage_bytes"], 2304)
         self.assertIn("peer_independent", result["combine_ready_expert_policy"]["selection"])
         self.assertTrue(result["combine_ready_expert_policy"]["nonempty_masks_saved_during_existing_dispatch_prefix_scan"])
-        self.assertTrue(result["combine_ready_expert_policy"]["payload_span_granularity_unchanged_one_nonempty_peer_expert"])
+        self.assertFalse(result["combine_ready_expert_policy"]["payload_span_granularity_unchanged_one_nonempty_peer_expert"])
+        self.assertEqual(result["combine_ready_expert_policy"]["ready_batch_max_experts"], 8)
+        self.assertTrue(result["combine_ready_expert_policy"]["ready_batch_cap_is_compile_time_constant"])
+        self.assertTrue(result["combine_ready_expert_policy"]["frozen_ready_snapshot_no_fill_wait"])
+        self.assertTrue(result["combine_ready_expert_policy"]["issuer_acquires_every_batched_expert"])
         self.assertFalse(result["combine_ready_expert_policy"]["policy_is_device_observation"])
         self.assertTrue(result["combine_schedule_is_requested_policy_not_device_observation"])
         self.assertEqual(result["combine_overlap_effective_policy"][

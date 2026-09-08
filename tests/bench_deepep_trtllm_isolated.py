@@ -917,18 +917,22 @@ def dispatch_candidate_metadata(flags):
     if combine_enabled and (not enabled or flags.get("DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT") != "1"):
         raise ValueError("combine overlap metadata requires dispatch overlap1 and single context1")
     return {
-        "candidate_family": ("direct_control_first_dispatch_peer_ready_combine" if combine_enabled else
+        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_combine" if combine_enabled else
                              "direct_control_first_dispatch" if enabled else
                              "clean_single_combine_context_only"),
         "combine_overlap_contract": {
             "requested_raw": combine_raw, "requested": combine_enabled,
             "readiness_unit": "complete expert output, using actual expert assignment counts",
             "producer_target": "ceil(actual expert assignments / actual BM) * (H / BN)",
-            "combine_schedule": "peer_parallel_ready_expert_spans_then_late_header",
-            "ready_selection_policy": "warp_parallel_readiness_peer_independent_expert_immediate_issue",
-            "early_payload_policy": "each peer independently selects a pending ready expert and immediately issues its nonempty contiguous span",
+            "combine_schedule": "peer_parallel_ready_coalesced_spans_then_late_header",
+            "ready_selection_policy": "warp_parallel_readiness_peer_independent_bounded_ready_coalescing",
+            "early_payload_policy": "each peer independently selects at most eight already-ready adjacent expert spans; never waits for future readiness",
             "readiness_tracking": "common monotonic discovered-ready experts; independent per-peer pending-ready selection",
-            "submission_granularity": "one nonaggregate PUT per nonempty (peer, expert); no batching",
+            "submission_granularity": "one nonaggregate PUT per bounded contiguous ready batch; fixed cap8",
+            "ready_batch_max_experts": 8,
+            "ready_batch_cap_is_compile_time_constant": True,
+            "frozen_ready_snapshot_no_fill_wait": True,
+            "issuer_acquires_every_batched_expert": True,
             "span_descriptors": "saved dispatch source/expert prefixes and existing exact assignment counts; no return-record metadata walk",
             "nonempty_masks": "two uint32 expert masks per peer; saved at dispatch and immutable until launch completion",
             "sent_entry_role": "final all-peer submission-complete bookkeeping, not early readiness",
