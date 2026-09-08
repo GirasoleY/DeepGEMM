@@ -917,7 +917,7 @@ def dispatch_candidate_metadata(flags):
     if combine_enabled and (not enabled or flags.get("DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT") != "1"):
         raise ValueError("combine overlap metadata requires dispatch overlap1 and single context1")
     return {
-        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_direct_reduce_preload" if combine_enabled else
+        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_direct_reduce_preload_late_flush" if combine_enabled else
                              "direct_control_first_dispatch" if enabled else
                              "clean_single_combine_context_only"),
         "combine_overlap_contract": {
@@ -929,6 +929,21 @@ def dispatch_candidate_metadata(flags):
             "early_payload_policy": "each peer independently selects at most eight already-ready adjacent expert spans; never waits for future readiness",
             "readiness_tracking": "common monotonic discovered-ready experts; independent per-peer pending-ready selection",
             "submission_granularity": "one nonaggregate PUT per bounded contiguous ready batch; fixed cap8",
+            "combine_payload_local_completion": {
+                "requested_by_combine_overlap": combine_enabled,
+                "eligibility": "early_record_combine_path_and_scratch_alias_fits",
+                "completion": "late_header_same_context_peer",
+                "payload_only_flush_before_handoff": False,
+                "all_input_flushes_retained": True,
+                "late_header_put_and_flush_retained": True,
+                "original_handoff_and_grid_order_retained": True,
+                "final_world_put_barrier_retained": True,
+                "source_storage_retained_until_late_header_flush": True,
+                "header_flush_does_not_prove_remote_visibility": True,
+                "fallback": "unchanged_full_packet_local_flush",
+                "slot101_writer_present": False,
+                "policy_not_device_observation": True,
+            },
             "direct_reducer": {
                 "requested": combine_enabled,
                 "additional_source_local_ordinal_bytes": 3072,

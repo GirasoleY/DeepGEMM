@@ -2547,16 +2547,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         expected_records += static_cast<uint32_t>(
                             *workspace.get_expert_recv_count_ptr(peer, expert));
                     DG_DEVICE_ASSERT(sent_records == expected_records);
-                    if (sent_records != 0) {
-                        ncclGinRequest_t request{};
-                        comm::mega_moe_gin_flush_data_peer_async(
-                            gin_transport, peer, /*context_stripe=*/ 0u, &request);
-                        comm::mega_moe_gin_wait_data_peer(
-                            gin_transport, /*context_stripe=*/ 0u, request);
-                    }
                 }
+                // Every Default PUT has returned, but payloads may still be
+                // in flight. The existing handoff/grid1 orders the later
+                // header PUT and same-(context1, peer) flush after all these
+                // submissions; that shared-QP completion protects source
+                // reuse. Keep the immutable slabs live until then. Slot101
+                // intentionally has no writer: no early payload-only flush.
                 __syncwarp();
-                DG_GIN_TRACE_IF(lane_idx == 0, 101);
             }
 #endif
         }
@@ -3790,8 +3788,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     workspace.get_gin_world_active_ptr()) != 0;
             if (run_remote_path) {
             // Publish every same-LSA mapped store before handing phase 2 to
-            // the world collective.  The first local barrier also proves that
-            // this CTA's dispatch drainer has flush-completed its GIN PUTs.
+            // the world collective. The first local barrier joins this CTA's
+            // dispatch phase; the grid below joins all early PUT submissions.
+            // Their source completion is deferred to the late header flush.
             __threadfence_system();
             ptx::sync_unaligned(
                 kNumDispatchThreads + kNumEpilogueThreads,

@@ -173,6 +173,21 @@ def _kernel_configuration(args, *, environment=None):
             "remote_ineligible": "unchanged_fallback",
             "all_local": "unchanged_local_path",
         },
+        "combine_payload_local_completion": {
+            "requested_by_combine_overlap": combine_raw == "1",
+            "eligibility": "early_record_combine_path_and_scratch_alias_fits",
+            "completion": "late_header_same_context_peer",
+            "payload_only_flush_before_handoff": False,
+            "all_input_flushes_retained": True,
+            "late_header_put_and_flush_retained": True,
+            "original_handoff_and_grid_order_retained": True,
+            "final_world_put_barrier_retained": True,
+            "source_storage_retained_until_late_header_flush": True,
+            "header_flush_does_not_prove_remote_visibility": True,
+            "fallback": "unchanged_full_packet_local_flush",
+            "slot101_writer_present": False,
+            "policy_not_device_observation": True,
+        },
         "direct_reducer": {
             "requested": combine_raw == "1",
             "additional_source_local_ordinal_bytes": 3072,
@@ -216,12 +231,12 @@ def _kernel_configuration(args, *, environment=None):
             "64_71": "first_combine_issue_observation_per_peer",
             "72_79": ("last_recorded_queue_observation_includes_late_header" if combine_raw == "1"
                       else "whole_packet_queue_observation"),
-            "80_87": ("late_header_local_flush_not_last_payload_time" if combine_raw == "1"
+            "80_87": ("late_header_same_context_peer_local_completion_includes_payload_not_last_payload_time_or_remote_visibility" if combine_raw == "1"
                       else "whole_packet_local_flush_not_receiver_arrival"),
             "53": "epilogue_task_loop_exit_not_mma_completion_or_nic_visibility",
             "99": "first_ready_expert_selected_software_observation",
             "100": "all_combine_payload_puts_queued_not_remote_completion",
-            "101": "combine_payload_local_flush_not_remote_visibility",
+            "101": "unwritten_absent_not_zero_not_relabelled_as_late_header_flush",
             "59_60_112_119": "scatter_markers_absent_on_direct_reducer_path_not_zero_cost",
             "88_95": "reducer_loop_exit_before_deferred_cleanup_handoff",
         },

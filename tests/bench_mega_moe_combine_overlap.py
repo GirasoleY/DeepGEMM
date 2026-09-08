@@ -8,6 +8,8 @@ SINGLE_COMBINE_CONTEXT=1 stay fixed. The shared driver preserves balanced
 launch-only timings and untimed exact-count hot-owner, masked/asymmetric,
 varying FP8/SF payload and same-allocation T48→64→48 gates. Device overlap and
 the per-rank counter-storage fit branch are not inferred from environment flags.
+Eligible combine1 defers payload local completion to the existing late header
+flush on the same context/peer; this is policy, not measured remote visibility.
 """
 
 import bench_mega_moe_dispatch_overlap as shared
@@ -32,6 +34,21 @@ def combine_contract(mode):
         "counter_storage_fit_is_per_rank": True,
         "counter_storage_capacity_policy": "56 expert ready counts + 56 sent entries + 8*56 saved source/expert prefixes + 8*2 nonempty mask words",
         "expert_metadata_storage_bytes": 2304,
+        "combine_payload_local_completion": {
+            "requested_by_combine_overlap": bool(mode),
+            "eligibility": "early_record_combine_path_and_scratch_alias_fits",
+            "completion": "late_header_same_context_peer",
+            "payload_only_flush_before_handoff": False,
+            "all_input_flushes_retained": True,
+            "late_header_put_and_flush_retained": True,
+            "original_handoff_and_grid_order_retained": True,
+            "final_world_put_barrier_retained": True,
+            "source_storage_retained_until_late_header_flush": True,
+            "header_flush_does_not_prove_remote_visibility": True,
+            "fallback": "unchanged_full_packet_local_flush",
+            "slot101_writer_present": False,
+            "policy_not_device_observation": True,
+        },
         "direct_reducer": {
             "requested": bool(mode),
             "additional_source_local_ordinal_bytes": 3072,

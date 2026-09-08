@@ -180,7 +180,7 @@ def summarize_capture(capture: dict[str, Any]) -> dict[str, Any]:
             "With dispatch_overlap=1 slots32–39 observe control readiness, not payload readiness; slots24–31 are late sender flushes, not receiver payload timestamps.",
             "The signed first-combine-issue to last-epilogue-loop-exit interval is positive when issue was observed first on that GPU; it is an issue/remaining-epilogue observation, not physical IB or MMA overlap proof.",
             "With combine_overlap=1 first issue is retained in slots64–71, while slots72–79 include late headers and slots80–87 report header flush. Do not infer last-payload timing from either late observation.",
-            "Expert-ready variants add slots99–101: first selected expert, all payload puts queued, and payload local flush. These are software observations; local flush is not remote visibility. Older captures may omit them.",
+            "Historical R1–R6 expert-ready variants use slots99–101 for first selected expert, all payload puts queued, and payload local flush. R7 removes the slot101 writer: it and its derived intervals remain absent/null, not zero and not replaced by a late header timestamp. Historical field names remain for backward compatibility. These are software observations; local flush is not remote visibility. Older captures may omit them.",
             "Expert production completion uses max(last L2 epilogue fragment marker) over participating SMs; it is not a NIC visibility proof.",
             "Reduction end marks loop exit/last TMA store issue, not asynchronous store completion.",
             "Level 1 omits per-expert readiness; level 2 includes its instrumentation cost.",

@@ -108,9 +108,15 @@ class ExpertReadySourceContracts(unittest.TestCase):
         self.assertLess(body.index("DG_GIN_TRACE_IF(lane_idx == 0, 100)"),
                         body.index("get_combine_overlap_sent_ptr(expert) = 1"))
         self.assertLess(body.index("DG_GIN_TRACE_IF(lane_idx == 0, 100)"),
-                        body.index("comm::mega_moe_gin_flush_data_peer_async("))
-        self.assertLess(body.index("comm::mega_moe_gin_wait_data_peer("),
-                        body.index("DG_GIN_TRACE_IF(lane_idx == 0, 101)"))
+                        body.index("DG_DEVICE_ASSERT(sent_records == expected_records)"))
+        # R7 preserves the submission audit, but completion moves to the
+        # existing same-context/peer header flush after the handoff/grid1.
+        for forbidden in ("comm::mega_moe_gin_flush_data_peer_async(",
+                          "comm::mega_moe_gin_wait_data_peer(",
+                          "ncclGinRequest_t request", "DG_GIN_TRACE_IF(lane_idx == 0, 101)"):
+            self.assertNotIn(forbidden, body)
+        self.assertLess(body.index("DG_DEVICE_ASSERT(sent_records == expected_records)"),
+                        body.rindex("__syncwarp();"))
 
     def test_all_dispatch_unpack_variants_save_existing_prefix_before_publication(self):
         source = self.source

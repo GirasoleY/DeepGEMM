@@ -11,6 +11,24 @@ import bench_mega_moe_combine_overlap as sweep
 
 
 class CombineSweepContracts(unittest.TestCase):
+    def test_local_payload_completion_is_deferred_policy_not_remote_visibility(self):
+        for mode in (0, 1, 0):
+            self.assertEqual(sweep.combine_contract(mode)["combine_payload_local_completion"], {
+                "requested_by_combine_overlap": bool(mode),
+                "eligibility": "early_record_combine_path_and_scratch_alias_fits",
+                "completion": "late_header_same_context_peer",
+                "payload_only_flush_before_handoff": False,
+                "all_input_flushes_retained": True,
+                "late_header_put_and_flush_retained": True,
+                "original_handoff_and_grid_order_retained": True,
+                "final_world_put_barrier_retained": True,
+                "source_storage_retained_until_late_header_flush": True,
+                "header_flush_does_not_prove_remote_visibility": True,
+                "fallback": "unchanged_full_packet_local_flush",
+                "slot101_writer_present": False,
+                "policy_not_device_observation": True,
+            })
+
     def test_full_schedule_gates_and_unchanged_timing_defaults(self):
         for mns, tokens in ((8, 32), (10, 40), (12, 48)):
             with patch.object(sys, "argv", ["sweep", "--decode-mns", str(mns),

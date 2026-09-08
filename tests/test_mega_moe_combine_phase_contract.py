@@ -140,6 +140,35 @@ class CombinePhaseContract(unittest.TestCase):
         self.assertEqual(result["collectively_validated_setup"]["num_tokens"], 32)
         self.assertEqual(result["collectively_validated_diagnostic_settings"]["diagnostic_level"], 2)
 
+    def test_removed_payload_flush_marker_remains_absent_not_zero_or_header_time(self):
+        for mode in ("0", "1"):
+            with mock.patch.dict(os.environ, candidate_env() | {COMBINE: mode}, clear=True):
+                result = capture._kernel_configuration(args())
+            self.assertEqual(result["combine_payload_local_completion"], {
+                "requested_by_combine_overlap": mode == "1",
+                "eligibility": "early_record_combine_path_and_scratch_alias_fits",
+                "completion": "late_header_same_context_peer",
+                "payload_only_flush_before_handoff": False,
+                "all_input_flushes_retained": True,
+                "late_header_put_and_flush_retained": True,
+                "original_handoff_and_grid_order_retained": True,
+                "final_world_put_barrier_retained": True,
+                "source_storage_retained_until_late_header_flush": True,
+                "header_flush_does_not_prove_remote_visibility": True,
+                "fallback": "unchanged_full_packet_local_flush",
+                "slot101_writer_present": False,
+                "policy_not_device_observation": True,
+            })
+            self.assertEqual(result["phase_marker_semantics"]["101"],
+                             "unwritten_absent_not_zero_not_relabelled_as_late_header_flush")
+        sample = marker_sample()
+        sample["sm_markers_ns"]["0"].update({"100": 40000, "55": 41000, "80": 50000})
+        for header_stamp in (50000, 9000000):
+            sample["sm_markers_ns"]["0"]["80"] = header_stamp
+            metrics = summarize_sample(sample)["metrics_us"]
+            self.assertIsNone(metrics["all_payload_puts_queued_to_payload_local_flush_us"])
+            self.assertIsNone(metrics["payload_local_flush_to_combine_grid1_us"])
+
     def test_signed_interval_uses_first_issue_and_last_exit_only_on_same_gpu(self):
         sample = marker_sample()
         sample["sm_markers_ns"]["2"] = {"0": 1200, "65": 23000, "53": 35000}

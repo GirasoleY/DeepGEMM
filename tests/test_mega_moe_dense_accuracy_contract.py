@@ -4,6 +4,7 @@ These tests check acceptance policy, not GPU math or communication correctness.
 The separate dense runner must still execute the full two-host device gates.
 """
 
+import ast
 import math
 import inspect
 import os
@@ -14,6 +15,30 @@ import test_mega_moe_dense_accuracy as dense
 
 
 class TestDenseAccuracyPolicy(unittest.TestCase):
+    def test_late_header_completion_metadata_preserves_gates_and_lifetimes(self):
+        source = inspect.getsource(dense.worker)
+        policy_ast = next(value for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Dict)
+                          for key, value in zip(node.keys, node.values)
+                          if isinstance(key, ast.Constant) and key.value == "combine_payload_local_completion")
+        for mode in (0, 1):
+            policy = eval(compile(ast.Expression(policy_ast), "dense-local-completion-metadata", "eval"),
+                          {"combine_overlap": mode})
+            self.assertEqual(policy, {
+                "requested_by_combine_overlap": bool(mode),
+                "eligibility": "early_record_combine_path_and_scratch_alias_fits",
+                "completion": "late_header_same_context_peer",
+                "payload_only_flush_before_handoff": False,
+                "all_input_flushes_retained": True,
+                "late_header_put_and_flush_retained": True,
+                "original_handoff_and_grid_order_retained": True,
+                "final_world_put_barrier_retained": True,
+                "source_storage_retained_until_late_header_flush": True,
+                "header_flush_does_not_prove_remote_visibility": True,
+                "fallback": "unchanged_full_packet_local_flush",
+                "slot101_writer_present": False,
+                "policy_not_device_observation": True,
+            })
+
     def test_combine_mode_is_collective_canonical_boolean(self):
         for value in ("0", "1"):
             self.assertEqual(dense.validate_combine_modes([value] * 16), int(value))

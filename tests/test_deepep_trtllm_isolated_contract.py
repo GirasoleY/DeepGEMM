@@ -23,12 +23,35 @@ class FakeDist:
 
 
 class ComparisonContractTest(unittest.TestCase):
+    def test_late_header_completion_metadata_is_explicit_for_both_modes(self):
+        for mode in ("0", "1"):
+            metadata = comparison.dispatch_candidate_metadata({
+                "DG_MEGAMOE_GIN_DISPATCH_OVERLAP": "1",
+                "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
+                "DG_MEGAMOE_GIN_COMBINE_OVERLAP": mode,
+            })
+            self.assertEqual(metadata["combine_overlap_contract"]["combine_payload_local_completion"], {
+                "requested_by_combine_overlap": mode == "1",
+                "eligibility": "early_record_combine_path_and_scratch_alias_fits",
+                "completion": "late_header_same_context_peer",
+                "payload_only_flush_before_handoff": False,
+                "all_input_flushes_retained": True,
+                "late_header_put_and_flush_retained": True,
+                "original_handoff_and_grid_order_retained": True,
+                "final_world_put_barrier_retained": True,
+                "source_storage_retained_until_late_header_flush": True,
+                "header_flush_does_not_prove_remote_visibility": True,
+                "fallback": "unchanged_full_packet_local_flush",
+                "slot101_writer_present": False,
+                "policy_not_device_observation": True,
+            })
+
     def test_combine_metadata_requires_dispatch_sc_and_labels_only_transport_policy(self):
         flags = {"DG_MEGAMOE_GIN_DISPATCH_OVERLAP": "1",
                  "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
                  "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1"}
         metadata = comparison.dispatch_candidate_metadata(flags)
-        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_ready_coalesced_direct_reduce_preload")
+        self.assertEqual(metadata["candidate_family"], "direct_control_first_dispatch_ready_coalesced_direct_reduce_preload_late_flush")
         contract = metadata["combine_overlap_contract"]
         self.assertEqual(contract["requested_raw"], "1")
         self.assertTrue(contract["requested"])
