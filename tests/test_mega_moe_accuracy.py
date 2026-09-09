@@ -202,7 +202,7 @@ def _check_runtime(torch: Any, deep_gemm: Any) -> None:
 
 
 def _configure_symmetric_memory_backend(
-    args: argparse.Namespace, torch: Any, dist: Any
+    args: argparse.Namespace, torch: Any, dist: Any, *, force_nccl: bool = False
 ) -> Tuple[Optional[str], Optional[Any]]:
     """Select the cross-host allocator required by the GIN accuracy path.
 
@@ -211,7 +211,9 @@ def _configure_symmetric_memory_backend(
     ``--require-gin`` result proves the registered allocation itself spans the
     two hosts instead of accidentally using the CUDA/IPC-only default.
     """
-    if not args.require_gin:
+    # Explicit allocator-only opt-in for the separate GB200 native-NVLink
+    # entrypoint. It does not enable a GIN context or change legacy defaults.
+    if not args.require_gin and not force_nccl:
         return None, None
     try:
         import torch.distributed._symmetric_memory as symm_mem
@@ -2890,6 +2892,8 @@ def _gin_transport_evidence(
     symmetric_memory_backend: Optional[str],
     symmetric_memory_registration: Optional[Any],
     dist: Any,
+    *,
+    topology: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Validate the facts needed to call a run GIN transport coverage.
 
@@ -2902,6 +2906,8 @@ def _gin_transport_evidence(
     experiment_flags = _collect_gin_experiment_flags(
         args, rank, world_size, dist
     )
+    if topology is not None:
+        topology.require_validated_buffer(buffer, hostnames)
     if not args.require_gin:
         return {
             "requested": "auto",
@@ -2910,7 +2916,8 @@ def _gin_transport_evidence(
             "jit_experiment_flags": experiment_flags,
         }
 
-    _validate_gin_host_placement(args, world_size, hostnames)
+    if topology is None:
+        _validate_gin_host_placement(args, world_size, hostnames)
     if not gin_enabled:
         detail = (
             "the buffer API does not expose gin_enabled"
@@ -2992,10 +2999,12 @@ def _gin_transport_evidence(
     raw_buffer_ptrs = [int(ptr) for ptr in buffer.handle.buffer_ptrs]
     buffer_offset = int(buffer.handle.offset)
     buffer_ptrs = [int(ptr) for ptr in buffer.buffer_ptrs]
-    expected_lsa_ranks = [
-        peer for peer, hostname in enumerate(hostnames)
-        if hostname == hostnames[rank]
-    ]
+    expected_lsa_ranks = (
+        topology.expected_lsa_ranks(rank) if topology is not None else [
+            peer for peer, hostname in enumerate(hostnames)
+            if hostname == hostnames[rank]
+        ]
+    )
     nonzero_ranks = [peer for peer, ptr in enumerate(buffer_ptrs) if ptr != 0]
     missing_lsa_ranks = [
         peer for peer in expected_lsa_ranks if buffer_ptrs[peer] == 0
@@ -3120,7 +3129,8 @@ def _teardown_worker(
         dist.destroy_process_group()
 
 
-def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) -> None:
+def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace,
+            *, topology: Optional[Any] = None) -> None:
     # The private compile-time knob must never affect the normal correctness
     # suite, even if a parent shell happens to export it.
     os.environ[GIN_LOCAL_ABLATION_ENV] = "0"
@@ -3136,25 +3146,41 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
     try:
         _init_distributed(local_rank, local_world_size, torch, dist)
         _check_runtime(torch, deep_gemm)
+        physical_hostnames = None
+        if topology is not None:
+            # Only the separate GB200 entrypoint opts in. Never replace real
+            # hostnames with logical route groups or relax the Novita guard.
+            from mega_moe_gb200_topology import GB200Topology
+            if not isinstance(topology, GB200Topology):
+                raise TypeError("topology must be an explicit GB200Topology")
+            physical_hostnames = _all_hostnames(dist)
+            topology.prepare(args, physical_hostnames, local_rank,
+                             local_world_size, torch, dist)
         (
             symmetric_memory_backend,
             symmetric_memory_registration,
-        ) = _configure_symmetric_memory_backend(
-            args, torch, dist
+        ) = (
+            _configure_symmetric_memory_backend(args, torch, dist)
+            if topology is None else
+            _configure_symmetric_memory_backend(args, torch, dist, force_nccl=True)
         )
         rank, world_size = dist.get_rank(), dist.get_world_size()
         _validate_args(args, world_size)
-        hostnames = _all_hostnames(dist)
+        hostnames = _all_hostnames(dist) if physical_hostnames is None else physical_hostnames
         if args.require_cross_host and len(set(hostnames)) < 2:
             raise RuntimeError(
                 "--require-cross-host was requested, but every rank is on "
                 f"{hostnames[0]}; refusing to relabel same-host NVLink as GIN coverage"
             )
-        _validate_gin_host_placement(args, world_size, hostnames)
+        if topology is None:
+            _validate_gin_host_placement(args, world_size, hostnames)
+        else:
+            topology.require_prepared(hostnames)
+        route_domains = hostnames if topology is None else topology.logical_route_domains
 
         experts_per_rank = args.num_experts // world_size
         cases = _make_route_cases(
-            rank, args, experts_per_rank, hostnames, torch, dist
+            rank, args, experts_per_rank, route_domains, torch, dist
         )
         asymmetric_cross_routes = (
             _validate_single_remote_source_case(
@@ -3162,14 +3188,14 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
                 rank,
                 args,
                 experts_per_rank,
-                hostnames,
+                route_domains,
                 dist,
             )
             if args.require_gin
             else None
         )
         is_matched_benchmark_shape = (
-            args.require_gin
+            (args.require_gin or topology is not None)
             and world_size == 16
             and args.num_experts == 896
             and args.num_topk == 16
@@ -3183,7 +3209,7 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
                 rank,
                 args,
                 experts_per_rank,
-                hostnames,
+                route_domains,
                 int(
                     deep_gemm.get_block_m_for_mega_moe(
                         world_size,
@@ -3221,6 +3247,11 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
             gin_bulk_combine=args.gin_bulk_combine,
             gin_direct_dispatch=args.gin_direct_dispatch,
         )
+        topology_evidence = (
+            topology.validate_buffer(buffer, args, symmetric_memory_backend,
+                                     symmetric_memory_registration, torch, dist)
+            if topology is not None else None
+        )
         transport_evidence = _gin_transport_evidence(
             buffer,
             args,
@@ -3230,13 +3261,20 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
             symmetric_memory_backend,
             symmetric_memory_registration,
             dist,
+            **({"topology": topology} if topology is not None else {}),
         )
+        if topology is not None:
+            transport_evidence.update(requested=topology.mode, gb200_topology=topology_evidence)
         inputs = _make_inputs(rank, args, torch, deep_gemm)
         weights = _make_kernel_weights(experts_per_rank, args, torch, deep_gemm)
         fingerprint = _weight_fingerprint(weights, torch, dist)
         harness = AccuracyHarness(
             rank, args, inputs, weights, cases, buffer, torch, dist, deep_gemm
         )
+        if topology is not None:
+            harness.physical_hostnames = list(hostnames)
+            harness.route_domains = list(route_domains)
+            harness.topology_evidence = topology_evidence
 
         snapshots, oracle_metrics = _snapshot_and_check_oracles(harness, torch, dist)
         _run_eager_stress(harness, snapshots, torch)
@@ -3285,7 +3323,7 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
             harness,
             rank,
             args,
-            hostnames,
+            route_domains,
             transition_graphs,
             torch,
             dist,
@@ -3354,6 +3392,9 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace) ->
                 # Retain the validation-r2 evidence key for bulk runbooks.
                 "gin_bulk_transition": gin_transition_evidence,
             }
+            if topology is not None:
+                result["gb200_topology"] = topology_evidence
+                topology.accuracy_result = result
             passed_record = "MEGAMOE_ACCURACY_JSON=" + json.dumps(
                 result, sort_keys=True)
             if benchmark_metrics is not None or local_ablation_metrics is not None:
