@@ -248,6 +248,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #if (defined(__CUDA_ARCH__) and (__CUDA_ARCH__ >= 1000)) or defined(__CLION_IDE__)
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
+    // Actual peers in each of the two GIN LSA teams. The wire/storage layout
+    // still reserves eight peer slots and nine registered contexts.
+    constexpr uint32_t kGinPeerCount = kNumRanks / 2u;
 
     // Template checks
     DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
@@ -264,6 +267,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kMegaMoeGinLocalAblationStage == 0 or kUseGin,
                      "GIN local ablation requires the GIN specialization");
     if constexpr (kUseGin) {
+        DG_STATIC_ASSERT(kNumRanks == 8 or kNumRanks == 16,
+                         "GIN requires EP8/LSA4 or EP16/LSA8");
         DG_STATIC_ASSERT(kNumDispatchWarps == layout::kMegaMoeGinNumDispatchWarps,
                          "GIN workspace must match the four dispatch warps");
         DG_STATIC_ASSERT(BLOCK_M <= layout::kMegaMoeGinMaxOutboxBlockM,
@@ -271,13 +276,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         DG_DEVICE_ASSERT(gin_transport.is_enabled());
         DG_DEVICE_ASSERT(gin_transport.dev_comm.rank == sym_buffer.rank_idx);
         DG_DEVICE_ASSERT(gin_transport.dev_comm.nRanks == kNumRanks);
-        DG_DEVICE_ASSERT(gin_transport.dev_comm.lsaSize == 8);
+        DG_DEVICE_ASSERT(gin_transport.dev_comm.lsaSize == kGinPeerCount);
         DG_DEVICE_ASSERT(
             gin_transport.dev_comm.nRanks == 2 * gin_transport.dev_comm.lsaSize);
         DG_DEVICE_ASSERT(gin_transport.dev_comm.ginContextCount >= 9);
         DG_DEVICE_ASSERT(gin_transport.dev_comm.ginSignalCount >= 2);
         if constexpr (kMegaMoeGinBulkCombine) {
-            DG_STATIC_ASSERT(kNumRanks == 16 and kNumExperts == 896 and
+            DG_STATIC_ASSERT(kNumExpertsPerRank == 56 and
                              kNumTopk == 16 and kHidden == 3584 and
                              kIntermediateHidden == 3072 and not kHasShared,
                              "GIN bulk combine requires the MNS8 decode shape");
@@ -286,7 +291,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         if constexpr (kMegaMoeGinDirectDispatch) {
             DG_STATIC_ASSERT(
-                kNumRanks == 16 and kNumExperts == 896 and
+                (kNumRanks == 8 or kNumRanks == 16) and
                 kNumExpertsPerRank ==
                     layout::kMegaMoeGinDirectDispatchExpertsPerRank and
                 kNumTopk == 16 and kHidden == 3584 and
@@ -323,11 +328,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             gin_transport.completion_batch == 4 or
             gin_transport.completion_batch == 8);
         if constexpr (kMegaMoeGinLocalAblationStage > 0) {
-            DG_STATIC_ASSERT(kNumRanks == 16,
-                             "GIN local ablation requires world size 16");
+            DG_STATIC_ASSERT(kNumRanks == 8 or kNumRanks == 16,
+                             "GIN local ablation requires world size 8 or 16");
             DG_STATIC_ASSERT(not kHasShared,
                              "GIN local ablation excludes shared experts");
-            DG_DEVICE_ASSERT(gin_transport.dev_comm.lsaSize == 8);
+            DG_DEVICE_ASSERT(gin_transport.dev_comm.lsaSize == kGinPeerCount);
         }
     }
 #endif
@@ -737,7 +742,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 sm_idx == 1 and warp_idx == 0) {
                 const uint32_t lsa_size = static_cast<uint32_t>(
                     gin_transport.dev_comm.lsaSize);
-                DG_DEVICE_ASSERT(lsa_size == 8u);
+                DG_DEVICE_ASSERT(lsa_size == kGinPeerCount);
                 DG_STATIC_ASSERT(
                     kNumExpertsPerRank == 56 and
                     layout::kMegaMoeGinNumDataContexts == 8,
@@ -745,6 +750,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 constexpr uint32_t kExpertsPerHelper = 14;
                 const uint32_t peer_in_lsa = lane_idx & 7u;
                 const uint32_t helper_idx = lane_idx >> 3;
+                // Keep the EP16 lane/shuffle map. EP8's unused peer columns
+                // contribute zero but must still execute every warp collective.
+                const bool active_pack_lane = kGinPeerCount == 8 or
+                    peer_in_lsa < kGinPeerCount;
                 const uint32_t remote_lsa_base =
                     (1u - sym_buffer.rank_idx / lsa_size) * lsa_size;
                 const uint32_t peer = remote_lsa_base + peer_in_lsa;
@@ -760,7 +769,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 uint32_t segment_count = 0;
                 #pragma unroll
                 for (uint32_t helper_expert = 0;
-                     helper_expert < kExpertsPerHelper;
+                     active_pack_lane and helper_expert < kExpertsPerHelper;
                      ++helper_expert) {
                     const uint32_t local_expert =
                         first_expert + helper_expert;
@@ -791,7 +800,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                 #pragma unroll
                 for (uint32_t helper_expert = 0;
-                     helper_expert < kExpertsPerHelper;
+                     active_pack_lane and helper_expert < kExpertsPerHelper;
                      ++helper_expert) {
                     const uint32_t local_expert =
                         first_expert + helper_expert;
@@ -819,7 +828,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     route_prefix == segment_begin + segment_count);
                 DG_DEVICE_ASSERT(route_count <= num_tokens * kNumTopk);
 
-                if (helper_idx == 0) {
+                if (active_pack_lane and helper_idx == 0) {
                     auto* route_count_scratch = reinterpret_cast<uint32_t*>(
                         buffer.gin_workspace
                             .get_direct_dispatch_ready_ptr(
@@ -895,7 +904,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // full grid rendezvous.  Keep the cross-rank signal/acquire,
                 // but remove its redundant grid prologue and epilogue.
                 comm::nvlink_lsa_barrier<
-                    kNumRanks, 8, kNumSMs, kNumDispatchThreads,
+                    kNumRanks, kGinPeerCount, kNumSMs, kNumDispatchThreads,
                     kDispatchGridSyncIndex, kGinActiveDecisionBarrierTag>(
                         workspace, sym_buffer, sm_idx, thread_idx,
                         [=]() {
@@ -906,7 +915,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         /* Final decision has its own grid rendezvous */ false);
             } else {
                 comm::nvlink_lsa_barrier<
-                    kNumRanks, 8, kNumSMs, kNumDispatchThreads,
+                    kNumRanks, kGinPeerCount, kNumSMs, kNumDispatchThreads,
                     kDispatchGridSyncIndex, kGinActiveDecisionBarrierTag>(
                         workspace, sym_buffer, sm_idx, thread_idx,
                         [=]() {
@@ -1033,7 +1042,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // any owner can reach the combine PUT phase.
             if (use_gin_bulk_combine and sm_idx == 0 and
                 warp_idx == 0 and
-                lane_idx < layout::kMegaMoeGinNumDataContexts) {
+                lane_idx < kGinPeerCount) {
                 *buffer.gin_workspace.get_bulk_combine_packet_count_ptr(
                     /*send=*/ false, lane_idx) = 0;
             }
@@ -1044,7 +1053,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if constexpr (kUseGin and kMegaMoeGinLocalAblationStage < 1) {
 #ifdef DG_MEGAMOE_GIN
             // SM 1 is otherwise idle while SM 0 publishes same-LSA counts.  In
-            // direct mode its first eight lanes each build one compact
+            // direct mode its first kGinPeerCount lanes each build one compact
             // expert-major control slab and publish the source SoA prefix
             // straight to that owner.  The fallback keeps the paired-ingress
             // publication byte-for-byte unchanged.
@@ -1059,14 +1068,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if constexpr (kMegaMoeGinCoopDirectPack) {
                         if constexpr (kMegaMoeGinPreconsensusPack) {
                             // The complete packet was prepared before the
-                            // activity consensus.  Only the original eight
+                            // activity consensus. Only the active peer
                             // leaders issue GIN publication, and only after
                             // the world selected direct mode. The overlap
                             // experiment posts control first and defers source
                             // completion until after this CTA's pulls.
                             if (use_gin_direct_dispatch and
                                 lane_idx < lsa_size) {
-                                DG_DEVICE_ASSERT(lsa_size == 8u);
+                                DG_DEVICE_ASSERT(lsa_size == kGinPeerCount);
                                 const uint32_t peer_in_lsa = lane_idx;
                                 const uint32_t remote_lsa_base =
                                     (1u - sym_buffer.rank_idx / lsa_size) *
@@ -1135,16 +1144,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // full warp cooperatively builds eight owner packets.
                         // Lanes owner+8*h own consecutive 14-expert segments,
                         // so the four segment totals reproduce the original
-                        // expert-major route prefix exactly.
+                        // expert-major route prefix exactly. EP8 leaves peer
+                        // columns4..7 inactive, not absent from the shuffles.
                         DG_STATIC_ASSERT(
                             kNumExpertsPerRank == 56 and
                             layout::kMegaMoeGinNumDataContexts == 8,
                             "Cooperative direct pack requires 8x56 layout");
                         if (use_gin_direct_dispatch) {
-                            DG_DEVICE_ASSERT(lsa_size == 8u);
+                            DG_DEVICE_ASSERT(lsa_size == kGinPeerCount);
                             constexpr uint32_t kExpertsPerHelper = 14;
                             const uint32_t peer_in_lsa = lane_idx & 7u;
                             const uint32_t helper_idx = lane_idx >> 3;
+                            const bool active_pack_lane = kGinPeerCount == 8 or
+                                peer_in_lsa < kGinPeerCount;
                             const uint32_t remote_lsa_base =
                                 (1u - sym_buffer.rank_idx / lsa_size) *
                                 lsa_size;
@@ -1162,7 +1174,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             uint32_t segment_count = 0;
                             #pragma unroll
                             for (uint32_t helper_expert = 0;
-                                 helper_expert < kExpertsPerHelper;
+                                 active_pack_lane and helper_expert < kExpertsPerHelper;
                                  ++helper_expert) {
                                 const uint32_t local_expert =
                                     first_expert + helper_expert;
@@ -1201,7 +1213,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             // pass, and every output slice remains disjoint.
                             #pragma unroll
                             for (uint32_t helper_expert = 0;
-                                 helper_expert < kExpertsPerHelper;
+                                 active_pack_lane and helper_expert < kExpertsPerHelper;
                                  ++helper_expert) {
                                 const uint32_t local_expert =
                                     first_expert + helper_expert;
@@ -1239,7 +1251,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             __threadfence_system();
                             __syncwarp();
 
-                            if (helper_idx == 0) {
+                            if (active_pack_lane and helper_idx == 0) {
                                 const uint32_t source_lane =
                                     sym_buffer.rank_idx % lsa_size;
                                 comm::mega_moe_gin_publish_direct_dispatch(
@@ -1415,7 +1427,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // original local atomic count publication.  All additions
                     // commute, and the scheduler still observes its unchanged
                     // kNumSMs * kNumRanks tag.
-                    constexpr uint32_t kLocalLsaSize = 8;
+                    constexpr uint32_t kLocalLsaSize = kGinPeerCount;
                     const uint64_t missing_sources_tag =
                         static_cast<uint64_t>(
                             kNumSMs * (kNumRanks - kLocalLsaSize)) << 32;
@@ -1592,7 +1604,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // stores separately before any owner starts pulling.
                     __threadfence_system();
                     comm::nvlink_lsa_barrier<
-                        kNumRanks, 8, kNumSMs, kNumDispatchThreads,
+                        kNumRanks, kGinPeerCount, kNumSMs, kNumDispatchThreads,
                         kDispatchGridSyncIndex,
                         kBeforeDispatchPullBarrierTag>(
                             workspace, sym_buffer, sm_idx, thread_idx,
@@ -1609,9 +1621,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // payloads. With dispatch overlap it covers ONLY exact
                     // counts and assignment metadata; pullers acquire each
                     // source's separate payload terminal before mirror reads.
-                    if (sm_idx == 0 and warp_idx == 0 and lane_idx < 8) {
+                    if (sm_idx == 0 and warp_idx == 0 and lane_idx < kGinPeerCount) {
                         const uint32_t owner_lane =
-                            sym_buffer.rank_idx % 8u;
+                            sym_buffer.rank_idx % kGinPeerCount;
                         const uint64_t expected_epoch =
                             *workspace.get_gin_direct_dispatch_epoch_ptr();
                         DG_GIN_TRACE_IF(true, 104u + lane_idx);
@@ -1633,10 +1645,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // round-robin source choice, and all later pull code exact.
                     if (sm_idx == 0) {
                         const uint32_t remote_lsa_base =
-                            (1u - sym_buffer.rank_idx / 8u) * 8u;
+                            (1u - sym_buffer.rank_idx / kGinPeerCount) * kGinPeerCount;
                         if constexpr (kMegaMoeGinDispatchWarpScan) {
                             // Four warps restore one remote source apiece in
-                            // each of two waves.  Both 32-lane scans execute
+                            // one EP8 wave or two EP16 waves. Both 32-lane scans execute
                             // with a full mask; inactive lanes in the second
                             // expert segment contribute zero.
                             DG_STATIC_ASSERT(
@@ -1646,7 +1658,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 "56 experts per rank");
                             #pragma unroll
                             for (uint32_t source_wave = 0;
-                                 source_wave < 2;
+                                 source_wave < kGinPeerCount / kNumDispatchWarps;
                                  ++source_wave) {
                                 const uint32_t source_lane =
                                     warp_idx + source_wave *
@@ -1769,7 +1781,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                         } else {
                             constexpr uint32_t kNumRemoteExpertPairs =
-                                8u * kNumExpertsPerRank;
+                                kGinPeerCount * kNumExpertsPerRank;
                             for (uint32_t pair = thread_idx;
                                  pair < kNumRemoteExpertPairs;
                                  pair += kNumDispatchThreads) {
@@ -1907,7 +1919,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 DG_GIN_TRACE_IF(sm_idx == 0 and warp_idx == 0 and lane_idx == 0, 7);
             } else {
                 comm::nvlink_lsa_barrier<
-                    kNumRanks, 8, kNumSMs, kNumDispatchThreads,
+                    kNumRanks, kGinPeerCount, kNumSMs, kNumDispatchThreads,
                     kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
                         workspace, sym_buffer, sm_idx, thread_idx,
                         [=]() {
@@ -1921,7 +1933,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         } else if constexpr (kUseGin) {
 #ifdef DG_MEGAMOE_GIN
             comm::nvlink_lsa_barrier<
-                kNumRanks, 8, kNumSMs, kNumDispatchThreads,
+                kNumRanks, kGinPeerCount, kNumSMs, kNumDispatchThreads,
                 kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
                 workspace, sym_buffer, sm_idx, thread_idx,
                 [=]() {
@@ -2360,7 +2372,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     "Expert-ready combine requires the fixed 56 local experts");
                 const uint32_t lsa_size =
                     static_cast<uint32_t>(gin_transport.dev_comm.lsaSize);
-                DG_DEVICE_ASSERT(lsa_size == 8u);
+                DG_DEVICE_ASSERT(lsa_size == kGinPeerCount);
                 const uint32_t remote_base =
                     (1u - sym_buffer.rank_idx / lsa_size) * lsa_size;
                 const uint32_t owner_lane = sym_buffer.rank_idx % lsa_size;
@@ -2560,25 +2572,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
         if constexpr (kUseGin and kMegaMoeGinDispatchOverlap) {
 #ifdef DG_MEGAMOE_GIN
-            // All eight peer chains were posted before the count rendezvous.
+            // All active peer chains were posted before the count rendezvous.
             // Keep the input/control send storage alive, then complete each
             // chain once here before cleanup may overwrite it. Crucially,
             // no outbound flush gates count publication or compute startup.
             if (use_gin_direct_dispatch and sm_idx == 1 and warp_idx == 0 and
-                lane_idx < 8u) {
+                lane_idx < kGinPeerCount) {
                 // Retire every inbound terminal, including zero-assignment
                 // peers which no pull warp needed to read. This preserves the
                 // baseline's all-input-context remote completion before the
                 // later context-1-only combine rendezvous and graph reuse.
                 comm::mega_moe_gin_wait_direct_dispatch(
                     gin_transport,
-                    /*context_stripe=*/ sym_buffer.rank_idx % 8u,
+                    /*context_stripe=*/ sym_buffer.rank_idx % kGinPeerCount,
                     sym_buffer.get_base_ptr(),
                     buffer.gin_workspace
                         .get_direct_dispatch_payload_ready_ptr(lane_idx),
                     *workspace.get_gin_dispatch_payload_epoch_ptr());
                 const uint32_t peer =
-                    (1u - sym_buffer.rank_idx / 8u) * 8u + lane_idx;
+                    (1u - sym_buffer.rank_idx / kGinPeerCount) * kGinPeerCount + lane_idx;
                 ncclGinRequest_t request{};
                 comm::mega_moe_gin_flush_data_peer_async(
                     gin_transport, peer, lane_idx, &request);
@@ -2592,7 +2604,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 #ifdef DG_MEGAMOE_GIN
             // One warp drains the bounded block outbox in logical pool order.
             // Keep the scheduler queries warp-converged because their cached
-            // expert counts are distributed across lanes.  The first eight
+            // expert counts are distributed across lanes. The active peer
             // lanes each own one remote peer, so Device API PUT construction
             // and independent peer QPs progress in parallel instead of one
             // lane serially issuing every remote row.  Each peer lane carries
@@ -2605,7 +2617,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 constexpr uint32_t kCombineRowBytes =
                     kHidden * sizeof(nv_bfloat16);
                 constexpr uint32_t kNumRemotePeers =
-                    layout::kMegaMoeGinNumDataContexts;
+                    kGinPeerCount;
                 uint32_t pool_block_idx = 0;
 
                 const uint32_t lsa_size = static_cast<uint32_t>(
@@ -2645,8 +2657,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         }
                         #pragma unroll
                         for (uint32_t context_stripe = 0;
-                             context_stripe <
-                                 layout::kMegaMoeGinNumDataContexts;
+                             context_stripe < kGinPeerCount;
                              ++context_stripe) {
                             if (completion_outstanding[context_stripe]) {
                                 comm::mega_moe_gin_wait_data_peer(
@@ -2758,7 +2769,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 pending_rows = 0;
                                 active_context =
                                     (context_stripe + 1) %
-                                    layout::kMegaMoeGinNumDataContexts;
+                                    kGinPeerCount;
                             }
                             ++row;
                         }
@@ -2939,7 +2950,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             } else {
                 comm::nvlink_lsa_barrier<
-                    kNumRanks, 8, kNumSMs, kNumDispatchThreads,
+                    kNumRanks, kGinPeerCount, kNumSMs, kNumDispatchThreads,
                     kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
                         workspace, sym_buffer, sm_idx, thread_idx,
                         [=]() {
@@ -2965,7 +2976,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
             }
             comm::nvlink_lsa_barrier<
-                kNumRanks, 8, kNumSMs, kNumDispatchThreads,
+                kNumRanks, kGinPeerCount, kNumSMs, kNumDispatchThreads,
                 kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
                 workspace, sym_buffer, sm_idx, thread_idx,
                 [=]() {
@@ -3921,7 +3932,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
                     // Cross-check the received packet count against this
                     // source rank's preserved outbound count vector.  Only
-                    // eight lanes perform the check, so it does not inflate
+                    // active peer lanes perform the check, so it does not inflate
                     // the per-record scatter loop.
                     if (sm_idx == 0 and epilogue_warp_idx == 0 and
                         lane_idx < lsa_size) {
@@ -3950,7 +3961,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     if (not use_gin_direct_reduce) {
                     #pragma unroll
                     for (uint32_t owner_in_lsa = 0;
-                         owner_in_lsa < layout::kMegaMoeGinNumDataContexts;
+                         owner_in_lsa < kGinPeerCount;
                          ++owner_in_lsa) {
                         auto* recv_count_ptr =
                             buffer.gin_workspace
@@ -4020,7 +4031,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     kDispatchWithEpilogueBarrierIdx);
             } else {
                 comm::nvlink_lsa_barrier<
-                    kNumRanks, 8, kNumSMs, kNumEpilogueThreads,
+                    kNumRanks, kGinPeerCount, kNumSMs, kNumEpilogueThreads,
                     kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
                         workspace, sym_buffer, sm_idx,
                         epilogue_thread_idx,
@@ -4038,7 +4049,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         } else if constexpr (kUseGin) {
 #ifdef DG_MEGAMOE_GIN
             comm::nvlink_lsa_barrier<
-                kNumRanks, 8, kNumSMs, kNumEpilogueThreads,
+                kNumRanks, kGinPeerCount, kNumSMs, kNumEpilogueThreads,
                 kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
                 workspace, sym_buffer, sm_idx, epilogue_thread_idx,
                 [&]() {

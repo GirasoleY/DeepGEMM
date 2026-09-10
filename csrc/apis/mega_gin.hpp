@@ -443,9 +443,10 @@ private:
             throw std::invalid_argument(
                 "MegaMoE GIN NCCL unique ID must contain exactly " +
                 std::to_string(NCCL_UNIQUE_ID_BYTES) + " bytes");
-        if (world_size_ != 16 || rank_ < 0 || rank_ >= world_size_)
+        if ((world_size_ != 8 && world_size_ != 16) ||
+            rank_ < 0 || rank_ >= world_size_)
             throw std::invalid_argument(
-                "initial MegaMoE GIN target requires world_size == 16 and 0 <= rank < world_size");
+                "MegaMoE GIN requires world_size == 8 or 16 and 0 <= rank < world_size");
         if (context_count_ < kDefaultContextCount)
             throw std::invalid_argument(
                 "MegaMoE GIN requires at least 9 contexts (control + 8 data)");
@@ -455,9 +456,9 @@ private:
         if (world_barrier_count_ < kDefaultWorldBarrierCount)
             throw std::invalid_argument(
                 "MegaMoE GIN requires at least 4 world/hybrid barrier slots");
-        if (expected_lsa_size_ != kDefaultExpectedLsaSize)
+        if (expected_lsa_size_ != world_size_ / 2)
             throw std::invalid_argument(
-                "initial MegaMoE GIN target requires expected_lsa_size == 8");
+                "MegaMoE GIN requires expected_lsa_size == world_size / 2 (4 or 8)");
         validate_launch_tuning(
             completion_batch_, combine_chunk_bytes_, outbox_depth_,
             combine_issue_wave_);
@@ -723,7 +724,8 @@ private:
                     "topology_lsa_layout",
                     "rank " + std::to_string(peer) + " reports lsaRank=" +
                     std::to_string(fields[2]) + ", lsaSize=" +
-                    std::to_string(fields[3]) + "; expected contiguous 2x8 ordering");
+                    std::to_string(fields[3]) + "; expected contiguous 2x" +
+                    std::to_string(expected_lsa_size_) + " ordering");
             // ncclGinAllContexts iterates dev_comm.ginContextCount locally.
             // Requiring the exact collective request prevents ranks from
             // executing different signal/wait counts in a world barrier.
@@ -908,7 +910,7 @@ static void register_apis(py::module_& m) {
         [](const torch::Tensor& buffer, const py::bytes& unique_id,
            const int rank, const int world_size, const int context_count,
            const int queue_depth, const int world_barrier_count,
-           const int expected_lsa_size, const std::string& required_gin_type,
+           const py::object& expected_lsa_size, const std::string& required_gin_type,
            const uint32_t completion_batch,
            const uint32_t combine_chunk_bytes,
            const uint32_t outbox_depth,
@@ -917,10 +919,14 @@ static void register_apis(py::module_& m) {
            const bool bulk_combine,
            const bool direct_dispatch) {
             const std::string unique_id_bytes = unique_id;
+            // None selects the matching half-world LSA. An explicit value is
+            // never overridden and remains subject to validate_arguments().
+            const int resolved_lsa_size = expected_lsa_size.is_none() ?
+                world_size / 2 : expected_lsa_size.cast<int>();
             py::gil_scoped_release release;
             return MegaMoeGinContext::create(
                 buffer, unique_id_bytes, rank, world_size, context_count,
-                queue_depth, world_barrier_count, expected_lsa_size,
+                queue_depth, world_barrier_count, resolved_lsa_size,
                 required_gin_type, completion_batch, combine_chunk_bytes,
                 outbox_depth, combine_issue_wave, active_fast_path,
                 bulk_combine, direct_dispatch);
@@ -929,7 +935,7 @@ static void register_apis(py::module_& m) {
         py::arg("world_size"), py::arg("context_count") = kDefaultContextCount,
         py::arg("queue_depth") = kDefaultQueueDepth,
         py::arg("world_barrier_count") = kDefaultWorldBarrierCount,
-        py::arg("expected_lsa_size") = kDefaultExpectedLsaSize,
+        py::arg("expected_lsa_size") = py::none(),
         py::arg("required_gin_type") = "gdaki",
         py::arg("completion_batch") = 1,
         py::arg("combine_chunk_bytes") = 7168,

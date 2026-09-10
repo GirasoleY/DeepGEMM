@@ -205,7 +205,7 @@ class TestMegaMoeCoopDirectPackSourceContract(unittest.TestCase):
     def test_all_writers_fence_before_original_leader_mask_issues_gin(self):
         fence = self.candidate.index("__threadfence_system();")
         sync = self.candidate.index("__syncwarp();", fence)
-        leaders = self.candidate.index("if (helper_idx == 0)", sync)
+        leaders = self.candidate.index("if (active_pack_lane and helper_idx == 0)", sync)
         publish = self.candidate.index(
             "mega_moe_gin_publish_direct_dispatch", leaders
         )

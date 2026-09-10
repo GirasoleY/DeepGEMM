@@ -536,7 +536,8 @@ struct MegaMoeGinWorkspace {
         // by at most (48 tokens * top-k) fixed-stride records.  Each record's
         // first 16 bytes carry the final token/top-k index and the remaining
         // bytes carry one BF16 output row.
-        // Only the eight peers in the other LSA need storage.
+        // Only actual peers in the other LSA need packets. Keep the complete
+        // fallback outbox even when EP8's four-peer packet pool is smaller.
         const auto bulk_base = combine_outbox_buffer.get_end_ptr();
         if (bulk_combine) {
             const uint32_t bulk_capacity =
@@ -551,13 +552,14 @@ struct MegaMoeGinWorkspace {
                 2ull * num_remote_peers * bulk_packet_bytes;
             const uint64_t outbox_storage_bytes =
                 combine_outbox_buffer.get_num_bytes();
+            const uint64_t reserved_storage_bytes =
+                bulk_packet_storage_bytes > outbox_storage_bytes ?
+                bulk_packet_storage_bytes : outbox_storage_bytes;
             DG_UNIFIED_ASSERT(
-                bulk_packet_storage_bytes >= outbox_storage_bytes);
-            DG_UNIFIED_ASSERT(
-                bulk_packet_storage_bytes - outbox_storage_bytes <=
+                reserved_storage_bytes - outbox_storage_bytes <=
                 static_cast<uint64_t>(UINT32_MAX));
             const uint32_t packet_tail_bytes = static_cast<uint32_t>(
-                bulk_packet_storage_bytes - outbox_storage_bytes);
+                reserved_storage_bytes - outbox_storage_bytes);
             bulk_combine_packet_tail_buffer = Buffer(
                 Data(packet_tail_bytes), 1, 1, bulk_base);
             bulk_combine_return_index_buffer = Buffer(

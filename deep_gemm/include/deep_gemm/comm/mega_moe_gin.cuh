@@ -71,7 +71,8 @@ struct MegaMoeGinTransport {
 
     NCCL_DEVICE_INLINE bool is_same_lsa_peer(const uint32_t peer) const {
         // The target communicator is validated by the host to contain two
-        // contiguous eight-rank LSA teams.  Keeping this predicate here avoids
+        // contiguous LSA teams (four ranks for EP8, eight for EP16).
+        // Keeping this predicate here avoids
         // materializing mapped pointers for peers outside the local LSA.
         return peer / static_cast<uint32_t>(dev_comm.lsaSize) ==
                static_cast<uint32_t>(dev_comm.rank) /
@@ -81,9 +82,9 @@ struct MegaMoeGinTransport {
     NCCL_DEVICE_INLINE uint32_t data_context(const uint32_t stripe) const {
         // Context zero is reserved for control and cleanup rendezvous.
         // Stripe paired/direct input publication and combine payloads across
-        // the remaining eight contexts.  A context owns one QP per peer, so
-        // combine batches for a hot peer can use eight independent QPs instead
-        // of one serialized queue.
+        // lsaSize data contexts; all eight data contexts remain registered.
+        // A context owns one QP per peer. The caller's outstanding-request
+        // rotation uses the same active width, not the allocated maximum.
         return 1u + stripe % static_cast<uint32_t>(dev_comm.lsaSize);
     }
 

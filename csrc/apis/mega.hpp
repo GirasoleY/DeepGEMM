@@ -53,13 +53,17 @@ get_symm_buffer_size_for_mega_moe(
     DG_HOST_ASSERT(activation == "swiglu");
     DG_HOST_ASSERT(num_shared_experts >= 0);
     DG_HOST_ASSERT(not gin_bulk_combine or
-                   (enable_gin and num_ranks == 16 and num_experts == 896 and
+                   (enable_gin and
+                    ((num_ranks == 16 and num_experts == 896) or
+                     (num_ranks == 8 and num_experts == 448)) and
                     num_topk == 16 and hidden == 3584 and
                     intermediate_hidden == 3072 and
                     num_shared_experts == 0 and gin_outbox_depth == 64));
     DG_HOST_ASSERT(not gin_direct_dispatch or
-                   (enable_gin and gin_active_fast_path and num_ranks == 16 and
-                    num_experts == 896 and num_topk == 16 and hidden == 3584 and
+                   (enable_gin and gin_active_fast_path and
+                    ((num_ranks == 16 and num_experts == 896) or
+                     (num_ranks == 8 and num_experts == 448)) and
+                    num_topk == 16 and hidden == 3584 and
                     intermediate_hidden == 3072 and num_shared_experts == 0 and
                     num_max_tokens_per_rank >= 384));
 
@@ -307,10 +311,11 @@ static void fp8_fp4_mega_moe(
         DG_HOST_ASSERT(gin_context->world_size() == num_ranks);
         DG_HOST_ASSERT(gin_context->buffer_bytes() ==
                        static_cast<int64_t>(sym_buffer.nbytes()));
-        // This first direct-GIN implementation deliberately targets one
-        // contiguous two-host, eight-GPU-per-host communicator.
-        DG_HOST_ASSERT(num_ranks == 16);
-        DG_HOST_ASSERT(gin_context->lsa_size() == 8);
+        // The two supported topologies have contiguous equal-width LSAs;
+        // storage retains its conservative eight-peer format in either case.
+        DG_HOST_ASSERT(num_ranks == 8 or num_ranks == 16);
+        DG_HOST_ASSERT(num_ranks != 8 or num_experts_per_rank == 56);
+        DG_HOST_ASSERT(gin_context->lsa_size() == num_ranks / 2);
         gin_transport_opt = gin::get_launch_descriptor(gin_context);
     }
     const bool enable_gin = gin_transport_opt.has_value();

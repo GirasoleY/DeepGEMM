@@ -194,12 +194,12 @@ class TestMegaMoeDispatchWarpScanSourceContract(unittest.TestCase):
             self.compile_tu,
         )
 
-    def test_candidate_uses_four_warps_two_waves_and_two_scans(self):
+    def test_candidate_uses_four_warps_actual_peer_waves_and_two_scans(self):
         candidate = self.kernel.split(
             "if constexpr (kMegaMoeGinDispatchWarpScan) {", 1
         )[1].split("} else {", 1)[0]
         self.assertIn("kNumDispatchWarps == 4", candidate)
-        self.assertIn("source_wave < 2", candidate)
+        self.assertIn("source_wave < kGinPeerCount / kNumDispatchWarps", candidate)
         self.assertIn(
             "warp_idx + source_wave *\n"
             "                                                   kNumDispatchWarps",

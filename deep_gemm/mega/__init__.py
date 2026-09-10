@@ -72,13 +72,15 @@ class SymmBuffer:
                     raise ValueError(
                         'gin_bulk_combine requires gin_active_fast_path=True '
                         'for world-uniform runtime eligibility consensus')
-                expected_shape = (896, 16, 3584, 3072, 0)
-                actual_shape = (num_experts, num_topk, hidden,
+                expected_shapes = ((16, 896, 16, 3584, 3072, 0),
+                                   (8, 448, 16, 3584, 3072, 0))
+                actual_shape = (group.size(), num_experts, num_topk, hidden,
                                 intermediate_hidden, num_shared_experts)
-                if actual_shape != expected_shape:
+                if actual_shape not in expected_shapes:
                     raise ValueError(
                         'gin_bulk_combine currently requires '
-                        'E896/topk16/H3584/I3072 with no shared experts')
+                        'EP16/E896 or EP8/E448, topk16/H3584/I3072 '
+                        'with no shared experts')
                 if gin_outbox_depth != 64:
                     raise ValueError(
                         'gin_bulk_combine currently requires '
@@ -88,13 +90,15 @@ class SymmBuffer:
                     raise ValueError(
                         'gin_direct_dispatch requires gin_active_fast_path=True '
                         'for world-uniform runtime eligibility consensus')
-                expected_shape = (16, 896, 16, 3584, 3072, 0)
+                expected_shapes = ((16, 896, 16, 3584, 3072, 0),
+                                   (8, 448, 16, 3584, 3072, 0))
                 actual_shape = (group.size(), num_experts, num_topk, hidden,
                                 intermediate_hidden, num_shared_experts)
-                if actual_shape != expected_shape:
+                if actual_shape not in expected_shapes:
                     raise ValueError(
                         'gin_direct_dispatch currently requires '
-                        'EP16/E896/topk16/H3584/I3072 with no shared experts')
+                        'EP16/E896 or EP8/E448, topk16/H3584/I3072 '
+                        'with no shared experts')
                 if num_max_tokens_per_rank < 384:
                     raise ValueError(
                         'gin_direct_dispatch requires '
@@ -289,8 +293,10 @@ class SymmBuffer:
                 errors.append(
                     'combine_overlap requires bulk_combine, direct_dispatch, '
                     'SINGLE_COMBINE_CONTEXT=1 and DISPATCH_OVERLAP=1')
-        if canonical['world_size'] != 16:
-            errors.append('world_size must be exactly 16')
+        if canonical['world_size'] not in (8, 16):
+            errors.append('world_size must be exactly 8 or 16')
+        if canonical['world_size'] == 8 and canonical['num_experts'] != 448:
+            errors.append('EP8 GIN requires exactly E448 (56 experts per rank)')
         if not canonical['gin_layout_enabled']:
             errors.append('legacy-sized buffer has no registered GIN workspace')
         if canonical['context_state'] == 'active':
@@ -305,8 +311,10 @@ class SymmBuffer:
             errors.append('queue_depth must be at least 64')
         if canonical['world_barrier_count'] < 4:
             errors.append('world_barrier_count must be at least 4')
-        if canonical['expected_lsa_size'] != 8:
-            errors.append('expected_lsa_size must be exactly 8')
+        if canonical['expected_lsa_size'] != canonical['world_size'] // 2:
+            errors.append(
+                'expected_lsa_size must be exactly world_size // 2 '
+                '(EP8/LSA4 or EP16/LSA8)')
         if canonical['required_gin_type'] not in ('gdaki', 'proxy', 'gpi', 'any'):
             errors.append('required_gin_type must be gdaki, proxy, gpi, or any')
         if canonical['completion_batch'] not in (1, 2, 4, 8):
@@ -328,10 +336,12 @@ class SymmBuffer:
                 canonical['intermediate_hidden'],
                 canonical['num_shared_experts'],
             )
-            if direct_shape != (16, 896, 16, 3584, 3072, 0):
+            if direct_shape not in ((16, 896, 16, 3584, 3072, 0),
+                                    (8, 448, 16, 3584, 3072, 0)):
                 errors.append(
                     'direct_dispatch requires '
-                    'EP16/E896/topk16/H3584/I3072 with no shared experts')
+                    'EP16/E896 or EP8/E448, topk16/H3584/I3072 '
+                    'with no shared experts')
             if canonical['num_max_tokens_per_rank'] < 384:
                 errors.append(
                     'direct_dispatch requires num_max_tokens_per_rank >= 384')
@@ -415,9 +425,9 @@ class SymmBuffer:
                    context_count: int = 9,
                    queue_depth: Optional[int] = None,
                    world_barrier_count: int = 4,
-                   expected_lsa_size: int = 8,
+                   expected_lsa_size: Optional[int] = None,
                    required_gin_type: str = 'gdaki'):
-        """Collectively enable the 2x8 direct-GIN transport for this buffer.
+        """Collectively enable the 2x4 or 2x8 direct-GIN transport.
 
         Every rank in ``self.group`` must call this method in the same order.
         Unsupported NCCL, GIN, or rank/topology configurations fail explicitly;
@@ -428,9 +438,13 @@ class SymmBuffer:
         afterward (including when capturing another graph specialization)
         requires caller-enforced rank agreement and identical launch ordering.
         Graph replay retains the protocol specialization captured in that graph.
+        An omitted LSA width derives from the world size; explicit widths are
+        validated collectively. The existing EP16 default remains LSA8.
         """
         if queue_depth is None:
             queue_depth = self.gin_queue_depth
+        if expected_lsa_size is None:
+            expected_lsa_size = self.group.size() // 2
 
         build_info = _C.megamoe_gin_build_info()
         self._collective_validate_gin_config(

@@ -340,12 +340,14 @@ static void sm100_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(gin_local_ablation_stage >= 0 and
                    gin_local_ablation_stage <= 4);
     DG_HOST_ASSERT(gin_local_ablation_stage == 0 or
-                   (gin_transport_opt.has_value() and num_ranks == 16 and
+                   (gin_transport_opt.has_value() and
+                    (num_ranks == 8 or num_ranks == 16) and
                     num_shared_experts == 0));
     const bool gin_active_fast_path = gin_transport_opt.has_value() and
         gin_transport_opt->active_fast_path != 0;
     DG_HOST_ASSERT(not gin_active_fast_path or
-                   (gin_local_ablation_stage == 0 and num_ranks == 16 and
+                   (gin_local_ablation_stage == 0 and
+                    (num_ranks == 8 or num_ranks == 16) and
                     num_shared_experts == 0));
     const int gin_activity_gate_opt_value =
         get_env<int>("DG_MEGAMOE_GIN_ACTIVITY_GATE_OPT", 0);
@@ -356,8 +358,10 @@ static void sm100_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(not gin_activity_gate_opt or gin_active_fast_path);
     const bool gin_bulk_combine = gin_transport_opt.has_value() and
         gin_transport_opt->bulk_combine != 0 and
-        gin_local_ablation_stage == 0 and num_ranks == 16 and
-        num_experts == 896 and num_topk == 16 and hidden == 3584 and
+        gin_local_ablation_stage == 0 and
+        ((num_ranks == 16 and num_experts == 896) or
+         (num_ranks == 8 and num_experts == 448)) and
+        num_topk == 16 and hidden == 3584 and
         intermediate_hidden == 3072 and num_shared_experts == 0 and
         gin_transport_opt->outbox_depth == 64;
     DG_HOST_ASSERT(not gin_transport_opt.has_value() or
@@ -365,8 +369,10 @@ static void sm100_fp8_fp4_mega_moe(
                    (gin_bulk_combine and gin_active_fast_path));
     const bool gin_direct_dispatch = gin_transport_opt.has_value() and
         gin_transport_opt->direct_dispatch != 0 and
-        gin_local_ablation_stage == 0 and num_ranks == 16 and
-        num_experts == 896 and num_topk == 16 and hidden == 3584 and
+        gin_local_ablation_stage == 0 and
+        ((num_ranks == 16 and num_experts == 896) or
+         (num_ranks == 8 and num_experts == 448)) and
+        num_topk == 16 and hidden == 3584 and
         intermediate_hidden == 3072 and num_shared_experts == 0 and
         num_max_tokens_per_rank >= 384 and
         static_cast<int64_t>(num_sms) *
