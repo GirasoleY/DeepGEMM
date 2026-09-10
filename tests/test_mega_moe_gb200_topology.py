@@ -136,9 +136,26 @@ class GB200TopologyTests(unittest.TestCase):
                 bad = adjusted.copy(); bad[(rank + 8) % 16] = 256
                 with self.assertRaises(AssertionError):
                     topology.validate_adjusted_aliases(raw, bad, 256, adjusted[rank], rank, mode)
-                for offset, own in ((0, adjusted[rank]), (256, raw[rank])):
-                    with self.assertRaises(AssertionError):
-                        topology.validate_adjusted_aliases(raw, adjusted, offset, own, rank, mode)
+                with self.assertRaises(AssertionError):
+                    topology.validate_adjusted_aliases(raw, adjusted, 0, adjusted[rank], rank, mode)
+                self.assertEqual(topology.validate_adjusted_aliases(
+                    raw, adjusted, 256, raw[rank], rank, mode), peers)
+
+    def test_distinct_self_va_is_allowed_but_invalid_ranges_are_not(self):
+        buffer = native_buffer()
+        raw, adjusted = buffer.handle.buffer_ptrs, buffer.buffer_ptrs
+        self.assertEqual(topology.validate_adjusted_aliases(
+            raw, adjusted, 256, 0x900000, 0, "native_nvl", num_bytes=256), list(range(16)))
+        for pointer in (0, -1, True, (1 << 64) - 127, 1 << 64):
+            with self.assertRaises(AssertionError):
+                topology.validate_adjusted_aliases(raw, adjusted, 256, pointer, 0,
+                                                   "native_nvl", num_bytes=128)
+        for pointer in (-1, True, 1 << 64, (1 << 64) - 127):
+            bad_raw, bad_adjusted = raw.copy(), adjusted.copy()
+            bad_raw[3], bad_adjusted[3] = pointer, pointer
+            with self.assertRaises(AssertionError):
+                topology.validate_adjusted_aliases(bad_raw, bad_adjusted, 0,
+                                                   0x1100, 0, "native_nvl", num_bytes=128)
 
     def test_roce_retains_gdaki_context_and_exact_same_clique_probe(self):
         policy = topology.GB200Topology("gin_roce")
@@ -164,6 +181,7 @@ class GB200TopologyTests(unittest.TestCase):
         self.assertTrue(evidence["gin_payload_proof_requires_following_accuracy"])
         self.assertFalse(evidence["gin_payload_test"])
         self.assertEqual(policy.expected_lsa_ranks(8), list(range(8, 16)))
+        self.assertEqual(buffer.buffer_ptrs[8:], [0] * 8)
 
     def test_roce_and_ib_mode_labels_must_be_collectively_uniform(self):
         class OtherGinMode(FakeDist):
@@ -202,12 +220,13 @@ class GB200TopologyTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "actual device"):
             topology.GB200Topology("gin_ib").prepare(args(), HOSTS, 0, 4, torch, FakeDist())
 
-    def native_validated_policy(self, *, sentinel_error=False, buffer_override=None):
+    def native_validated_policy(self, *, sentinel_error=False, restore_error=False, buffer_override=None):
         policy = topology.GB200Topology("native_nvl")
         torch, dist = fake_torch(), FakeDist()
         policy.prepare(args("native_nvl"), HOSTS, 0, 4, torch, dist)
         buffer = native_buffer() if buffer_override is None else buffer_override
         original = buffer.buffer.values.copy()
+        mapped_before = tuple(buffer.buffer_ptrs)
         def gather(_dist, value):
             if isinstance(value, dict) and "nccl" in value:
                 records = []
@@ -224,6 +243,8 @@ class GB200TopologyTests(unittest.TestCase):
             self.assertIs(handle, buffer.handle)
             self.assertEqual(mode, "native")
             self.assertEqual(len(records), 16)
+            self.assertEqual(tuple(buffer.buffer_ptrs), mapped_before)
+            self.assertFalse(hasattr(buffer, "_gb200_validated_alias_identity"))
             allocation.values[:128] = [-1] * 128
             if sentinel_error:
                 raise AssertionError("injected peer-read mismatch")
@@ -233,13 +254,20 @@ class GB200TopologyTests(unittest.TestCase):
         with mock.patch.object(probe, "_query_nccl", return_value=props), \
                 mock.patch.object(probe, "_gather", side_effect=gather), \
                 mock.patch.object(probe, "_peer_memory_test", side_effect=sentinel) as peer_test:
-            if sentinel_error:
+            if restore_error:
+                torch.equal = lambda a, b: False
+                with self.assertRaisesRegex(RuntimeError, "restore_real_work_buffer"):
+                    policy.validate_buffer(buffer, args("native_nvl"), "NCCL", object(), torch, dist)
+            elif sentinel_error:
                 with self.assertRaisesRegex(AssertionError, "injected peer-read"):
                     policy.validate_buffer(buffer, args("native_nvl"), "NCCL", object(), torch, dist)
             else:
                 policy.validate_buffer(buffer, args("native_nvl"), "NCCL", object(), torch, dist)
             self.assertEqual(peer_test.call_count, 1)
         self.assertEqual(buffer.buffer.values, original)
+        if sentinel_error or restore_error:
+            self.assertEqual(tuple(buffer.buffer_ptrs), mapped_before)
+            self.assertFalse(hasattr(buffer, "_gb200_validated_alias_identity"))
         return policy, buffer
 
     def test_actual_buffer_sentinel_restoration_and_identity_gate(self):
@@ -252,10 +280,53 @@ class GB200TopologyTests(unittest.TestCase):
             policy.require_validated_buffer(native_buffer(), HOSTS)
 
     def test_failed_sentinel_restores_bytes_but_never_admits_compute(self):
-        policy, buffer = self.native_validated_policy(sentinel_error=True)
-        self.assertIsNone(policy.evidence)
-        with self.assertRaises(RuntimeError):
-            policy.require_validated_buffer(buffer, HOSTS)
+        for failure in ("sentinel_error", "restore_error"):
+            buffer = native_buffer()
+            buffer.handle.buffer_ptrs[0] += 0x100000
+            buffer.buffer_ptrs[0] += 0x100000
+            policy, buffer = self.native_validated_policy(buffer_override=buffer, **{failure: True})
+            self.assertIsNone(policy.evidence)
+            with self.assertRaises(RuntimeError):
+                policy.require_validated_buffer(buffer, HOSTS)
+
+    def test_only_copied_self_pointer_changes_after_alias_proof_and_restore(self):
+        buffer = native_buffer()
+        buffer.handle.buffer_ptrs[0] += 0x100000
+        buffer.buffer_ptrs[0] += 0x100000
+        original_tensor, original_handle = buffer.buffer, buffer.handle
+        mapped_list = buffer.buffer_ptrs
+        raw = tuple(buffer.handle.buffer_ptrs)
+        mapped = tuple(mapped_list)
+        policy, buffer = self.native_validated_policy(buffer_override=buffer)
+        self.assertIs(buffer.buffer, original_tensor)
+        self.assertIs(buffer.handle, original_handle)
+        self.assertEqual(tuple(buffer.handle.buffer_ptrs), raw)
+        self.assertEqual(tuple(mapped_list), mapped)
+        self.assertIsNot(buffer.buffer_ptrs, mapped_list)
+        self.assertEqual(buffer.buffer_ptrs, [buffer.buffer.data_ptr(), *mapped[1:]])
+        self.assertEqual(policy.evidence["ranks"][0]["mapped_adjusted_buffer_ptrs"], list(mapped))
+        self.assertEqual(policy.evidence["kernel_pointer_records"][0]["kernel_buffer_ptrs"],
+                         buffer.buffer_ptrs)
+        self.assertEqual(buffer._gb200_validated_alias_identity, topology._buffer_alias_identity(buffer))
+        policy.require_validated_buffer(buffer, HOSTS)
+        with self.assertRaisesRegex(RuntimeError, "first compute only"):
+            policy.validate_buffer(buffer, args("native_nvl"), "NCCL", object(), fake_torch(), FakeDist())
+
+    def test_validated_allocation_raw_and_canonical_pointer_state_is_immutable(self):
+        mutations = (
+            lambda b: b.buffer_ptrs.__setitem__(0, b.buffer_ptrs[0] + 8),
+            lambda b: b.buffer_ptrs.__setitem__(15, b.buffer_ptrs[15] + 8),
+            lambda b: b.handle.buffer_ptrs.__setitem__(2, b.handle.buffer_ptrs[2] + 8),
+            lambda b: setattr(b.handle, "offset", 512),
+            lambda b: setattr(b, "handle", deepcopy(b.handle)),
+            lambda b: setattr(b, "buffer", FakeBytes(b.buffer.values.copy())),
+            lambda b: setattr(b, "_gb200_validated_alias_identity", None),
+        )
+        for mutate in mutations:
+            policy, buffer = self.native_validated_policy()
+            mutate(buffer)
+            with self.assertRaisesRegex(RuntimeError, "aliases changed"):
+                policy.require_validated_buffer(buffer, HOSTS)
 
     def test_unprepared_buffer_and_legacy_native_allocator_remain_fail_closed(self):
         with self.assertRaises(RuntimeError):

@@ -3,7 +3,9 @@
 import copy
 import ctypes
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import probe_gb200_topology as probe
 
@@ -20,6 +22,67 @@ def records(mode="gin"):
 
 
 class ProbeContracts(unittest.TestCase):
+    def peer_fixture(self, *, offset=0, bad_pointer=False, bad_bytes=False):
+        """CPU call-path mock, not a device alias/coherence simulation."""
+        own = mock.MagicMock()
+        own.element_size.return_value = 8
+        own.data_ptr.return_value = 0x900000
+        own.device = "cuda:0"
+        own.cpu().tolist.return_value = [probe.sentinel(0, peer, 0, peer) for peer in range(16)]
+        if bad_bytes:
+            own.cpu().tolist.return_value = [-1] * 16
+        allocation = mock.MagicMock()
+        allocation.__getitem__.return_value.view.return_value = own
+        raw = [0x1000 * (peer + 1) for peer in range(16)]
+        def get_buffer(peer, shape, *, dtype, storage_offset):
+            self.assertEqual(shape, (16,))
+            self.assertEqual(dtype, "int64")
+            self.assertEqual(storage_offset, offset // 8)
+            view = mock.MagicMock()
+            view.data_ptr.return_value = raw[peer] + offset + (8 if bad_pointer else 0)
+            view.clone().cpu().tolist.return_value = [probe.sentinel(1, peer, peer, slot)
+                                                      for slot in range(16)]
+            return view
+        handle = SimpleNamespace(buffer_ptrs=raw, offset=offset,
+                                 get_buffer=mock.Mock(side_effect=get_buffer))
+        def gather(output, item):
+            output[:] = [item] * 16
+        dist = SimpleNamespace(get_rank=lambda: 0, get_world_size=lambda: 16,
+                               all_gather_object=mock.Mock(side_effect=gather))
+        torch = SimpleNamespace(int64="int64", tensor=mock.Mock(),
+                                cuda=SimpleNamespace(synchronize=mock.Mock()))
+        return own, allocation, handle, dist, torch
+
+    def test_distinct_self_mapping_keeps_original_as_bidirectional_sentinel_target(self):
+        for offset in (0, 256):
+            own, allocation, handle, dist, torch = self.peer_fixture(offset=offset)
+            result = probe._peer_memory_test("native", torch, dist, allocation, handle, records("native"))
+            self.assertEqual(result["status"], "passed")
+            self.assertFalse(result["self_virtual_addresses_equal"])
+            self.assertTrue(result["original_to_mapped_and_mapped_to_original_checked"])
+            self.assertFalse(result["intra_kernel_alias_proxy_ordering_claim"])
+            self.assertEqual(result["get_buffer_storage_offset_elements"], offset // 8)
+            self.assertEqual(result["read_peers"], list(range(16)))
+            self.assertEqual(result["write_peers"], list(range(16)))
+            own.fill_.assert_called_once_with(-1)
+            own.cpu.assert_called()
+            own.copy_.assert_called_once()
+            self.assertEqual(handle.get_buffer.call_count, 16)
+
+    def test_offset_alignment_and_pointer_equation_fail_before_any_memory_access(self):
+        for options in ({"offset": 7}, {"offset": -8}, {"bad_pointer": True}):
+            own, allocation, handle, dist, torch = self.peer_fixture(**options)
+            with self.assertRaisesRegex(RuntimeError, "prepare_peer_views"):
+                probe._peer_memory_test("native", torch, dist, allocation, handle, records("native"))
+            own.fill_.assert_not_called()
+            own.copy_.assert_not_called()
+
+    def test_distinct_mapping_without_matching_original_bytes_is_rejected(self):
+        own, allocation, handle, dist, torch = self.peer_fixture(bad_bytes=True)
+        with self.assertRaisesRegex(RuntimeError, "peer-write sentinel mismatch"):
+            probe._peer_memory_test("native", torch, dist, allocation, handle, records("native"))
+        own.copy_.assert_not_called()
+
     def test_exact_nccl_23007_abi_on_64bit_host(self):
         self.assertEqual(ctypes.sizeof(ctypes.c_void_p), 8)
         self.assertEqual(ctypes.sizeof(probe.NcclProperties23007), 56)
@@ -141,7 +204,8 @@ class ProbeContracts(unittest.TestCase):
         self.assertIn('"gin_payload_test": False', source)
         self.assertIn('"environment_not_proof"', source)
         self.assertIn('SimpleNamespace(require_gin=True)', source)
-        self.assertIn('handle.get_buffer(peer, (WORLD,), dtype=torch.int64)', source)
+        self.assertIn('handle.get_buffer(peer, (WORLD,), dtype=torch.int64,', source)
+        self.assertIn('storage_offset=offset // own.element_size()', source)
         self.assertIn('view[rank:rank + 1].fill_', source)
         self.assertIn('view.clone().cpu().tolist()', source)
         self.assertLess(source.index('version.value != NCCL_VERSION'),

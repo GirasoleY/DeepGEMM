@@ -222,14 +222,23 @@ def _peer_memory_test(mode, torch, dist, allocation, handle, records):
     offset = int(handle.offset)
     views = {}
     def prepare():
+        if offset < 0 or offset % own.element_size() or own.element_size() != 8:
+            raise AssertionError("byte allocation offset must align to int64 sentinel elements")
         for peer in peers:
-            view = handle.get_buffer(peer, (WORLD,), dtype=torch.int64)
-            expected = int(handle.buffer_ptrs[peer]) + offset
+            # get_buffer's storage_offset is in requested dtype elements;
+            # handle.offset is bytes. Check the resulting address before use.
+            view = handle.get_buffer(peer, (WORLD,), dtype=torch.int64,
+                                     storage_offset=offset // own.element_size())
+            raw = int(handle.buffer_ptrs[peer])
+            expected = raw + offset
+            if raw <= 0 or expected + WORLD * 8 > 1 << 64:
+                raise AssertionError("mapped sentinel address range must fit positive uint64 storage")
             if view.data_ptr() != expected:
                 raise AssertionError("get_buffer/offset semantics disagree with MegaMoE's pointer contract")
             views[peer] = view
-        if views[rank].data_ptr() != own.data_ptr():
-            raise AssertionError("self alias does not point at the source allocation")
+        # A self mapping may have another VA. The following all-peer writes
+        # observed through ORIGINAL own, and original writes observed through
+        # every mapped view (including self), prove shared bytes, not VA equality.
         own.fill_(-1)
         torch.cuda.synchronize()
     _phase(dist, "prepare_peer_views", prepare)
@@ -255,6 +264,13 @@ def _peer_memory_test(mode, torch, dist, allocation, handle, records):
     cross_os = [peer for peer in peers if records[peer]["hostname"] != records[rank]["hostname"]]
     return {"status": "passed", "read_peers": peers, "write_peers": peers,
             "cross_os_peers_tested": cross_os, "words_per_read": WORLD,
+            "original_self_pointer": int(own.data_ptr()),
+            "mapped_self_pointer": int(views[rank].data_ptr()),
+            "self_virtual_addresses_equal": views[rank].data_ptr() == own.data_ptr(),
+            "get_buffer_storage_offset_elements": offset // own.element_size(),
+            "symmetric_allocation_offset_bytes": offset,
+            "original_to_mapped_and_mapped_to_original_checked": True,
+            "intra_kernel_alias_proxy_ordering_claim": False,
             "independent_writer_slots": True, "path": "mapped_peer_memory_torch_cuda_ops",
             "gin_payload_test": False}
 
