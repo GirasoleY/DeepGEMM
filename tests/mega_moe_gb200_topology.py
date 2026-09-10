@@ -2,7 +2,8 @@
 
 No device/kernel change. Native mode is admitted only after actual NCCL LSA16
 and adjusted peer aliases plus a GPU sentinel on the REAL work allocation.
-GIN mode requires actual LSA2x8/GDAKI, not an environment label. Legacy Novita
+Both gin_ib and gin_roce require actual LSA2x8/GDAKI, not an environment label.
+The mode does not prove InfiniBand versus RoCE NIC payloads. Legacy Novita
 host placement checks are untouched. Imports are CPU-only until hook execution.
 """
 
@@ -10,7 +11,7 @@ from copy import deepcopy
 
 
 WORLD = 16
-MODES = {"gin_ib": "gin", "native_nvl": "native"}
+MODES = {"gin_ib": "gin", "gin_roce": "gin", "native_nvl": "native"}
 
 
 def validate_physical_hostnames(hostnames):
@@ -37,7 +38,7 @@ def validate_adjusted_aliases(raw, adjusted, offset, tensor_pointer, rank, mode)
         raise AssertionError("sixteen raw and adjusted buffer aliases required")
     if any(type(value) is not int or value < 0 for value in (*raw, *adjusted, offset)):
         raise AssertionError("buffer pointers/offset must be nonnegative integers")
-    width = 8 if mode == "gin_ib" else WORLD
+    width = 8 if MODES[mode] == "gin" else WORLD
     expected = list(range(rank // width * width, (rank // width + 1) * width))
     observed = [peer for peer, value in enumerate(adjusted) if value]
     if observed != expected or [peer for peer, value in enumerate(raw) if value] != expected:
@@ -52,7 +53,7 @@ def validate_adjusted_aliases(raw, adjusted, offset, tensor_pointer, rank, mode)
 class GB200Topology:
     def __init__(self, mode, run_configuration=None):
         if mode not in MODES:
-            raise ValueError("GB200 mode must be gin_ib or native_nvl")
+            raise ValueError("GB200 mode must be gin_ib, gin_roce or native_nvl")
         self.mode = mode
         self.run_configuration = deepcopy(run_configuration)
         self.physical_hostnames = None
@@ -71,7 +72,7 @@ class GB200Topology:
                 raise ValueError("GB200 baseline requires WORLD16 / four torchrun workers per real host")
             if torch.cuda.current_device() != local_rank:
                 raise ValueError("CUDA device does not match local rank")
-            if bool(args.require_gin) != (self.mode == "gin_ib"):
+            if bool(args.require_gin) != (MODES[self.mode] == "gin"):
                 raise ValueError("explicit GB200 mode and require_gin disagree")
             shape = (args.num_experts, args.num_topk, args.hidden, args.intermediate_hidden,
                      args.num_max_tokens_per_rank, args.num_shared_experts, args.mma_type)
@@ -112,7 +113,7 @@ class GB200Topology:
         def record():
             if backend != "NCCL" or registration is None:
                 raise AssertionError("both GB200 modes require the live NCCL symmetric allocator bridge")
-            if bool(buffer.gin_enabled) != (self.mode == "gin_ib"):
+            if bool(buffer.gin_enabled) != (MODES[self.mode] == "gin"):
                 raise AssertionError("actual buffer GIN state differs from requested transport")
             if self.mode == "native_nvl" and getattr(buffer, "gin_context", None) is not None:
                 raise AssertionError("native mode must not create a GIN context")
@@ -137,7 +138,7 @@ class GB200Topology:
         records = _gather(dist, _phase(dist, "gb200_real_buffer_properties", record))
         actual_topology = validate_records(records, MODES[self.mode])
         contexts = None
-        if self.mode == "gin_ib":
+        if MODES[self.mode] == "gin":
             contexts = _gather(dist, _phase(dist, "gb200_real_gin_context", lambda: {
                 name: getattr(buffer.gin_context, name) for name in (
                     "rank", "world_size", "lsa_rank", "lsa_size", "gin_type_string",
@@ -177,7 +178,7 @@ class GB200Topology:
             "before_first_megamoe_compute": True,
             "native_gin_disabled": self.mode == "native_nvl",
             "gin_payload_test": False,
-            "gin_payload_proof_requires_following_accuracy": self.mode == "gin_ib",
+            "gin_payload_proof_requires_following_accuracy": MODES[self.mode] == "gin",
         }
         self._validated_buffer_id = id(buffer)
         return self.evidence

@@ -18,7 +18,7 @@ class ParsingContracts(unittest.TestCase):
         return runner.parse_args(["--mode", mode, "--decode-mns", str(mns),
                                   "--output", "result.json", *extra])
 
-    def test_all_target_shapes_and_both_modes_keep_exact_math(self):
+    def test_all_target_shapes_and_all_modes_keep_exact_math(self):
         for mode in runner.MODES:
             for mns in (8, 10, 12):
                 with self.subTest(mode=mode, mns=mns):
@@ -30,8 +30,8 @@ class ParsingContracts(unittest.TestCase):
                     self.assertFalse(args.fast_math)
                     self.assertEqual(args.activation_clamp, 10.0)
                     self.assertEqual(args.benchmark_replays, 0)
-                    self.assertEqual(args.require_gin, mode == "gin_ib")
-                    self.assertEqual(args.gin_direct_dispatch, mode == "gin_ib")
+                    self.assertEqual(args.require_gin, mode in runner.GIN_MODES)
+                    self.assertEqual(args.gin_direct_dispatch, mode in runner.GIN_MODES)
                     self.assertEqual((comparison.deepep_capacity,
                                       comparison.deepep_dispatch_bucket,
                                       comparison.deepep_num_sms, comparison.deepep_num_qps),
@@ -76,14 +76,32 @@ class ParsingContracts(unittest.TestCase):
         for mode in runner.MODES:
             env = runner.fixed_environment(mode)
             for key in runner.accuracy.GIN_VALIDATED_FLAG_ENVS:
-                self.assertEqual(env[key], "1" if mode == "gin_ib" else "0")
+                self.assertEqual(env[key], "1" if mode in runner.GIN_MODES else "0")
             self.assertEqual(env[runner.accuracy.GIN_ACTIVITY_GATE_OPT_ENV],
-                             "1" if mode == "gin_ib" else "0")
+                             "1" if mode in runner.GIN_MODES else "0")
             self.assertEqual(env[runner.accuracy.GIN_LOCAL_ABLATION_ENV], "0")
             self.assertEqual(env["DG_MEGAMOE_GIN_DIAGNOSTICS"], "0")
             self.assertFalse(any("NUM_SMS" in key or "BLOCK_M" in key for key in env))
         with self.assertRaises(ValueError):
             runner.fixed_environment("ep8")
+
+    def test_roce_changes_only_transport_label_not_math_timing_or_flags(self):
+        ib_options, ib_args, ib_comparison = self.parse("gin_ib", 10, "--profile-recipe")
+        roce_options, roce_args, roce_comparison = self.parse("gin_roce", 10, "--profile-recipe")
+        self.assertEqual(vars(ib_args), vars(roce_args))
+        self.assertEqual(vars(ib_comparison), vars(roce_comparison))
+        self.assertEqual(runner.fixed_environment("gin_ib"), runner.fixed_environment("gin_roce"))
+        ib = runner.configuration(ib_options, ib_args, ib_comparison, {})
+        roce = runner.configuration(roce_options, roce_args, roce_comparison, {})
+        self.assertEqual(roce.pop("mode"), "gin_roce")
+        self.assertEqual(ib.pop("mode"), "gin_ib")
+        network = roce.pop("network_transport")
+        self.assertEqual(network["requested_transport"], "RoCE")
+        self.assertEqual(network["requested_rdma_link_layer"], "Ethernet")
+        self.assertIsNone(network["observed_rdma_link_layer"])
+        self.assertFalse(network["physical_network_payload_verified"])
+        self.assertEqual(ib.pop("network_transport")["requested_transport"], "InfiniBand")
+        self.assertEqual(ib, roce)
 
 
 class FakeDist:

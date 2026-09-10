@@ -5,12 +5,15 @@ Four physical hosts, four torchrun workers/host; repeat MNS8/10/12:
       --decode-mns 8 --output native-mns8.json
   python tests/bench_gb200_transport_matched.py --mode gin_ib \
       --decode-mns 8 --profile-recipe --output gin-mns8.json
+  python tests/bench_gb200_transport_matched.py --mode gin_roce \
+      --decode-mns 8 --profile-recipe --output roce-mns8.json
 
 Logical route domains remain ranks0..7/ranks8..15, exactly as in the Novita
 fixture. They are NOT physical hostnames. Native mode requires all sixteen
 actual mapped peers, including cross-OS-host read/write sentinels, before
-MegaMoE compute. GIN mode requires two actual eight-rank LSA teams and GDAKI;
-an environment request alone is never evidence of an IB payload path.
+MegaMoE compute. GIN modes require two actual eight-rank LSA teams and GDAKI.
+gin_ib requests InfiniBand; gin_roce requests RoCE/Ethernet. Neither the mode
+label nor GDAKI alone proves the physical link layer or selected payload path.
 
 GIN uses the existing full MegaMoE/DeepEP+TRT benchmark pair unchanged. Native
 times only MegaMoE, with the same backend-isolated CUDA-event convention.
@@ -36,7 +39,8 @@ import bench_deepep_trtllm_isolated as matched
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MODES = ("native_nvl", "gin_ib")
+GIN_MODES = ("gin_ib", "gin_roce")
+MODES = ("native_nvl", *GIN_MODES)
 SOURCE_FILES = (
     "tests/bench_gb200_transport_matched.py",
     "tests/mega_moe_gb200_topology.py", "tests/probe_gb200_topology.py",
@@ -72,7 +76,7 @@ def parse_args(argv=None):
         parser.error("conditioning, warmups and correctness iterations must be positive")
     if options.payload_epochs < 2:
         parser.error("changing-payload correctness must remain enabled")
-    if options.profile_recipe and options.mode != "gin_ib":
+    if options.profile_recipe and options.mode not in GIN_MODES:
         parser.error("recipe profiling applies only to the GIN + DeepEP/TRT job")
     common = ["--k3", "--decode-mns", str(options.decode_mns),
               "--eager-iterations", str(options.eager_iterations),
@@ -81,7 +85,7 @@ def parse_args(argv=None):
               "--no-fast-math", "--activation-clamp", "10",
               "--gin-completion-batch", "8", "--gin-combine-issue-wave", "8",
               "--gin-outbox-depth", "64", "--gin-combine-chunk-bytes", "7168"]
-    if options.mode == "gin_ib":
+    if options.mode in GIN_MODES:
         common += ["--require-gin", "--gin-active-fast-path", "--gin-bulk-combine",
                    "--gin-direct-dispatch"]
     with patch.object(sys, "argv", [sys.argv[0], *common]):
@@ -101,8 +105,8 @@ def parse_args(argv=None):
 
 def fixed_environment(mode):
     if mode not in MODES:
-        raise ValueError("mode must be native_nvl or gin_ib")
-    enabled = "1" if mode == "gin_ib" else "0"
+        raise ValueError("mode must be native_nvl, gin_ib or gin_roce")
+    enabled = "1" if mode in GIN_MODES else "0"
     return {
         **{name: enabled for name in accuracy.GIN_VALIDATED_FLAG_ENVS},
         accuracy.GIN_ACTIVITY_GATE_OPT_ENV: enabled,
@@ -110,6 +114,24 @@ def fixed_environment(mode):
         accuracy.GIN_LOCAL_ABLATION_ENV: "0",
         "DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE": "0",
         "DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS": "1",
+    }
+
+
+def network_transport_metadata(mode):
+    """Requested physical transport; NIC/link/payload evidence stays separate."""
+    if mode not in MODES:
+        raise ValueError("unknown GB200 transport mode")
+    label, link_layer = {
+        "native_nvl": ("NVLink", None),
+        "gin_ib": ("InfiniBand", "InfiniBand"),
+        "gin_roce": ("RoCE", "Ethernet"),
+    }[mode]
+    return {
+        "requested_transport": label, "requested_rdma_link_layer": link_layer,
+        "observed_rdma_link_layer": None,
+        "physical_network_payload_verified": False,
+        "basis": "explicit mode request, not measured NIC/link-layer/payload evidence",
+        "gin_protocol_and_topology_checks_shared_between_ib_and_roce": mode in GIN_MODES,
     }
 
 
@@ -147,6 +169,7 @@ def configuration(options, args, comparison, sources):
     """CPU-only, all-rank equality checked by topology.prepare before compute."""
     return {
         "mode": options.mode, "world_size": 16, "physical_hosts": 4,
+        "network_transport": network_transport_metadata(options.mode),
         "ranks_per_physical_host": 4, "logical_route_domains": [0] * 8 + [1] * 8,
         "shape": {"tokens_per_rank": args.num_tokens, "capacity": 384,
                   "hidden": args.hidden, "intermediate_hidden": args.intermediate_hidden,
@@ -350,7 +373,7 @@ def main():
     def stress_then_measure(harness, snapshots, torch, dist):
         original_stress(harness, snapshots, torch, dist)
         before = _collective_call(dist, "fixture identity before", lambda: _fixture_identity(harness, snapshots))
-        if options.mode == "gin_ib":
+        if options.mode in GIN_MODES:
             result = _compare_gin(harness, snapshots, comparison)
         else:
             result = {"routes": _benchmark_native(harness, snapshots, comparison)}
@@ -394,10 +417,11 @@ def main():
         "excluded": ["input_quantization", "route_generation", "source_buffer_copies"],
         "aggregation": "max_of_16_rank_cuda_event_durations_per_replay_then_quantiles",
         "schedule": ("route_isolated_alternating_backend_order_plus_backend_isolated_rewarm"
-                     if options.mode == "gin_ib" else "native_backend_isolated_rewarm"),
+                     if options.mode in GIN_MODES else "native_backend_isolated_rewarm"),
         "historical_production_SITU_comparison": False,
         "compute_only_floor_claim": False, "random_dense_timing_claim": False,
         "physical_ib_payload_proven_by_environment": False,
+        "network_transport": network_transport_metadata(options.mode),
         "megamoe_math": {"fast_math": False, "activation_clamp": 10.0,
                          "weight_position": "before_intermediate_mxfp8_quantization",
                          "intermediate_scale": "2**ceil(log2(amax/448)), per32 UE8M0"},
@@ -405,7 +429,7 @@ def main():
         "source_stability_checked": True,
         "source_attestation_scope": "listed source files plus per-rank extension hash; external headers/JIT binary not attested",
     }
-    if options.mode == "gin_ib":
+    if options.mode in GIN_MODES:
         record.update(matched.dispatch_candidate_metadata(fixed_environment(options.mode)))
         record["quantization_boundary"] = {
             "intermediate_quantizers_identical": False,

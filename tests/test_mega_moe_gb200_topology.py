@@ -17,7 +17,7 @@ HOSTS = tuple(f"actual-host-{rank // 4}" for rank in range(16))
 
 
 def args(mode="gin_ib", tokens=32):
-    return SimpleNamespace(require_gin=mode == "gin_ib", num_experts=896,
+    return SimpleNamespace(require_gin=mode in ("gin_ib", "gin_roce"), num_experts=896,
                            num_topk=16, hidden=3584, intermediate_hidden=3072,
                            num_max_tokens_per_rank=384, num_shared_experts=0,
                            mma_type="fp8xfp4", num_tokens=tokens)
@@ -126,18 +126,54 @@ class GB200TopologyTests(unittest.TestCase):
                                                    256, buffer.buffer.data_ptr(), 0, "native_nvl")
 
     def test_gin_exact_lsa_membership_and_offset_not_environment(self):
-        for rank in (0, 7, 8, 15):
-            peers = list(range(rank // 8 * 8, rank // 8 * 8 + 8))
-            raw = [0x1000 * (peer + 1) if peer in peers else 0 for peer in range(16)]
-            adjusted = [pointer + 256 if pointer else 0 for pointer in raw]
-            self.assertEqual(topology.validate_adjusted_aliases(raw, adjusted, 256,
-                                                              adjusted[rank], rank, "gin_ib"), peers)
-            bad = adjusted.copy(); bad[(rank + 8) % 16] = 256
-            with self.assertRaises(AssertionError):
-                topology.validate_adjusted_aliases(raw, bad, 256, adjusted[rank], rank, "gin_ib")
-            for offset, own in ((0, adjusted[rank]), (256, raw[rank])):
+        for mode in ("gin_ib", "gin_roce"):
+            for rank in (0, 7, 8, 15):
+                peers = list(range(rank // 8 * 8, rank // 8 * 8 + 8))
+                raw = [0x1000 * (peer + 1) if peer in peers else 0 for peer in range(16)]
+                adjusted = [pointer + 256 if pointer else 0 for pointer in raw]
+                self.assertEqual(topology.validate_adjusted_aliases(raw, adjusted, 256,
+                                                                  adjusted[rank], rank, mode), peers)
+                bad = adjusted.copy(); bad[(rank + 8) % 16] = 256
                 with self.assertRaises(AssertionError):
-                    topology.validate_adjusted_aliases(raw, adjusted, offset, own, rank, "gin_ib")
+                    topology.validate_adjusted_aliases(raw, bad, 256, adjusted[rank], rank, mode)
+                for offset, own in ((0, adjusted[rank]), (256, raw[rank])):
+                    with self.assertRaises(AssertionError):
+                        topology.validate_adjusted_aliases(raw, adjusted, offset, own, rank, mode)
+
+    def test_roce_retains_gdaki_context_and_exact_same_clique_probe(self):
+        policy = topology.GB200Topology("gin_roce")
+        torch, dist = fake_torch(), FakeDist()
+        policy.prepare(args("gin_roce"), HOSTS, 0, 4, torch, dist)
+        self.assertEqual(dist.records[-1]["mode"], "gin_roce")
+        buffer = native_buffer()
+        buffer.gin_enabled = True
+        buffer.handle.buffer_ptrs[8:] = [0] * 8
+        buffer.buffer_ptrs[8:] = [0] * 8
+        buffer.gin_context = SimpleNamespace(rank=0, world_size=16, lsa_rank=0, lsa_size=8,
+            gin_type_string="gdaki", context_count=9, queue_depth=64, signal_count=2, connection_count=1)
+        with mock.patch.object(probe, "_query_nccl", return_value={}), mock.patch.object(
+                probe, "validate_records", return_value={"mock_only": True}) as records, mock.patch.object(
+                probe, "validate_context_records") as contexts, mock.patch.object(
+                probe, "_peer_memory_test", return_value={"status": "passed"}) as sentinel:
+            evidence = policy.validate_buffer(buffer, args("gin_roce"), "NCCL", object(), torch, dist)
+        self.assertEqual(records.call_args.args[1], "gin")
+        contexts.assert_called_once()
+        self.assertEqual(sentinel.call_args.args[0], "gin")
+        self.assertEqual(evidence["mode"], "gin_roce")
+        self.assertFalse(evidence["native_gin_disabled"])
+        self.assertTrue(evidence["gin_payload_proof_requires_following_accuracy"])
+        self.assertFalse(evidence["gin_payload_test"])
+        self.assertEqual(policy.expected_lsa_ranks(8), list(range(8, 16)))
+
+    def test_roce_and_ib_mode_labels_must_be_collectively_uniform(self):
+        class OtherGinMode(FakeDist):
+            def all_gather_object(self, output, item):
+                super().all_gather_object(output, item)
+                if isinstance(item, dict) and item.get("mode") == "gin_roce":
+                    output[15]["mode"] = "gin_ib"
+        with self.assertRaisesRegex(RuntimeError, "configuration differs"):
+            topology.GB200Topology("gin_roce").prepare(
+                args("gin_roce"), HOSTS, 0, 4, fake_torch(), OtherGinMode())
 
     def test_prepare_configuration_is_collective_before_admission(self):
         policy = topology.GB200Topology("gin_ib", run_configuration={"replays": 204, "source": "abc"})
