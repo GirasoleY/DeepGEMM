@@ -36,6 +36,7 @@ from unittest.mock import patch
 
 import test_mega_moe_accuracy as accuracy
 import bench_deepep_trtllm_isolated as matched
+from gb200_mxfp4_compat import prepare_converter_adapter
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,6 +44,7 @@ GIN_MODES = ("gin_ib", "gin_roce")
 MODES = ("native_nvl", *GIN_MODES)
 SOURCE_FILES = (
     "tests/bench_gb200_transport_matched.py",
+    "tests/gb200_mxfp4_compat.py",
     "tests/mega_moe_gb200_topology.py", "tests/probe_gb200_topology.py",
     "tests/test_mega_moe_accuracy.py", "tests/bench_deepep_trtllm_isolated.py",
     "deep_gemm/__init__.py", "deep_gemm/mega/__init__.py", "deep_gemm/utils/math.py",
@@ -326,11 +328,19 @@ def _validate_deepep_domains(harness, comparator):
 
 
 def _compare_gin(harness, snapshots, comparison):
-    comparator = matched.DeepEPTRTLLM(harness, comparison)
+    adapter = _collective_call(harness.dist, "GB200 MXFP4 converter compatibility", prepare_converter_adapter)
+    converter_records = _gather(harness.dist, adapter.evidence)
+    if any(record != adapter.evidence for record in converter_records):
+        raise RuntimeError("GB200 MXFP4 converter selection/source differs across ranks")
+    # The imported converter is restored before graph capture and timing.
+    with adapter.install():
+        comparator = matched.DeepEPTRTLLM(harness, comparison)
     try:
         domains = _validate_deepep_domains(harness, comparator)
         routes, payload = matched._benchmark_pair(harness, comparator, comparison, snapshots)
         return {"routes": routes, "same_graph_pair_payload_refresh": payload,
+                "gb200_mxfp4_converter_compatibility": {"per_rank": converter_records,
+                                                        "installed_only_during_construction": True},
                 "deepep_actual_domain_preflight": domains,
                 "runtime": comparator.api_evidence,
                 "canonical_weights_sha256": comparator.weight_sha256,

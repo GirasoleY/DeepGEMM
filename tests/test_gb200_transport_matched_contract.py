@@ -1,6 +1,7 @@
 """CPU contracts only; no GB200/topology/latency claim is produced here."""
 
 import ast
+from contextlib import nullcontext
 import json
 import os
 from pathlib import Path
@@ -143,6 +144,12 @@ def fake_comparator():
 
 
 class TimingContracts(unittest.TestCase):
+    def setUp(self):
+        adapter = SimpleNamespace(evidence={"cpu_fixture": True}, install=nullcontext)
+        mock = patch.object(runner, "prepare_converter_adapter", return_value=adapter)
+        mock.start()
+        self.addCleanup(mock.stop)
+
     def make_harness(self):
         trace = []
         event_count = 0
@@ -223,6 +230,12 @@ class TimingContracts(unittest.TestCase):
 
 
 class DeepEPDomainContracts(unittest.TestCase):
+    def setUp(self):
+        adapter = SimpleNamespace(evidence={"cpu_fixture": True}, install=nullcontext)
+        mock = patch.object(runner, "prepare_converter_adapter", return_value=adapter)
+        mock.start()
+        self.addCleanup(mock.stop)
+
     def test_actual_live_domains_and_source_are_recorded(self):
         value = runner._deepep_domain_record(fake_comparator(), 7)
         self.assertEqual(value["rank"], 7)
@@ -361,6 +374,7 @@ class SourceAndLifecycleContracts(unittest.TestCase):
 
     def test_sources_include_kernel_scheduler_layout_and_probe(self):
         for expected in ("tests/mega_moe_gb200_topology.py", "tests/probe_gb200_topology.py",
+                         "tests/gb200_mxfp4_compat.py",
                          "deep_gemm/include/deep_gemm/scheduler/mega_moe.cuh",
                          "deep_gemm/include/deep_gemm/layout/mega_moe.cuh"):
             self.assertIn(expected, runner.SOURCE_FILES)
