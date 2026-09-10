@@ -299,7 +299,7 @@ class LateFlushSourceContracts(unittest.TestCase):
         source = self.kernel
         late = braced_block(source, source.index(
             "if (use_gin_direct_dispatch and sm_idx == 1 and warp_idx == 0 and",
-            source.index("// All eight peer chains were posted before the count rendezvous.")))
+            source.index("// All active peer chains were posted before the count rendezvous.")))
         self.assertIn("mega_moe_gin_wait_direct_dispatch", late)
         self.assertIn("get_direct_dispatch_payload_ready_ptr(lane_idx)", late)
         self.assertIn("mega_moe_gin_flush_data_peer_async", late)

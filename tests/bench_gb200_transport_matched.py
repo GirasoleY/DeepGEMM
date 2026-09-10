@@ -1,4 +1,4 @@
-"""Matched EP16 GB200 transport experiment; run each mode in a fresh job.
+"""Matched GB200 transport experiment; run each mode in a fresh job.
 
 Four physical hosts, four torchrun workers/host; repeat MNS8/10/12:
   python tests/bench_gb200_transport_matched.py --mode native_nvl \
@@ -12,6 +12,8 @@ Logical route domains remain ranks0..7/ranks8..15, exactly as in the Novita
 fixture. They are NOT physical hostnames. Native mode requires all sixteen
 actual mapped peers, including cross-OS-host read/write sentinels, before
 MegaMoE compute. GIN modes require two actual eight-rank LSA teams and GDAKI.
+Explicit --world-size8 instead uses two four-GPU hosts, E448/56 experts per
+rank, logical2x4 routes and GIN LSA2x4/nativeLSA8. EP16 remains the default.
 gin_ib requests InfiniBand; gin_roce requests RoCE/Ethernet. Neither the mode
 label nor GDAKI alone proves the physical link layer or selected payload path.
 
@@ -37,6 +39,7 @@ from unittest.mock import patch
 import test_mega_moe_accuracy as accuracy
 import bench_deepep_trtllm_isolated as matched
 from gb200_mxfp4_compat import prepare_converter_adapter
+from probe_gb200_topology import validate_world_size
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -44,6 +47,7 @@ GIN_MODES = ("gin_ib", "gin_roce")
 MODES = ("native_nvl", *GIN_MODES)
 SOURCE_FILES = (
     "tests/bench_gb200_transport_matched.py",
+    "tests/mega_moe_gb200_imbalance.py",
     "tests/gb200_mxfp4_compat.py",
     "tests/mega_moe_gb200_topology.py", "tests/probe_gb200_topology.py",
     "tests/test_mega_moe_accuracy.py", "tests/bench_deepep_trtllm_isolated.py",
@@ -61,6 +65,7 @@ SOURCE_FILES = (
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=MODES, required=True)
+    parser.add_argument("--world-size", type=int, choices=(8, 16), default=16)
     parser.add_argument("--decode-mns", type=int, choices=(8, 10, 12), required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--comparison-replays", type=int, default=204)
@@ -81,6 +86,7 @@ def parse_args(argv=None):
     if options.profile_recipe and options.mode not in GIN_MODES:
         parser.error("recipe profiling applies only to the GIN + DeepEP/TRT job")
     common = ["--k3", "--decode-mns", str(options.decode_mns),
+              "--num-experts", str(56 * options.world_size),
               "--eager-iterations", str(options.eager_iterations),
               "--graph-replays", str(options.graph_replays),
               "--payload-epochs", str(options.payload_epochs), "--require-cross-host",
@@ -170,9 +176,11 @@ def _load_runtime_for_gb200(local_rank):
 def configuration(options, args, comparison, sources):
     """CPU-only, all-rank equality checked by topology.prepare before compute."""
     return {
-        "mode": options.mode, "world_size": 16, "physical_hosts": 4,
+        "mode": options.mode, "world_size": options.world_size,
+        "physical_hosts": options.world_size // 4,
         "network_transport": network_transport_metadata(options.mode),
-        "ranks_per_physical_host": 4, "logical_route_domains": [0] * 8 + [1] * 8,
+        "ranks_per_physical_host": 4,
+        "logical_route_domains": [0] * (options.world_size // 2) + [1] * (options.world_size // 2),
         "shape": {"tokens_per_rank": args.num_tokens, "capacity": 384,
                   "hidden": args.hidden, "intermediate_hidden": args.intermediate_hidden,
                   "num_experts": args.num_experts, "num_topk": args.num_topk},
@@ -274,19 +282,21 @@ def _benchmark_native(harness, snapshots, comparison):
         matched._retire_graphs(graphs)
 
 
-def _deepep_domain_record(comparator, rank):
+def _deepep_domain_record(comparator, rank, world_size=16):
     """Read the separate DeepEP runtime, not MegaMoE's topology descriptor.
 
     Public tuple order is (RDMA, NVLink) and (scaleout, scaleup). Installed
     getter text and source identity are retained for the required version
     review; historical Novita or current upstream docs are not that proof.
     """
+    validate_world_size(world_size)
     buffer = comparator.buffer
     physical = tuple(buffer.get_physical_domain_size())
     logical = tuple(buffer.get_logical_domain_size())
     if (any(type(value) is not int for value in (*physical, *logical))
-            or physical != (2, 8) or logical != (1, 16)):
-        raise AssertionError(f"DeepEP requires physical(2,8), logical(1,16); got {physical}, {logical}")
+            or physical != (2, world_size // 2) or logical != (1, world_size)):
+        raise AssertionError(f"DeepEP requires physical(2,{world_size // 2}), "
+                             f"logical(1,{world_size}); got {physical}, {logical}")
     if buffer.allow_hybrid_mode is not False:
         raise AssertionError("DeepEP must use the actual non-hybrid/direct mode")
     named = {name: getattr(buffer, name) for name in (
@@ -311,15 +321,16 @@ def _deepep_domain_record(comparator, rank):
 
 
 def _validate_deepep_domains(harness, comparator):
+    world_size = harness.dist.get_world_size()
     record = _collective_call(harness.dist, "DeepEP actual domain preflight",
-                              lambda: _deepep_domain_record(comparator, harness.rank))
+                              lambda: _deepep_domain_record(comparator, harness.rank, world_size))
     records = _gather(harness.dist, record)
     if len({item["loaded_python_source_sha256"] for item in records}) != 1:
         raise RuntimeError("DeepEP loaded Python source differs across ranks")
     return {
         "status": "passed", "before_graph_capture": True,
-        "expected_physical_domain_size_rdma_nvlink": [2, 8],
-        "expected_logical_domain_size_scaleout_scaleup": [1, 16],
+        "expected_physical_domain_size_rdma_nvlink": [2, world_size // 2],
+        "expected_logical_domain_size_scaleout_scaleup": [1, world_size],
         "direct_nonhierarchical": True, "per_rank": records,
         "installed_tuple_semantics_source_review_required_before_acceptance": True,
         "physical_ib_payload_probe": False,
@@ -361,14 +372,15 @@ def _compare_gin(harness, snapshots, comparison):
 def main():
     options, args, comparison = parse_args()
     if ("LOCAL_RANK" not in os.environ or os.getenv("LOCAL_WORLD_SIZE") != "4"
-            or os.getenv("WORLD_SIZE") != "16"):
-        raise RuntimeError("use a fresh four-host torchrun job with four workers/host (EP16)")
+            or os.getenv("WORLD_SIZE") != str(options.world_size)):
+        raise RuntimeError("use a fresh torchrun job with four workers/host and the selected EP8/EP16 world")
     matched.validate_clean_experiment_environment()
     os.environ.update(fixed_environment(options.mode))
     from mega_moe_gb200_topology import GB200Topology
     sources = source_manifest()
     config = configuration(options, args, comparison, sources)
-    topology = GB200Topology(mode=options.mode, run_configuration=config)
+    topology = GB200Topology(mode=options.mode, run_configuration=config,
+                             world_size=options.world_size)
     original_stress = accuracy._run_graph_stress
     original_success = accuracy._synchronize_worker_success
     state = {}
@@ -382,6 +394,9 @@ def main():
 
     def stress_then_measure(harness, snapshots, torch, dist):
         original_stress(harness, snapshots, torch, dist)
+        if options.world_size == 8:
+            from mega_moe_gb200_imbalance import validate_ep8_imbalance
+            state["fixed_shape_imbalance"] = validate_ep8_imbalance(harness)
         before = _collective_call(dist, "fixture identity before", lambda: _fixture_identity(harness, snapshots))
         if options.mode in GIN_MODES:
             result = _compare_gin(harness, snapshots, comparison)
@@ -419,13 +434,13 @@ def main():
     if topology.accuracy_result is None:
         raise AssertionError("worker returned without its complete accuracy evidence")
     record = {
-        "schema": "gb200-ep16-matched-transport-v1", "status": "passed",
+        "schema": f"gb200-ep{options.world_size}-matched-transport-v1", "status": "passed",
         "accuracy_and_teardown_passed": True, "configuration": config, **state,
         "accuracy": topology.accuracy_result,
         "operator": "SwiGLU", "input_pattern": "selected_periodic_sparse_valued_full_shape",
         "timing_scope": "prequantized_activation_and_routes_to_combined_bf16_output",
         "excluded": ["input_quantization", "route_generation", "source_buffer_copies"],
-        "aggregation": "max_of_16_rank_cuda_event_durations_per_replay_then_quantiles",
+        "aggregation": f"max_of_{options.world_size}_rank_cuda_event_durations_per_replay_then_quantiles",
         "schedule": ("route_isolated_alternating_backend_order_plus_backend_isolated_rewarm"
                      if options.mode in GIN_MODES else "native_backend_isolated_rewarm"),
         "historical_production_SITU_comparison": False,

@@ -1,8 +1,11 @@
-"""Untimed GB200 EP16 topology/peer-memory preflight; no new CUDA kernel.
+"""Untimed GB200 topology/peer-memory preflight; no new CUDA kernel.
 
 Run with four torchrun hosts, four workers each. ``--mode gin`` expects two
 real eight-rank NCCL LSA teams; ``--mode native`` expects one sixteen-rank
 team. Environment settings are recorded, never accepted as topology evidence.
+Explicit ``--world-size 8`` uses two four-worker hosts, GIN LSA2x4/native LSA8.
+The EP8 GIN clique is one physical host; its mapped-peer test makes no
+cross-OS same-clique claim. Native EP8 still exercises cross-OS mapped peers.
 The tiny GIN context proves backend/resource creation, NOT device PUT traffic.
 An optional reusable callback can supply that separate payload test; otherwise
 the following full MegaMoE accuracy smoke must establish payload correctness.
@@ -66,22 +69,31 @@ def source_manifest():
     return result
 
 
-def expected_peers(rank, mode):
-    if mode not in ("gin", "native") or type(rank) is not int or not 0 <= rank < WORLD:
-        raise ValueError("mode must be gin/native and rank must be in [0,16)")
-    width = 8 if mode == "gin" else WORLD
+def validate_world_size(world_size):
+    if type(world_size) is not int or world_size not in (8, 16):
+        raise ValueError("GB200 world size must be exactly 8 or 16")
+    return world_size
+
+
+def expected_peers(rank, mode, world_size=WORLD):
+    validate_world_size(world_size)
+    if mode not in ("gin", "native") or type(rank) is not int or not 0 <= rank < world_size:
+        raise ValueError("mode must be gin/native and rank must be in the selected world")
+    width = world_size // 2 if mode == "gin" else world_size
     start = rank // width * width
     return list(range(start, start + width))
 
 
-def validate_records(records, mode):
+def validate_records(records, mode, world_size=WORLD):
     """Validate real physical placement, NCCL properties and observed aliases."""
-    if len(records) != WORLD or [r.get("rank") for r in records] != list(range(WORLD)):
-        raise AssertionError("probe requires exactly sixteen ordered rank records")
+    validate_world_size(world_size)
+    expected_peers(0, mode, world_size)
+    if len(records) != world_size or [r.get("rank") for r in records] != list(range(world_size)):
+        raise AssertionError("probe requires exactly one ordered record per selected world rank")
     hosts = [r["hostname"] for r in records]
-    if len(set(hosts)) != 4:
-        raise AssertionError("probe requires four distinct physical hostnames")
-    for node in range(4):
+    if len(set(hosts)) != world_size // 4:
+        raise AssertionError("probe requires four distinct physical hostnames for EP16, two for EP8")
+    for node in range(world_size // 4):
         members = records[4 * node:4 * node + 4]
         if len({r["hostname"] for r in members}) != 1:
             raise AssertionError("physical hosts must occupy contiguous four-rank blocks")
@@ -91,9 +103,9 @@ def validate_records(records, mode):
             raise AssertionError("LOCAL_WORLD_SIZE must be four on every rank")
     for rank, record in enumerate(records):
         props = record["nccl"]
-        if record["world_size"] != WORLD or props["version"] != NCCL_VERSION:
+        if record["world_size"] != world_size or props["version"] != NCCL_VERSION:
             raise AssertionError("world size or NCCL version differs from the fixed target")
-        if props["rank"] != rank or props["n_ranks"] != WORLD:
+        if props["rank"] != rank or props["n_ranks"] != world_size:
             raise AssertionError("queried NCCL communicator rank mapping is wrong")
         if props["cuda_device"] != record["cuda_device"]:
             raise AssertionError("queried NCCL communicator uses another CUDA device")
@@ -101,28 +113,31 @@ def validate_records(records, mode):
             raise AssertionError("actual NCCL communicator lacks device API support")
         if props["n_lsa_teams"] != (2 if mode == "gin" else 1):
             raise AssertionError("actual NCCL LSA team count does not match requested mode")
-        if record["peer_alias_ranks"] != expected_peers(rank, mode):
+        if record["peer_alias_ranks"] != expected_peers(rank, mode, world_size):
             raise AssertionError(f"actual peer aliases disagree with LSA membership at rank{rank}")
         if mode == "gin" and props["gin_type"] != 3:
             raise AssertionError("actual NCCL backend is not GDAKI")
-        peers = expected_peers(rank, mode)
-        if not any(hosts[peer] != hosts[rank] for peer in peers):
+        peers = expected_peers(rank, mode, world_size)
+        if (mode == "native" or world_size == 16) and not any(
+                hosts[peer] != hosts[rank] for peer in peers):
             raise AssertionError("no same-clique cross-OS-host peer exists")
     return {
-        "physical_host_count": 4, "ranks_per_physical_host": 4,
-        "world_size": WORLD, "lsa_team_count": 2 if mode == "gin" else 1,
-        "lsa_team_size": 8 if mode == "gin" else WORLD,
+        "physical_host_count": world_size // 4, "ranks_per_physical_host": 4,
+        "world_size": world_size, "lsa_team_count": 2 if mode == "gin" else 1,
+        "lsa_team_size": world_size // 2 if mode == "gin" else world_size,
+        "same_clique_cross_os_peers_required": mode == "native" or world_size == 16,
         "actual_properties_and_aliases_checked": True,
         "environment_is_not_topology_proof": True,
     }
 
 
-def validate_context_records(records):
-    if len(records) != WORLD or [r.get("rank") for r in records] != list(range(WORLD)):
-        raise AssertionError("GIN context evidence must include all sixteen ranks")
+def validate_context_records(records, world_size=WORLD):
+    validate_world_size(world_size)
+    if len(records) != world_size or [r.get("rank") for r in records] != list(range(world_size)):
+        raise AssertionError("GIN context evidence must include all selected world ranks")
     for rank, record in enumerate(records):
         if (record["rank"], record["world_size"], record["lsa_rank"], record["lsa_size"]) != (
-                rank, WORLD, rank % 8, 8):
+                rank, world_size, rank % (world_size // 2), world_size // 2):
             raise AssertionError("actual GIN device communicator topology differs")
         if record["gin_type_string"] != "gdaki" or record["context_count"] != 9:
             raise AssertionError("actual GDAKI/context count differs")
@@ -217,8 +232,9 @@ def _retire_context(context, success):
 
 def _peer_memory_test(mode, torch, dist, allocation, handle, records):
     rank = dist.get_rank()
-    peers = expected_peers(rank, mode)
-    own = allocation[:WORLD * 8].view(torch.int64)
+    world_size = validate_world_size(dist.get_world_size())
+    peers = expected_peers(rank, mode, world_size)
+    own = allocation[:world_size * 8].view(torch.int64)
     offset = int(handle.offset)
     views = {}
     def prepare():
@@ -227,11 +243,11 @@ def _peer_memory_test(mode, torch, dist, allocation, handle, records):
         for peer in peers:
             # get_buffer's storage_offset is in requested dtype elements;
             # handle.offset is bytes. Check the resulting address before use.
-            view = handle.get_buffer(peer, (WORLD,), dtype=torch.int64,
+            view = handle.get_buffer(peer, (world_size,), dtype=torch.int64,
                                      storage_offset=offset // own.element_size())
             raw = int(handle.buffer_ptrs[peer])
             expected = raw + offset
-            if raw <= 0 or expected + WORLD * 8 > 1 << 64:
+            if raw <= 0 or expected + world_size * 8 > 1 << 64:
                 raise AssertionError("mapped sentinel address range must fit positive uint64 storage")
             if view.data_ptr() != expected:
                 raise AssertionError("get_buffer/offset semantics disagree with MegaMoE's pointer contract")
@@ -249,21 +265,21 @@ def _peer_memory_test(mode, torch, dist, allocation, handle, records):
     _phase(dist, "same_lsa_peer_writes", write)
     _phase(dist, "verify_peer_writes", lambda: _check_values(
         own.cpu().tolist(),
-        [sentinel(0, peer, rank, peer) if peer in peers else -1 for peer in range(WORLD)],
+        [sentinel(0, peer, rank, peer) if peer in peers else -1 for peer in range(world_size)],
         "peer-write"))
     def prepare_reads():
-        own.copy_(torch.tensor([sentinel(1, rank, rank, slot) for slot in range(WORLD)],
+        own.copy_(torch.tensor([sentinel(1, rank, rank, slot) for slot in range(world_size)],
                                dtype=torch.int64, device=own.device))
         torch.cuda.synchronize()
     _phase(dist, "publish_read_sentinels", prepare_reads)
     def read():
         for peer, view in views.items():
             _check_values(view.clone().cpu().tolist(),
-                          [sentinel(1, peer, peer, slot) for slot in range(WORLD)], "peer-read")
+                          [sentinel(1, peer, peer, slot) for slot in range(world_size)], "peer-read")
     _phase(dist, "same_lsa_peer_reads", read)
     cross_os = [peer for peer in peers if records[peer]["hostname"] != records[rank]["hostname"]]
     return {"status": "passed", "read_peers": peers, "write_peers": peers,
-            "cross_os_peers_tested": cross_os, "words_per_read": WORLD,
+            "cross_os_peers_tested": cross_os, "words_per_read": world_size,
             "original_self_pointer": int(own.data_ptr()),
             "mapped_self_pointer": int(views[rank].data_ptr()),
             "self_virtual_addresses_equal": views[rank].data_ptr() == own.data_ptr(),
@@ -276,7 +292,7 @@ def _peer_memory_test(mode, torch, dist, allocation, handle, records):
 
 
 def run_topology_probe(mode, *, torch, dist, deep_gemm=None,
-                       validate_gin_context=True, gin_payload_probe=None):
+                       validate_gin_context=True, gin_payload_probe=None, world_size=WORLD):
     """Reusable preflight on initialized WORLD, before benchmark allocations.
 
     Owns/releases a temporary registration and allocation, never destroys WORLD.
@@ -288,13 +304,15 @@ def run_topology_probe(mode, *, torch, dist, deep_gemm=None,
     import test_mega_moe_accuracy as accuracy
     import torch.distributed._symmetric_memory as symm_mem
     rank = dist.get_rank()
-    configuration = {"mode": mode, "validate_gin_context": bool(validate_gin_context),
+    configuration = {"mode": mode, "world_size": world_size,
+                     "validate_gin_context": bool(validate_gin_context),
                      "has_payload_callback": gin_payload_probe is not None}
     configurations = _gather(dist, configuration)
     if any(item != configuration for item in configurations):
         raise RuntimeError("topology probe configuration differs across ranks")
-    if mode not in ("gin", "native") or dist.get_world_size() != WORLD:
-        raise RuntimeError("topology probe requires mode gin/native and WORLD16")
+    validate_world_size(world_size)
+    if mode not in ("gin", "native") or dist.get_world_size() != world_size:
+        raise RuntimeError("topology probe requires mode gin/native and the selected WORLD")
     if gin_payload_probe is not None and (mode != "gin" or not validate_gin_context):
         raise ValueError("payload callback requires GIN mode with a validated context")
     manifest = _phase(dist, "source_manifest", source_manifest)
@@ -327,7 +345,7 @@ def run_topology_probe(mode, *, torch, dist, deep_gemm=None,
             "environment_not_proof": {key: os.getenv(key) for key in ENV_FIELDS},
         }
         records = _gather(dist, record)
-        topology = validate_records(records, mode)
+        topology = validate_records(records, mode, world_size)
         memory = _peer_memory_test(mode, torch, dist, allocation, handle, records)
         memory_records = _gather(dist, memory)
         contexts = None
@@ -347,14 +365,14 @@ def run_topology_probe(mode, *, torch, dist, deep_gemm=None,
             skip = (-allocation.data_ptr()) % WINDOW_ALIGNMENT
             gin_buffer = allocation[skip:skip + WINDOW_ALIGNMENT]
             context = deep_gemm._C.create_megamoe_gin_context(
-                gin_buffer, uid_list[0], rank, WORLD, context_count=9,
-                queue_depth=64, world_barrier_count=4, expected_lsa_size=8,
+                gin_buffer, uid_list[0], rank, world_size, context_count=9,
+                queue_depth=64, world_barrier_count=4, expected_lsa_size=world_size // 2,
                 required_gin_type="gdaki")
             context_record = {name: getattr(context, name) for name in (
                 "rank", "world_size", "lsa_rank", "lsa_size", "gin_type_string",
                 "context_count", "queue_depth", "signal_count", "connection_count")}
             contexts = _gather(dist, context_record)
-            validate_context_records(contexts)
+            validate_context_records(contexts, world_size)
         payload = {"status": "not_run", "actual_payload_checked": False,
                    "reason": "no standalone device PUT export; full MegaMoE accuracy smoke is required"}
         if gin_payload_probe is not None:
@@ -394,6 +412,7 @@ def run_topology_probe(mode, *, torch, dist, deep_gemm=None,
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", choices=("gin", "native"), required=True)
+    parser.add_argument("--world-size", type=int, choices=(8, 16), default=WORLD)
     parser.add_argument("--skip-gin-context", action="store_true",
                         help="explicit topology-only mode; no GIN context/payload claim")
     parser.add_argument("--output", type=Path)
@@ -402,7 +421,7 @@ def main():
     import torch
     import torch.distributed as dist
     if "LOCAL_RANK" not in os.environ:
-        raise RuntimeError("launch using four torchrun hosts, four ranks per host")
+        raise RuntimeError("launch using selected EP8/EP16 world, four ranks per host")
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     dist.init_process_group("nccl", init_method="env://",
                             timeout=timedelta(seconds=args.timeout_seconds))
@@ -412,7 +431,8 @@ def main():
         if args.mode == "gin" and not args.skip_gin_context:
             dg = _phase(dist, "import_deep_gemm", lambda: __import__("deep_gemm"))
         result = run_topology_probe(args.mode, torch=torch, dist=dist, deep_gemm=dg,
-                                    validate_gin_context=not args.skip_gin_context)
+                                    validate_gin_context=not args.skip_gin_context,
+                                    world_size=args.world_size)
     except Exception as exc:
         # Do not enter fresh teardown collectives after a failed distributed
         # probe. torchrun's bounded launcher owns timeout/peer termination.

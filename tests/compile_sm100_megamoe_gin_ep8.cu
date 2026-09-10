@@ -60,7 +60,7 @@ void instantiate_ep8_decode() {
         NumStages,
         3584,
         128, 128, NumEpilogueThreads,
-        148, 8,                      // GB200 SMs, actual EP8 world
+        152, 8,                      // validated GB200 SMs, actual EP8 world
         10.0f,
         false, !DG_EP8_COMPILE_NATIVE>;
     (void)kernel;

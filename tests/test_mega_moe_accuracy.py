@@ -452,12 +452,13 @@ def _build_bulk_transition_route_tensors(
     turning the transition check into a behavioral proof of uniform exact-r75
     fallback rather than relying only on the launch's requested token count.
     """
-    if len(hostnames) != 16 or num_topk != 16 or experts_per_rank < num_topk:
+    world_size = len(hostnames)
+    if world_size not in (8, 16) or num_topk != 16 or experts_per_rank < num_topk:
         raise ValueError(
-            "fast-path transition routes require EP16, top-k 16, and at least "
+            "fast-path transition routes require EP8/EP16, top-k 16, and at least "
             "16 experts per rank"
         )
-    owner = (rank + 8) % 16
+    owner = (rank + world_size // 2) % world_size
     if hostnames[owner] == hostnames[rank]:
         raise ValueError(
             "fast-path transition paired owner must be on the other host"
@@ -585,10 +586,15 @@ def _finalize_matched_route_evidence(
     cross-checked as consistency evidence, not treated as an independent input.
     """
     world_size = len(hostnames)
-    if world_size != 16 or len(records) != world_size:
+    if world_size not in (8, 16) or len(records) != world_size:
         raise AssertionError(
-            "matched route evidence requires one record from every EP16 rank"
+            "matched route evidence requires one record from every EP8/EP16 rank"
         )
+    lsa_size = world_size // 2
+    if (hostnames[0] == hostnames[lsa_size]
+            or any(value != hostnames[0] for value in hostnames[:lsa_size])
+            or any(value != hostnames[lsa_size] for value in hostnames[lsa_size:])):
+        raise AssertionError("matched route evidence requires two equal contiguous route domains")
     runtime_block_ms = [int(record["runtime_block_m"]) for record in records]
     if len(set(runtime_block_ms)) != 1:
         raise AssertionError(
@@ -613,12 +619,12 @@ def _finalize_matched_route_evidence(
         "all_remote": routes_per_source,
     }
     expected_fanout = {
-        "all_same_host": (7, 0),
-        "half_remote": (7, 7),
-        "all_remote": (0, 7),
+        "all_same_host": (lsa_size - 1, 0),
+        "half_remote": (lsa_size - 1, lsa_size - 1),
+        "all_remote": (0, lsa_size - 1),
     }
     ordered_records = sorted(records, key=lambda record: int(record["rank"]))
-    if [int(record["rank"]) for record in ordered_records] != list(range(16)):
+    if [int(record["rank"]) for record in ordered_records] != list(range(world_size)):
         raise AssertionError("matched route evidence has missing/duplicate ranks")
 
     route_evidence: Dict[str, Any] = {}
@@ -2559,7 +2565,17 @@ def _benchmark_local_ablation_graphs(
     }
 
 
-def _validate_args(args: argparse.Namespace, world_size: int) -> None:
+def _validate_args(args: argparse.Namespace, world_size: int, *,
+                   gb200_world_size: Optional[int] = None) -> None:
+    # Only the explicit, collectively prepared GB200 entry supplies this.
+    # Normal accuracy/Novita invocations retain the original EP16 GIN gate.
+    if gb200_world_size is not None and (
+        type(gb200_world_size) is not int or gb200_world_size not in (8, 16)
+        or world_size != gb200_world_size
+    ):
+        raise ValueError("GB200 profile world size must match actual EP8 or EP16")
+    gin_world_size = 16 if gb200_world_size is None else gb200_world_size
+    gin_num_experts = gin_world_size * 56
     if world_size < 2:
         raise ValueError("MegaMoE owner-transport accuracy requires at least two ranks")
     if args.num_experts % world_size != 0:
@@ -2629,9 +2645,9 @@ def _validate_args(args: argparse.Namespace, world_size: int) -> None:
                 args.hidden,
                 args.intermediate_hidden,
                 args.num_shared_experts,
-            ) != (896, 16, 3584, 3072, 0):
+            ) != (gin_num_experts, 16, 3584, 3072, 0):
                 raise ValueError(
-                    "matched benchmarking requires E896/topk16/H3584/I3072/"
+                    f"matched benchmarking requires E{gin_num_experts}/topk16/H3584/I3072/"
                     "no-shared"
                 )
             if args.num_tokens not in MATCHED_BENCHMARK_TOKEN_COUNTS:
@@ -2644,9 +2660,10 @@ def _validate_args(args: argparse.Namespace, world_size: int) -> None:
                 "--require-gin currently requires --mma-type=fp8xfp4; the BF16 "
                 "MegaMoE launch has not been wired to the GIN transport"
             )
-        if world_size != 16:
+        if world_size != gin_world_size:
             raise ValueError(
-                f"--require-gin currently requires exactly 16 ranks (2x8), got {world_size}"
+                f"--require-gin currently requires exactly {gin_world_size} ranks "
+                f"(2x{gin_world_size // 2}), got {world_size}"
             )
         if args.gin_completion_batch not in (1, 2, 4, 8):
             raise ValueError(
@@ -2714,10 +2731,10 @@ def _validate_args(args: argparse.Namespace, world_size: int) -> None:
             args.intermediate_hidden,
             args.num_shared_experts,
             args.gin_outbox_depth,
-        ) != (896, 16, 3584, 3072, 0, 64):
+        ) != (gin_num_experts, 16, 3584, 3072, 0, 64):
             raise ValueError(
                 "--gin-bulk-combine requires "
-                "E896/topk16/H3584/I3072/no-shared/outbox64")
+                f"E{gin_num_experts}/topk16/H3584/I3072/no-shared/outbox64")
     if args.gin_direct_dispatch:
         if not args.require_gin or not args.gin_active_fast_path:
             raise ValueError(
@@ -2734,10 +2751,10 @@ def _validate_args(args: argparse.Namespace, world_size: int) -> None:
             args.hidden,
             args.intermediate_hidden,
             args.num_shared_experts,
-        ) != (16, 896, 16, 3584, 3072, 0):
+        ) != (gin_world_size, gin_num_experts, 16, 3584, 3072, 0):
             raise ValueError(
                 "--gin-direct-dispatch requires "
-                "EP16/E896/topk16/H3584/I3072/no-shared")
+                f"EP{gin_world_size}/E{gin_num_experts}/topk16/H3584/I3072/no-shared")
         if args.num_max_tokens_per_rank < 384:
             raise ValueError(
                 "--gin-direct-dispatch requires "
@@ -2951,12 +2968,13 @@ def _gin_transport_evidence(
             "--require-gin requires a live context with launch_descriptor_snapshot()"
         )
     snapshot = dict(snapshot_fn())
+    lsa_size = topology.lsa_size if topology is not None else 8
     expected = {
         "enabled": True,
         "rank": rank,
         "world_size": world_size,
-        "lsa_rank": rank % 8,
-        "lsa_size": 8,
+        "lsa_rank": rank % lsa_size,
+        "lsa_size": lsa_size,
         "context_count": 9,
         "requested_context_count": 9,
         "requested_signal_count": 2,
@@ -3165,7 +3183,8 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace,
             _configure_symmetric_memory_backend(args, torch, dist, force_nccl=True)
         )
         rank, world_size = dist.get_rank(), dist.get_world_size()
-        _validate_args(args, world_size)
+        _validate_args(args, world_size,
+                       **({"gb200_world_size": topology.world_size} if topology is not None else {}))
         hostnames = _all_hostnames(dist) if physical_hostnames is None else physical_hostnames
         if args.require_cross_host and len(set(hostnames)) < 2:
             raise RuntimeError(
@@ -3196,8 +3215,8 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace,
         )
         is_matched_benchmark_shape = (
             (args.require_gin or topology is not None)
-            and world_size == 16
-            and args.num_experts == 896
+            and (world_size == 16 or (topology is not None and world_size == 8))
+            and args.num_experts == world_size * 56
             and args.num_topk == 16
             and args.hidden == 3584
             and args.intermediate_hidden == 3072

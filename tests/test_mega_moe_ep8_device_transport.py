@@ -24,7 +24,7 @@ class Ep8DeviceTransportContract(unittest.TestCase):
         ep8 = (ROOT / "tests/compile_sm100_megamoe_gin_ep8.cu").read_text()
         self.assertIn("#if !DG_EP8_COMPILE_NATIVE", ep8)
         self.assertIn("448, 0, 16,", ep8)
-        self.assertIn("148, 8,", ep8)
+        self.assertIn("152, 8,", ep8)
         self.assertIn("false, !DG_EP8_COMPILE_NATIVE", ep8)
         for profile in ("<16, 256, 8, 5>", "<32, 128, 16, 10>",
                         "<64, 128, 32, 9, 128>"):

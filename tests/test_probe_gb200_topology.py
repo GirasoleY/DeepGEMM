@@ -22,36 +22,53 @@ def records(mode="gin"):
 
 
 class ProbeContracts(unittest.TestCase):
-    def peer_fixture(self, *, offset=0, bad_pointer=False, bad_bytes=False):
+    def peer_fixture(self, *, offset=0, bad_pointer=False, bad_bytes=False,
+                     world_size=16, mode="native"):
         """CPU call-path mock, not a device alias/coherence simulation."""
         own = mock.MagicMock()
         own.element_size.return_value = 8
         own.data_ptr.return_value = 0x900000
         own.device = "cuda:0"
-        own.cpu().tolist.return_value = [probe.sentinel(0, peer, 0, peer) for peer in range(16)]
+        peers = probe.expected_peers(0, mode, world_size)
+        own.cpu().tolist.return_value = [probe.sentinel(0, peer, 0, peer) if peer in peers else -1
+                                         for peer in range(world_size)]
         if bad_bytes:
-            own.cpu().tolist.return_value = [-1] * 16
+            own.cpu().tolist.return_value = [-1] * world_size
         allocation = mock.MagicMock()
         allocation.__getitem__.return_value.view.return_value = own
-        raw = [0x1000 * (peer + 1) for peer in range(16)]
+        raw = [0x1000 * (peer + 1) if peer in peers else 0 for peer in range(world_size)]
         def get_buffer(peer, shape, *, dtype, storage_offset):
-            self.assertEqual(shape, (16,))
+            self.assertEqual(shape, (world_size,))
             self.assertEqual(dtype, "int64")
             self.assertEqual(storage_offset, offset // 8)
             view = mock.MagicMock()
             view.data_ptr.return_value = raw[peer] + offset + (8 if bad_pointer else 0)
             view.clone().cpu().tolist.return_value = [probe.sentinel(1, peer, peer, slot)
-                                                      for slot in range(16)]
+                                                      for slot in range(world_size)]
             return view
         handle = SimpleNamespace(buffer_ptrs=raw, offset=offset,
                                  get_buffer=mock.Mock(side_effect=get_buffer))
         def gather(output, item):
-            output[:] = [item] * 16
-        dist = SimpleNamespace(get_rank=lambda: 0, get_world_size=lambda: 16,
+            output[:] = [item] * world_size
+        dist = SimpleNamespace(get_rank=lambda: 0, get_world_size=lambda: world_size,
                                all_gather_object=mock.Mock(side_effect=gather))
         torch = SimpleNamespace(int64="int64", tensor=mock.Mock(),
                                 cuda=SimpleNamespace(synchronize=mock.Mock()))
         return own, allocation, handle, dist, torch
+
+    def test_ep8_sentinel_uses_eight_slots_and_only_actual_lsa_views(self):
+        records8 = [{"hostname": "host" + str(rank // 4)} for rank in range(8)]
+        for mode in ("gin", "native"):
+            for offset in (0, 256):
+                own, allocation, handle, dist, torch = self.peer_fixture(
+                    world_size=8, mode=mode, offset=offset)
+                value = probe._peer_memory_test(mode, torch, dist, allocation, handle, records8)
+                self.assertEqual(value["words_per_read"], 8)
+                self.assertEqual(value["write_peers"], list(range(4 if mode == "gin" else 8)))
+                self.assertEqual(value["cross_os_peers_tested"], [] if mode == "gin" else list(range(4, 8)))
+                self.assertTrue(value["original_to_mapped_and_mapped_to_original_checked"])
+                self.assertEqual(value["get_buffer_storage_offset_elements"], offset // 8)
+                allocation.__getitem__.assert_called_once_with(slice(None, 64, None))
 
     def test_distinct_self_mapping_keeps_original_as_bidirectional_sentinel_target(self):
         for offset in (0, 256):
@@ -204,7 +221,8 @@ class ProbeContracts(unittest.TestCase):
         self.assertIn('"gin_payload_test": False', source)
         self.assertIn('"environment_not_proof"', source)
         self.assertIn('SimpleNamespace(require_gin=True)', source)
-        self.assertIn('handle.get_buffer(peer, (WORLD,), dtype=torch.int64,', source)
+        self.assertIn('handle.get_buffer(peer, (world_size,), dtype=torch.int64,', source)
+        self.assertIn('world_size = validate_world_size(dist.get_world_size())', source)
         self.assertIn('storage_offset=offset // own.element_size()', source)
         self.assertIn('view[rank:rank + 1].fill_', source)
         self.assertIn('view.clone().cpu().tolist()', source)

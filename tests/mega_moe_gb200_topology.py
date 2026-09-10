@@ -1,41 +1,46 @@
-"""Explicit GB200 harness policy: actual 4x4 hosts, logical 2x8 routes.
+"""Explicit GB200 policy: default EP16/4x4 hosts, opt-in EP8/2x4 hosts.
 
 No device/kernel change. Native mode is admitted only after actual NCCL LSA16
 and adjusted peer aliases plus a GPU sentinel on the REAL work allocation.
 Both gin_ib and gin_roce require actual LSA2x8/GDAKI, not an environment label.
+EP8 instead requires LSA2x4/GDAKI or native LSA8 with all eight aliases.
 The mode does not prove InfiniBand versus RoCE NIC payloads. Legacy Novita
 host placement checks are untouched. Imports are CPU-only until hook execution.
 """
 
 from copy import deepcopy
+from probe_gb200_topology import validate_world_size
 
 
 WORLD = 16
 MODES = {"gin_ib": "gin", "gin_roce": "gin", "native_nvl": "native"}
 
 
-def validate_physical_hostnames(hostnames):
+def validate_physical_hostnames(hostnames, world_size=WORLD):
+    validate_world_size(world_size)
     hosts = tuple(hostnames)
-    if len(hosts) != WORLD or any(type(host) is not str or not host for host in hosts):
-        raise ValueError("GB200 requires sixteen nonempty actual hostname strings")
-    if len(set(hosts)) != 4 or any(len(set(hosts[start:start + 4])) != 1
-                                 for start in range(0, WORLD, 4)):
-        raise ValueError("GB200 requires four real contiguous four-rank hosts")
+    if len(hosts) != world_size or any(type(host) is not str or not host for host in hosts):
+        raise ValueError("GB200 requires one nonempty actual hostname per selected rank")
+    if len(set(hosts)) != world_size // 4 or any(len(set(hosts[start:start + 4])) != 1
+                                              for start in range(0, world_size, 4)):
+        raise ValueError("GB200 requires real contiguous four-rank hosts")
     return hosts
 
 
-def logical_route_domains(hostnames):
+def logical_route_domains(hostnames, world_size=WORLD):
     """Rank group IDs, deliberately not fabricated hostnames."""
-    validate_physical_hostnames(hostnames)
-    return tuple(rank // 8 for rank in range(WORLD))
+    validate_physical_hostnames(hostnames, world_size)
+    return tuple(rank // (world_size // 2) for rank in range(world_size))
 
 
-def validate_adjusted_aliases(raw, adjusted, offset, tensor_pointer, rank, mode, *, num_bytes=1):
+def validate_adjusted_aliases(raw, adjusted, offset, tensor_pointer, rank, mode, *,
+                              num_bytes=1, world_size=WORLD):
     """Validate mapped addresses; physical self aliasing requires the GPU sentinel."""
-    if mode not in MODES or type(rank) is not int or not 0 <= rank < WORLD:
+    validate_world_size(world_size)
+    if mode not in MODES or type(rank) is not int or not 0 <= rank < world_size:
         raise ValueError("unsupported mode or rank")
-    if len(raw) != WORLD or len(adjusted) != WORLD:
-        raise AssertionError("sixteen raw and adjusted buffer aliases required")
+    if len(raw) != world_size or len(adjusted) != world_size:
+        raise AssertionError("one raw and adjusted buffer alias per selected rank required")
     if any(type(value) is not int or not 0 <= value < 1 << 64
            for value in (*raw, *adjusted, offset)):
         raise AssertionError("buffer pointers/offset must be nonnegative integers")
@@ -44,7 +49,7 @@ def validate_adjusted_aliases(raw, adjusted, offset, tensor_pointer, rank, mode,
             any(value + num_bytes > 1 << 64
                 for value in (*adjusted, tensor_pointer) if value)):
         raise AssertionError("work-buffer address range must fit positive uint64 storage")
-    width = 8 if MODES[mode] == "gin" else WORLD
+    width = world_size // 2 if MODES[mode] == "gin" else world_size
     expected = list(range(rank // width * width, (rank // width + 1) * width))
     observed = [peer for peer, value in enumerate(adjusted) if value]
     if observed != expected or [peer for peer, value in enumerate(raw) if value] != expected:
@@ -63,10 +68,12 @@ def _buffer_alias_identity(buffer):
 
 
 class GB200Topology:
-    def __init__(self, mode, run_configuration=None):
+    def __init__(self, mode, run_configuration=None, *, world_size=WORLD):
         if mode not in MODES:
             raise ValueError("GB200 mode must be gin_ib, gin_roce or native_nvl")
         self.mode = mode
+        self.world_size = validate_world_size(world_size)
+        self.lsa_size = self.world_size // 2 if MODES[mode] == "gin" else self.world_size
         self.run_configuration = deepcopy(run_configuration)
         self.physical_hostnames = None
         self.logical_route_domains = None
@@ -79,22 +86,23 @@ class GB200Topology:
         from probe_gb200_topology import _phase, _gather
 
         def local_record():
-            hosts = validate_physical_hostnames(hostnames)
+            hosts = validate_physical_hostnames(hostnames, self.world_size)
             rank = dist.get_rank()
-            if dist.get_world_size() != WORLD or local_world_size != 4 or local_rank != rank % 4:
-                raise ValueError("GB200 baseline requires WORLD16 / four torchrun workers per real host")
+            if dist.get_world_size() != self.world_size or local_world_size != 4 or local_rank != rank % 4:
+                raise ValueError("GB200 requires the selected WORLD / four torchrun workers per real host")
             if torch.cuda.current_device() != local_rank:
                 raise ValueError("CUDA device does not match local rank")
             if bool(args.require_gin) != (MODES[self.mode] == "gin"):
                 raise ValueError("explicit GB200 mode and require_gin disagree")
             shape = (args.num_experts, args.num_topk, args.hidden, args.intermediate_hidden,
                      args.num_max_tokens_per_rank, args.num_shared_experts, args.mma_type)
-            if shape != (896, 16, 3584, 3072, 384, 0, "fp8xfp4") or args.num_tokens not in (32, 40, 48):
+            if shape != (56 * self.world_size, 16, 3584, 3072, 384, 0, "fp8xfp4") or args.num_tokens not in (32, 40, 48):
                 raise ValueError("GB200 baseline is scoped to exact matched K3 decode shapes/capacity")
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
             if "GB200" not in props.name or torch.cuda.get_device_capability()[0] != 10:
                 raise ValueError("actual device is not an SM100-family GB200")
-            return {"mode": self.mode, "physical_hostnames": list(hosts),
+            return {"mode": self.mode, "world_size": self.world_size,
+                    "physical_hostnames": list(hosts),
                     "tokens": args.num_tokens, "shape": shape,
                     "run_configuration": self.run_configuration}
 
@@ -102,8 +110,8 @@ class GB200Topology:
         configurations = _gather(dist, configuration)
         if any(item != configuration for item in configurations):
             raise RuntimeError("GB200 mode, shape, source or run configuration differs across ranks")
-        self.physical_hostnames = validate_physical_hostnames(hostnames)
-        self.logical_route_domains = logical_route_domains(hostnames)
+        self.physical_hostnames = validate_physical_hostnames(hostnames, self.world_size)
+        self.logical_route_domains = logical_route_domains(hostnames, self.world_size)
         self._local_rank, self._local_world_size = local_rank, local_world_size
 
     def require_prepared(self, hostnames):
@@ -114,7 +122,7 @@ class GB200Topology:
         from probe_gb200_topology import expected_peers
         if self.evidence is None:
             raise RuntimeError("actual GB200 LSA membership is not validated")
-        return expected_peers(rank, MODES[self.mode])
+        return expected_peers(rank, MODES[self.mode], self.world_size)
 
     def validate_buffer(self, buffer, args, backend, registration, torch, dist):
         from probe_gb200_topology import (
@@ -137,7 +145,8 @@ class GB200Topology:
             offset = int(buffer.handle.offset)
             aliases = validate_adjusted_aliases(raw, adjusted, offset,
                                                int(buffer.buffer.data_ptr()), rank, self.mode,
-                                               num_bytes=int(buffer.buffer.numel()))
+                                               num_bytes=int(buffer.buffer.numel()),
+                                               world_size=self.world_size)
             if buffer.buffer.dtype not in (torch.int8, torch.uint8) or buffer.buffer.ndim != 1 or buffer.buffer.numel() < 128:
                 raise AssertionError("sentinel requires a flat byte work allocation of at least128 bytes")
             props = torch.cuda.get_device_properties(torch.cuda.current_device())
@@ -154,14 +163,14 @@ class GB200Topology:
                     "buffer_bytes": int(buffer.buffer.numel())}
         records = _gather(dist, _phase(dist, "gb200_real_buffer_properties", record))
         mapped_identity = _buffer_alias_identity(buffer)
-        actual_topology = validate_records(records, MODES[self.mode])
+        actual_topology = validate_records(records, MODES[self.mode], self.world_size)
         contexts = None
         if MODES[self.mode] == "gin":
             contexts = _gather(dist, _phase(dist, "gb200_real_gin_context", lambda: {
                 name: getattr(buffer.gin_context, name) for name in (
                     "rank", "world_size", "lsa_rank", "lsa_size", "gin_type_string",
                     "context_count", "queue_depth", "signal_count", "connection_count")}))
-            validate_context_records(contexts)
+            validate_context_records(contexts, self.world_size)
 
         def save():
             original = buffer.buffer[:128].clone()
@@ -207,7 +216,7 @@ class GB200Topology:
             "status": "passed", "mode": self.mode,
             "physical_hostnames": list(self.physical_hostnames),
             "logical_route_domains": list(self.logical_route_domains),
-            "route_domain_meaning": "explicit rank0..7/rank8..15 groups; not physical OS hostnames",
+            "route_domain_meaning": "explicit equal contiguous half-world rank groups; not physical OS hostnames",
             "legacy_cross_host_route_fields_mean": "logical route-domain predicates in this entrypoint",
             "actual_topology": actual_topology, "ranks": records,
             "actual_gin_contexts": contexts, "peer_memory_sentinels": memory_records,

@@ -447,7 +447,7 @@ class SourceAndLifecycleContracts(unittest.TestCase):
             with patch.object(sys, "argv", ["run", "--mode", "native_nvl", "--decode-mns", "8",
                                             "--output", "never-written.json"]), patch.dict(
                     os.environ, {"LOCAL_RANK": "0", "WORLD_SIZE": world, "LOCAL_WORLD_SIZE": local}), self.assertRaisesRegex(
-                    RuntimeError, "four-host"):
+                    RuntimeError, "selected EP8/EP16 world"):
                 runner.main()
 
 
