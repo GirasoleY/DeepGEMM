@@ -109,6 +109,37 @@ class EP8PublicContract(unittest.TestCase):
             value.enable_gin()
         value._collective_get_gin_unique_id.assert_not_called()
 
+    def test_strongva_terminal_is_collective_and_requires_overlap_stack(self):
+        strongva = 'DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL'
+        value = self.buffer(8)
+        os.environ[strongva] = '1'
+        with self.assertRaisesRegex(RuntimeError, "collective configuration rejected"):
+            value.enable_gin()
+        value._collective_get_gin_unique_id.assert_not_called()
+
+        flags = {
+            strongva: '1',
+            'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '1',
+            'DG_MEGAMOE_GIN_DISPATCH_OVERLAP': '1',
+            'DG_MEGAMOE_GIN_COMBINE_OVERLAP': '1',
+            'DG_MEGAMOE_GIN_PRECONSENSUS_PACK': '1',
+            'DG_MEGAMOE_GIN_COOP_DIRECT_PACK': '1',
+        }
+        os.environ.update(flags)
+        value = self.buffer(8)
+        with self.assertRaises(ReachedUID):
+            value.enable_gin()
+        self.assertEqual(self.configs[-1]['strongva_combine_terminal'], '1')
+
+        def skew(output, local):
+            if isinstance(local, dict):
+                output[-1]['strongva_combine_terminal'] = '0'
+        self.gather_hook = skew
+        value = self.buffer(8)
+        with self.assertRaisesRegex(RuntimeError, "configuration mismatch"):
+            value.enable_gin()
+        value._collective_get_gin_unique_id.assert_not_called()
+
     def test_ep8_rejects_wrong_expert_count_and_insufficient_contexts(self):
         for changes in ({"num_experts": 896}, {"context_count": 8}):
             value = self.buffer(8)
@@ -299,6 +330,7 @@ int main() {
     static_assert(kMegaMoeGinDirectReduceOrdinalBytes == 3072);
     static_assert(kMegaMoeGinBulkCombineRecordAlignment == 128);
     static_assert(kMegaMoeGinBulkCombineRecordAreaOffset == 128);
+    static_assert(kMegaMoeGinCombineTerminalSignalStride == 128);
     const uint64_t record_data_bytes=16+3584*2;
     const uint64_t record_bytes=7296;
     const uint64_t packet_bytes=128+768*record_bytes;
@@ -326,6 +358,8 @@ int main() {
             assert(w.combine_outbox_alignment_padding_buffer.get_num_bytes()==0);
             assert(w.bulk_combine_packet_tail_buffer.get_num_bytes()==0);
             assert(w.bulk_combine_return_index_buffer.get_num_bytes()==0);
+            assert(w.combine_terminal_signal_buffer.get_num_bytes()==0);
+            assert(w.get_end_ptr()==w.bulk_combine_return_index_buffer.get_end_ptr());
             continue;
         }
         const uint64_t reserved=std::max(outbox,packets);
@@ -351,6 +385,23 @@ int main() {
             assert(legacy_reserved==reserved);
             assert(w.bulk_combine_packet_tail_buffer.get_num_bytes()==0);
             assert(w.bulk_combine_return_index_buffer.get_num_bytes()==239616);
+        }
+        auto* return_index_end=static_cast<uint8_t*>(
+            w.bulk_combine_return_index_buffer.get_end_ptr());
+        auto* signal_base=static_cast<uint8_t*>(
+            w.combine_terminal_signal_buffer.base);
+        const uint64_t signal_bytes=uint64_t(world/2)*128;
+        assert(signal_base==return_index_end);
+        assert(reinterpret_cast<uintptr_t>(signal_base)%128==0);
+        assert(w.combine_terminal_signal_buffer.get_num_bytes()==signal_bytes);
+        assert(w.get_end_ptr()==signal_base+signal_bytes);
+        assert(w.get_num_bytes()==uint64_t(signal_base+signal_bytes-storage_base));
+        for (uint32_t owner=0;owner<world/2;++owner) {
+            auto* signal=reinterpret_cast<uint8_t*>(
+                w.get_combine_terminal_signal_ptr(owner));
+            assert(signal==signal_base+uint64_t(owner)*128);
+            assert(reinterpret_cast<uintptr_t>(signal)%128==0);
+            assert(signal+sizeof(uint64_t)<=signal_base+signal_bytes);
         }
         for (uint32_t peer=0;peer<world/2;++peer) for (bool send : {false,true}) {
             auto* packet=static_cast<uint8_t*>(w.get_bulk_combine_packet_ptr(send,peer));
@@ -452,6 +503,16 @@ int main() {
                 (world==8 ? expected_padding : 1378048+expected_padding));
             assert(sizing.gin_workspace.bulk_combine_packet_tail_buffer
                        .get_num_bytes()==reserved-outbox_bytes);
+            const uint64_t signal_bytes=uint64_t(world/2)*128;
+            assert(sizing.gin_workspace.combine_terminal_signal_buffer
+                       .get_num_bytes()==signal_bytes);
+            assert(address(sizing.gin_workspace
+                       .combine_terminal_signal_buffer.base)==
+                   address(sizing.gin_workspace
+                       .bulk_combine_return_index_buffer.get_end_ptr()));
+            assert(address(sizing.gin_workspace.get_end_ptr())==
+                   address(sizing.gin_workspace
+                       .combine_terminal_signal_buffer.base)+signal_bytes);
 
             for (uint64_t allocator_base : allocator_bases) {
                 // Both bases satisfy the public 4096-byte GIN window check;
@@ -469,6 +530,21 @@ int main() {
                 assert(concrete.gin_workspace
                            .combine_outbox_alignment_padding_buffer
                            .get_num_bytes()==expected_padding);
+                assert(concrete.gin_workspace.combine_terminal_signal_buffer
+                           .get_num_bytes()==signal_bytes);
+                const auto signal_base=address(concrete.gin_workspace
+                    .combine_terminal_signal_buffer.base);
+                assert(signal_base==address(concrete.gin_workspace
+                    .bulk_combine_return_index_buffer.get_end_ptr()));
+                assert(signal_base%128==0);
+                assert(address(concrete.gin_workspace.get_end_ptr())==
+                       signal_base+signal_bytes);
+                for (uint32_t owner=0;owner<world/2;++owner) {
+                    const auto signal=address(concrete.gin_workspace
+                        .get_combine_terminal_signal_ptr(owner));
+                    assert(signal==signal_base+uint64_t(owner)*128);
+                    assert(signal%128==0);
+                }
                 for (uint32_t peer=0;peer<world/2;++peer) {
                     for (bool send : {false,true}) {
                         const auto packet=address(concrete.gin_workspace
@@ -491,6 +567,8 @@ int main() {
             assert(legacy_layout.gin_workspace
                        .combine_outbox_alignment_padding_buffer
                        .get_num_bytes()==0);
+            assert(legacy_layout.gin_workspace
+                       .combine_terminal_signal_buffer.get_num_bytes()==0);
            }
           }
         }

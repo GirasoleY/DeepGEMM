@@ -916,30 +916,50 @@ def dispatch_candidate_metadata(flags):
     combine_enabled = combine_raw == "1"
     if combine_enabled and (not enabled or flags.get("DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT") != "1"):
         raise ValueError("combine overlap metadata requires dispatch overlap1 and single context1")
+    strongva_raw = flags.get(
+        "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL", "0")
+    if strongva_raw not in ("0", "1"):
+        raise ValueError("StrongVA combine-terminal metadata requires a canonical0/1 flag")
+    strongva_enabled = strongva_raw == "1"
+    if strongva_enabled and not combine_enabled:
+        raise ValueError("StrongVA combine terminal requires combine overlap1")
     return {
-        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_direct_reduce_preload_late_flush" if combine_enabled else
+        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_direct_reduce_strongva_terminal" if strongva_enabled else
+                             "direct_control_first_dispatch_ready_coalesced_direct_reduce_preload_late_flush" if combine_enabled else
                              "direct_control_first_dispatch" if enabled else
                              "clean_single_combine_context_only"),
         "combine_overlap_contract": {
             "requested_raw": combine_raw, "requested": combine_enabled,
+            "strongva_terminal_requested_raw": strongva_raw,
+            "strongva_terminal_requested": strongva_enabled,
             "readiness_unit": "complete expert output, using actual expert assignment counts",
             "producer_target": "ceil(actual expert assignments / actual BM) * (H / BN)",
-            "combine_schedule": "peer_parallel_ready_coalesced_spans_then_late_header",
+            "combine_schedule": (
+                "peer_parallel_ready_coalesced_spans_with_final_strongva_terminal"
+                if strongva_enabled else
+                "peer_parallel_ready_coalesced_spans_then_late_header"
+            ),
             "ready_selection_policy": "warp_parallel_readiness_peer_independent_bounded_ready_coalescing",
             "early_payload_policy": "each peer independently selects at most eight already-ready adjacent expert spans; never waits for future readiness",
             "readiness_tracking": "common monotonic discovered-ready experts; independent per-peer pending-ready selection",
             "submission_granularity": "one nonaggregate PUT per bounded contiguous ready batch; fixed cap8",
             "combine_payload_local_completion": {
                 "requested_by_combine_overlap": combine_enabled,
-                "eligibility": "early_record_combine_path_and_scratch_alias_fits",
-                "completion": "late_header_same_context_peer",
+                "eligibility": (
+                    "world_uniform_bulk_direct_remote_after_host_scratch_preflight"
+                    if strongva_enabled else
+                    "early_record_combine_path_and_scratch_alias_fits"
+                ),
+                "completion": ("post_terminal_same_context_peer_flush"
+                               if strongva_enabled else
+                               "late_header_same_context_peer"),
                 "payload_only_flush_before_handoff": False,
                 "all_input_flushes_retained": True,
-                "late_header_put_and_flush_retained": True,
+                "late_header_put_and_flush_retained": not strongva_enabled,
                 "original_handoff_and_grid_order_retained": True,
-                "final_world_put_barrier_retained": True,
-                "source_storage_retained_until_late_header_flush": True,
-                "header_flush_does_not_prove_remote_visibility": True,
+                "final_world_put_barrier_retained": not strongva_enabled,
+                "source_storage_retained_until_late_header_flush": not strongva_enabled,
+                "header_flush_does_not_prove_remote_visibility": not strongva_enabled,
                 "fallback": "unchanged_full_packet_local_flush",
                 "slot101_writer_present": False,
                 "policy_not_device_observation": True,
@@ -1021,6 +1041,7 @@ def main():
             "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT",
             "DG_MEGAMOE_GIN_DISPATCH_OVERLAP",
             "DG_MEGAMOE_GIN_COMBINE_OVERLAP",
+            "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL",
         )}
         rank_flags = [None] * dist.get_world_size()
         dist.all_gather_object(rank_flags, flags)

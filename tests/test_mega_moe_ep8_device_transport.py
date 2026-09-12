@@ -30,6 +30,8 @@ class Ep8DeviceTransportContract(unittest.TestCase):
                         "<64, 128, 32, 9, 128>"):
             self.assertIn("instantiate_ep8_decode" + profile, ep8)
         self.assertIn("#ifndef DG_MEGAMOE_GIN_COMBINE_OVERLAP", ep8)
+        self.assertIn(
+            "#ifndef DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL", ep8)
         original = (ROOT / "tests/compile_sm100_megamoe_gin.cu").read_text()
         self.assertIn("896, 0, 16,", original)
         self.assertIn("148, 16,", original)
@@ -59,7 +61,10 @@ class Ep8DeviceTransportContract(unittest.TestCase):
     def test_all_lsa_barriers_use_actual_team_width(self):
         source = KERNEL.read_text()
         calls = re.findall(r"comm::nvlink_lsa_barrier<\s*([^>]+)>", source)
-        self.assertEqual(len(calls), 9)
+        # The default-off StrongVA specialization moves the existing combine
+        # LSA rendezvous ahead of its per-owner signal waits. Both compile-time
+        # branches remain in source, although exactly one executes.
+        self.assertEqual(len(calls), 10)
         for call in calls:
             self.assertTrue(call.startswith("kNumRanks, kGinPeerCount,"), call)
 

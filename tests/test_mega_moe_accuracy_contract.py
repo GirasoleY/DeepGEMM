@@ -831,6 +831,7 @@ class TestMegaMoeAccuracyGinContract(unittest.TestCase):
                 accuracy.GIN_SINGLE_COMBINE_CONTEXT_ENV: False,
                 accuracy.GIN_DISPATCH_OVERLAP_ENV: False,
                 accuracy.GIN_COMBINE_OVERLAP_ENV: False,
+                accuracy.GIN_STRONGVA_COMBINE_TERMINAL_ENV: False,
             },
         )
         self.assertEqual(evidence["registered_buffer_bytes"], 4096)

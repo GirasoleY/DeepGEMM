@@ -105,6 +105,41 @@ class ComparisonContractTest(unittest.TestCase):
         self.assertLess(source.index('"DG_MEGAMOE_GIN_COMBINE_OVERLAP"'),
                         source.index("dist.all_gather_object(rank_flags, flags)"))
 
+    def test_strongva_terminal_metadata_is_explicit_and_default_off(self):
+        flags = {
+            "DG_MEGAMOE_GIN_DISPATCH_OVERLAP": "1",
+            "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
+            "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1",
+            "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL": "1",
+        }
+        metadata = comparison.dispatch_candidate_metadata(flags)
+        self.assertIn("strongva_terminal", metadata["candidate_family"])
+        contract = metadata["combine_overlap_contract"]
+        self.assertTrue(contract["strongva_terminal_requested"])
+        self.assertIn("final_strongva_terminal", contract["combine_schedule"])
+        completion = contract["combine_payload_local_completion"]
+        self.assertEqual(
+            completion["eligibility"],
+            "world_uniform_bulk_direct_remote_after_host_scratch_preflight",
+        )
+        self.assertEqual(
+            completion["completion"],
+            "post_terminal_same_context_peer_flush",
+        )
+        self.assertFalse(completion["late_header_put_and_flush_retained"])
+        self.assertFalse(completion["final_world_put_barrier_retained"])
+        self.assertFalse(
+            completion["source_storage_retained_until_late_header_flush"])
+        default = comparison.dispatch_candidate_metadata({
+            key: value for key, value in flags.items()
+            if key != "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL"
+        })
+        self.assertFalse(
+            default["combine_overlap_contract"]["strongva_terminal_requested"])
+        with self.assertRaises(ValueError):
+            comparison.dispatch_candidate_metadata({
+                **flags, "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "0"})
+
     def test_dispatch_metadata_distinguishes_control_first_without_claiming_measured_overlap(self):
         for raw, family in (("0", "clean_single_combine_context_only"),
                             ("1", "direct_control_first_dispatch")):

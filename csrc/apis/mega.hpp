@@ -299,10 +299,11 @@ static void fp8_fp4_mega_moe(
                 "MegaMoE GIN context is inactive; refusing legacy NVLink fallback");
         // Debug-mode whole-buffer zeroing happens after the asynchronous
         // kernel launch below.  A registered GIN buffer contains persistent
-        // VA readiness generations (and the direct-dispatch epoch), so one
-        // rank zeroing early could make a later stale signal satisfy another
-        // rank's CUDA-Graph replay.  Reject before JIT/enqueue instead of
-        // trying to preserve selected regions after launch.
+        // VA readiness generations (including direct-dispatch and StrongVA
+        // combine-terminal epochs), so one rank zeroing early could make a
+        // later stale signal satisfy another rank's CUDA-Graph replay. Reject
+        // before JIT/enqueue instead of preserving selected regions after
+        // launch.
         if (get_env<int>("DG_COMM_KERNEL_DEBUG") != 0)
             throw std::runtime_error(
                 "DG_COMM_KERNEL_DEBUG must be 0 while a MegaMoE GIN context "

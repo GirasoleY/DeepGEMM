@@ -37,6 +37,13 @@ static_assert(kMegaMoeGinBulkCombineRecordAreaOffset >=
               kMegaMoeGinBulkCombineHeaderBytes);
 static_assert(kMegaMoeGinBulkCombineRecordAreaOffset %
                   kMegaMoeGinBulkCombineRecordAlignment == 0);
+// StrongVA combine visibility uses persistent NIC-written counters. Keep each
+// owner lane on its own 128-byte address family and, unlike the historical
+// packet/scratch aliases, reserve these bytes explicitly at the end of the
+// registered GIN extension. The first eight bytes of each stride are the cell.
+static constexpr uint32_t kMegaMoeGinCombineTerminalSignalStride = 128;
+static_assert(kMegaMoeGinCombineTerminalSignalStride >= sizeof(uint64_t));
+static_assert(kMegaMoeGinCombineTerminalSignalStride % 128u == 0);
 
 // Stage-2 direct dispatch reinterprets the existing 384-row paired-ingress
 // mirrors as eight source-private lanes.  Its compact control packets alias
@@ -220,7 +227,7 @@ struct Workspace {
     // [52..55]: GIN world activity decision
     // [56..59]: GIN world small-decode ineligibility decision
     // [60..63]: reserved
-    // [64..71]: reserved
+    // [64..71]: `uint64_t` StrongVA combine-terminal invocation epoch
     // [72..87]: 2 x `uint64_t` GIN paired-decision mailboxes
     // [88..95]: reserved (keeps the NIC mailboxes in their own 32-byte sector)
     // [96..103]: `uint64_t` GIN paired-decision launch epoch
@@ -303,6 +310,11 @@ struct Workspace {
         // Separate from the control epoch: baseline direct invocations still
         // increment the control terminal, but do not publish this terminal.
         return math::advance_ptr<uint64_t>(base, 112u);
+    }
+
+    CUTLASS_DEVICE
+    uint64_t* get_gin_combine_terminal_epoch_ptr() const {
+        return math::advance_ptr<uint64_t>(base, 64u);
     }
 
     CUTLASS_DEVICE
@@ -479,6 +491,7 @@ struct MegaMoeGinWorkspace {
     Buffer combine_outbox_buffer;
     Buffer bulk_combine_packet_tail_buffer;
     Buffer bulk_combine_return_index_buffer;
+    Buffer combine_terminal_signal_buffer;
     bool bulk_combine;
     uint32_t bulk_packet_bytes;
 
@@ -627,11 +640,21 @@ struct MegaMoeGinWorkspace {
                     num_ranks, num_max_tokens_per_rank, num_topk,
                     num_experts / num_ranks),
                 bulk_combine_packet_tail_buffer.get_end_ptr());
+            DG_UNIFIED_ASSERT(
+                reinterpret_cast<uintptr_t>(
+                    bulk_combine_return_index_buffer.get_end_ptr()) %
+                    kMegaMoeGinCombineTerminalSignalStride == 0);
+            combine_terminal_signal_buffer = Buffer(
+                Data(kMegaMoeGinCombineTerminalSignalStride),
+                num_remote_peers, 1,
+                bulk_combine_return_index_buffer.get_end_ptr());
         } else {
             const auto empty_layout = Data(0, false);
             bulk_combine_packet_tail_buffer = Buffer(
                 empty_layout, 0, 0, bulk_base);
             bulk_combine_return_index_buffer = Buffer(
+                empty_layout, 0, 0, bulk_base);
+            combine_terminal_signal_buffer = Buffer(
                 empty_layout, 0, 0, bulk_base);
         }
     }
@@ -657,13 +680,13 @@ struct MegaMoeGinWorkspace {
     CUTLASS_HOST_DEVICE
     uint64_t get_num_bytes() const {
         return static_cast<uint8_t*>(
-                   bulk_combine_return_index_buffer.get_end_ptr()) -
+                   combine_terminal_signal_buffer.get_end_ptr()) -
                static_cast<uint8_t*>(base);
     }
 
     CUTLASS_HOST_DEVICE
     void* get_end_ptr() const {
-        return bulk_combine_return_index_buffer.get_end_ptr();
+        return combine_terminal_signal_buffer.get_end_ptr();
     }
 
 #if defined(__CUDA_ARCH__) or defined(__CLION_IDE__)
@@ -937,6 +960,21 @@ struct MegaMoeGinWorkspace {
         DG_DEVICE_ASSERT(bulk_combine);
         return static_cast<uint32_t*>(
             get_bulk_combine_packet_ptr(send, peer_in_lsa));
+    }
+
+    CUTLASS_HOST_DEVICE
+    uint64_t* get_combine_terminal_signal_ptr(
+        const uint32_t& owner_in_lsa) const {
+        DG_UNIFIED_ASSERT(bulk_combine);
+        DG_UNIFIED_ASSERT(owner_in_lsa < num_ranks / 2u);
+        auto* signal = combine_terminal_signal_buffer
+            .get_rank_buffer(owner_in_lsa)
+            .get_data_buffer(0)
+            .template get_base_ptr<uint64_t>();
+        DG_UNIFIED_ASSERT(
+            reinterpret_cast<uintptr_t>(signal) %
+                kMegaMoeGinCombineTerminalSignalStride == 0);
+        return signal;
     }
 
     CUTLASS_DEVICE

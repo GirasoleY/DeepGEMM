@@ -258,17 +258,19 @@ class LateFlushSourceContracts(unittest.TestCase):
         cls.kernel = (root / "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh").read_text()
         cls.helper = (root / "deep_gemm/include/deep_gemm/comm/mega_moe_gin.cuh").read_text()
 
-    def test_drainer_retains_count_audit_but_has_no_payload_wait_or_slot101(self):
+    def test_drainer_retains_count_audit_and_candidate_local_completion(self):
         source = self.kernel
         body = braced_block(source, source.index(
             "if (use_gin_combine_overlap and sm_idx == 0 and warp_idx == 0)",
             source.index("DG_GIN_TRACE_IF(lane_idx == 0, 48u + warp_idx);")))
-        self.assertEqual(body.count("comm::mega_moe_gin_put_bulk_combine_span("), 1)
+        self.assertEqual(body.count("comm::mega_moe_gin_put_bulk_combine_span("), 2)
+        self.assertIn("mega_moe_gin_put_bulk_combine_terminal_span", body)
         self.assertIn("/*context_stripe=*/ 0u", body)
         self.assertIn("DG_GIN_TRACE_IF(lane_idx == 0, 100)", body)
         self.assertIn("DG_DEVICE_ASSERT(sent_records == expected_records)", body)
-        for forbidden in ("flush_data_peer_async", "wait_data_peer", "ncclGinRequest_t"):
-            self.assertNotIn(forbidden, body)
+        self.assertIn("flush_data_peer_async", body)
+        self.assertIn("wait_data_peer", body)
+        self.assertIn("ncclGinRequest_t", body)
         self.assertNotRegex(source, r"DG_GIN_TRACE(?:_IF)?\([^;]*\b101\b")
         self.assertLess(body.index("DG_DEVICE_ASSERT(sent_records == expected_records)"),
                         body.rindex("__syncwarp();"))

@@ -13,6 +13,7 @@ from analyze_mega_moe_phases import summarize_capture, summarize_sample
 
 DISPATCH = "DG_MEGAMOE_GIN_DISPATCH_OVERLAP"
 COMBINE = "DG_MEGAMOE_GIN_COMBINE_OVERLAP"
+STRONGVA = capture.accuracy.GIN_STRONGVA_COMBINE_TERMINAL_ENV
 SINGLE = capture.accuracy.GIN_SINGLE_COMBINE_CONTEXT_ENV
 PREPACK = "DG_MEGAMOE_GIN_PRECONSENSUS_PACK"
 COOP = "DG_MEGAMOE_GIN_COOP_DIRECT_PACK"
@@ -95,8 +96,46 @@ class CombinePhaseContract(unittest.TestCase):
         self.assertEqual(result["environment"][DISPATCH], "1")
         self.assertEqual(result["environment"][COMBINE], "1")
 
+    def test_strongva_terminal_metadata_distinguishes_visibility_and_fallback(self):
+        environment = candidate_env() | {STRONGVA: "1"}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            result = capture._kernel_configuration(args())
+        self.assertTrue(result["strongva_combine_terminal_requested"])
+        self.assertEqual(
+            result["combine_schedule"],
+            "peer_parallel_ready_coalesced_spans_with_final_strongva_terminal",
+        )
+        completion = result["combine_payload_local_completion"]
+        self.assertEqual(
+            completion["eligibility"],
+            "world_uniform_bulk_direct_remote_after_host_scratch_preflight",
+        )
+        self.assertEqual(
+            completion["completion"],
+            "post_terminal_same_context_peer_flush",
+        )
+        self.assertFalse(completion["late_header_put_and_flush_retained"])
+        self.assertFalse(completion["final_world_put_barrier_retained"])
+        self.assertFalse(
+            completion["source_storage_retained_until_late_header_flush"])
+        self.assertEqual(
+            completion["fallback"], "unchanged_full_packet_local_flush")
+        self.assertEqual(
+            result["combine_overlap_effective_policy"][
+                "bulk_direct_remote_but_scratch_alias_insufficient"],
+            "host_launch_rejected_before_world_collective_removal",
+        )
+        self.assertIn(
+            "strongva_owner_terminals", result["combine_barrier_protocol"])
+        self.assertIn(
+            "final_span_terminal_or_zero_count_header",
+            result["phase_marker_semantics"]["72_79"],
+        )
+        self.assertIn(
+            "not_receiver_visibility", result["phase_marker_semantics"]["80_87"])
+
     def test_invalid_raw_values_are_rejected_only_after_collective(self):
-        for name in (DISPATCH, COMBINE):
+        for name in (DISPATCH, COMBINE, STRONGVA):
             for invalid in ("", "01", " 1", "1x", "-1", "2"):
                 with self.subTest(name=name, raw=invalid):
                     dist, calls = fake_dist()
@@ -111,6 +150,7 @@ class CombinePhaseContract(unittest.TestCase):
         for mutate in (
             lambda record: record["environment"].update({COMBINE: "0"}),
             lambda record: record["environment"].update({DISPATCH: "0"}),
+            lambda record: record["environment"].update({STRONGVA: "1"}),
             lambda record: record["setup"].update({"num_tokens": 40}),
         ):
             dist, calls = fake_dist(mutate)
@@ -132,6 +172,11 @@ class CombinePhaseContract(unittest.TestCase):
             with mock.patch.dict(os.environ, candidate_env(), clear=True):
                 with self.assertRaisesRegex(ValueError, "requires bulk/direct"):
                     capture._kernel_configuration(configuration)
+        with mock.patch.dict(
+                os.environ, candidate_env() | {COMBINE: "0", STRONGVA: "1"},
+                clear=True):
+            with self.assertRaisesRegex(ValueError, "requires combine_overlap=1"):
+                capture._kernel_configuration(args())
         dist, calls = fake_dist()
         with mock.patch.dict(os.environ, candidate_env(), clear=True):
             result = capture._collective_kernel_configuration(

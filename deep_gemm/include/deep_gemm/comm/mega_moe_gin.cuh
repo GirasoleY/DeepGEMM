@@ -583,6 +583,109 @@ NCCL_DEVICE_INLINE void mega_moe_gin_put_bulk_combine_span(
     mega_moe_gin_trace(transport, blockIdx.x, 72u + diagnostic_peer_lane);
 }
 
+// Queue the exact packet count before any dynamically discovered record span.
+// This PUT deliberately has no completion and no visibility signal. The final
+// submitted record span (or the empty-pair signal below) is the StrongVA
+// terminal for the same (context, peer), and the caller flushes that chain once
+// after posting its terminal. A closed Default PUT keeps the header from
+// holding an aggregate request open while expert computation is still running.
+NCCL_DEVICE_INLINE void mega_moe_gin_put_bulk_combine_header_async(
+    const MegaMoeGinTransport& transport,
+    const uint32_t peer,
+    const uint32_t context_stripe,
+    const void* local_window_base,
+    const void* local_packet,
+    void* remote_packet,
+    const uint32_t diagnostic_peer_lane) {
+    mega_moe_gin_trace(
+        transport, blockIdx.x, 64u + diagnostic_peer_lane, true);
+    asm volatile("" ::: "memory");
+    mega_moe_gin_put_data(
+        transport, peer, context_stripe, local_window_base, local_packet,
+        remote_packet, 16u);
+    asm volatile("" ::: "memory");
+    mega_moe_gin_trace(transport, blockIdx.x, 72u + diagnostic_peer_lane);
+}
+
+// Attach remote visibility only to the actual last submitted record span.
+// StrongVA settles this PUT and every preceding PUT on the same context/peer,
+// irrespective of record-address order. Required system release preserves the
+// producer-acquire publication contract of the ordinary span helper.
+NCCL_DEVICE_INLINE void mega_moe_gin_put_bulk_combine_terminal_span(
+    const MegaMoeGinTransport& transport,
+    const uint32_t peer,
+    const uint32_t context_stripe,
+    const void* local_window_base,
+    const void* local_span,
+    void* remote_span,
+    void* remote_signal,
+    const uint32_t span_bytes,
+    const uint32_t diagnostic_peer_lane) {
+    DG_DEVICE_ASSERT(span_bytes > 0u and span_bytes % 16u == 0u);
+    DG_DEVICE_ASSERT(
+        transport.window_offset(local_window_base, remote_signal) %
+            sizeof(uint64_t) == 0);
+    mega_moe_gin_trace(
+        transport, blockIdx.x, 64u + diagnostic_peer_lane, true);
+    asm volatile("" ::: "memory");
+    ncclGin gin{transport.dev_comm,
+                static_cast<int>(transport.data_context(context_stripe)),
+                NCCL_GIN_RESOURCE_SHARING_GPU};
+    gin.put(
+        ncclTeamWorld(transport.dev_comm), static_cast<int>(peer),
+        transport.window,
+        transport.window_offset(local_window_base, remote_span),
+        transport.window,
+        transport.window_offset(local_window_base, local_span), span_bytes,
+        ncclGin_StrongVASignalInc{
+            transport.window,
+            transport.window_offset(local_window_base, remote_signal)},
+        ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+        cuda::thread_scope_device, cuda::thread_scope_system,
+        ncclGinOptFlagsDefault);
+    asm volatile("" ::: "memory");
+    mega_moe_gin_trace(transport, blockIdx.x, 72u + diagnostic_peer_lane);
+}
+
+// Empty owner/source pairs still advance one terminal generation. The exact
+// zero count was queued first by the header helper on this same context/peer.
+NCCL_DEVICE_INLINE void mega_moe_gin_signal_bulk_combine_terminal(
+    const MegaMoeGinTransport& transport,
+    const uint32_t peer,
+    const uint32_t context_stripe,
+    const void* local_window_base,
+    void* remote_signal) {
+    DG_DEVICE_ASSERT(
+        transport.window_offset(local_window_base, remote_signal) %
+            sizeof(uint64_t) == 0);
+    ncclGin gin{transport.dev_comm,
+                static_cast<int>(transport.data_context(context_stripe)),
+                NCCL_GIN_RESOURCE_SHARING_GPU};
+    gin.signal(
+        ncclTeamWorld(transport.dev_comm), static_cast<int>(peer),
+        ncclGin_StrongVASignalInc{
+            transport.window,
+            transport.window_offset(local_window_base, remote_signal)},
+        ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_device,
+        cuda::thread_scope_system, ncclGinOptFlagsDefault);
+}
+
+NCCL_DEVICE_INLINE void mega_moe_gin_wait_bulk_combine_terminal(
+    const MegaMoeGinTransport& transport,
+    const uint32_t context_stripe,
+    const void* local_window_base,
+    const void* local_signal,
+    const uint64_t expected_epoch) {
+    DG_DEVICE_ASSERT(expected_epoch > 0);
+    ncclGin gin{transport.dev_comm,
+                static_cast<int>(transport.data_context(context_stripe)),
+                NCCL_GIN_RESOURCE_SHARING_GPU};
+    gin.waitSignal(
+        ncclCoopThread{}, transport.window,
+        transport.window_offset(local_window_base, local_signal),
+        expected_epoch, 64, cuda::memory_order_acquire);
+}
+
 // Publish one BF16 combine row as a chained sequence of equally sized PUTs.
 // The final PUT closes the aggregate chain.  The caller must flush/wait the
 // destination peer before allowing the source outbox slot to be reused.

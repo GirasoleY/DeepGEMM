@@ -31,7 +31,8 @@ def _args(*, direct_dispatch=False):
     return SimpleNamespace(gin_direct_dispatch=direct_dispatch)
 
 
-def _records(*, warp="0", coop="0", prepack="0", single="0", dispatch="0", combine="0", direct=False,
+def _records(*, warp="0", coop="0", prepack="0", single="0",
+             dispatch="0", combine="0", strongva="0", direct=False,
              world_size=16):
     return [
         {
@@ -46,6 +47,7 @@ def _records(*, warp="0", coop="0", prepack="0", single="0", dispatch="0", combi
                 accuracy.GIN_SINGLE_COMBINE_CONTEXT_ENV: single,
                 accuracy.GIN_DISPATCH_OVERLAP_ENV: dispatch,
                 accuracy.GIN_COMBINE_OVERLAP_ENV: combine,
+                accuracy.GIN_STRONGVA_COMBINE_TERMINAL_ENV: strongva,
             },
         }
         for rank in range(world_size)
@@ -120,8 +122,36 @@ class TestMegaMoeExperimentEvidence(unittest.TestCase):
                 "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": False,
                 "DG_MEGAMOE_GIN_DISPATCH_OVERLAP": False,
                 "DG_MEGAMOE_GIN_COMBINE_OVERLAP": False,
+                "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL": False,
             },
         )
+
+    def test_strongva_terminal_is_canonical_uniform_and_combine_dependent(self):
+        name = accuracy.GIN_STRONGVA_COMBINE_TERMINAL_ENV
+        self.assertIn(name, accuracy.GIN_PROTOCOL_FLAG_ENVS)
+        records = _records(
+            single="1", dispatch="1", combine="1", strongva="1",
+            direct=True,
+        )
+        evidence = accuracy._collect_gin_experiment_flags(
+            _args(direct_dispatch=True), 0, 16, _FakeDist(records))
+        self.assertTrue(evidence[name])
+        for invalid in ("2", "01", "true", "", "1 "):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    RuntimeError, "must be 0 or 1"):
+                accuracy._collect_gin_experiment_flags(
+                    _args(direct_dispatch=True), 0, 16,
+                    _FakeDist(_records(strongva=invalid, direct=True)),
+                )
+        records[7]["flags"][name] = "0"
+        with self.assertRaisesRegex(RuntimeError, "not uniform across ranks"):
+            accuracy._collect_gin_experiment_flags(
+                _args(direct_dispatch=True), 0, 16, _FakeDist(records))
+        with self.assertRaisesRegex(RuntimeError, "requires COMBINE_OVERLAP=1"):
+            accuracy._collect_gin_experiment_flags(
+                _args(direct_dispatch=True), 0, 16,
+                _FakeDist(_records(strongva="1", direct=True)),
+            )
 
     def test_enabled_flags_are_collectively_emitted(self):
         env = {

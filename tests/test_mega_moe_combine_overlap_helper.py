@@ -166,6 +166,10 @@ int main() {
         source = HELPER.read_text()
         functions = "\n".join(function_source(source, name) for name in (
             "mega_moe_gin_put_data", "mega_moe_gin_put_bulk_combine_span",
+            "mega_moe_gin_put_bulk_combine_header_async",
+            "mega_moe_gin_put_bulk_combine_terminal_span",
+            "mega_moe_gin_signal_bulk_combine_terminal",
+            "mega_moe_gin_wait_bulk_combine_terminal",
             "mega_moe_gin_flush_data_peer_async", "mega_moe_gin_wait_data_peer",
             "mega_moe_gin_put_bulk_combine_header"))
         self.compile_and_run(r'''
@@ -184,6 +188,10 @@ struct ncclGin_None {};
 struct ncclCoopThread {};
 struct ncclGinRequest_t {};
 using ncclWindow_t = void*;
+struct ncclGin_StrongVASignalInc {
+    ncclWindow_t signalWindow;
+    size_t signalOffset;
+};
 constexpr int NCCL_GIN_RESOURCE_SHARING_GPU = 1;
 constexpr uint32_t ncclGinOptFlagsDefault = 0;
 struct DevComm { int lsaSize = 8; };
@@ -200,12 +208,17 @@ struct { uint32_t x = 0; } blockIdx;
 struct Event {
     char kind;
     int peer, context;
-    size_t dst, src, bytes;
+    size_t dst, src, bytes, signal;
     cuda::thread_scope given, required;
     uint32_t flags;
 };
 std::vector<Event> events;
 std::vector<std::pair<uint32_t, bool>> traces;
+constexpr size_t no_signal = size_t(-1);
+inline size_t signal_offset(ncclGin_None) { return no_signal; }
+inline size_t signal_offset(ncclGin_StrongVASignalInc action) {
+    return action.signalOffset;
+}
 inline void mega_moe_gin_trace(const MegaMoeGinTransport&, uint32_t,
                                uint32_t column, bool first_only = false) {
     traces.emplace_back(column, first_only);
@@ -213,25 +226,42 @@ inline void mega_moe_gin_trace(const MegaMoeGinTransport&, uint32_t,
 struct ncclGin {
     int context;
     ncclGin(DevComm, int context, int) : context(context) {}
+    template <class RemoteAction>
     void put(int, int peer, ncclWindow_t, size_t dst, ncclWindow_t, size_t src,
-             size_t bytes, ncclGin_None, ncclGin_None, ncclCoopThread, ncclGin_None,
+             size_t bytes, RemoteAction action, ncclGin_None, ncclCoopThread,
+             ncclGin_None,
              cuda::thread_scope given, cuda::thread_scope required, uint32_t flags) {
-        events.push_back({'P', peer, context, dst, src, bytes, given, required, flags});
+        events.push_back({'P', peer, context, dst, src, bytes,
+                          signal_offset(action), given, required, flags});
+    }
+    template <class RemoteAction>
+    void signal(int, int peer, RemoteAction action, ncclCoopThread,
+                ncclGin_None, cuda::thread_scope given,
+                cuda::thread_scope required, uint32_t flags) {
+        events.push_back({'S', peer, context, 0, 0, 0,
+                          signal_offset(action), given, required, flags});
     }
     void flushAsync(int, int peer, ncclGinRequest_t*, ncclCoopThread,
                     uint32_t flags, ncclGin_None) {
-        events.push_back({'F', peer, context, 0, 0, 0,
+        events.push_back({'F', peer, context, 0, 0, 0, no_signal,
                          cuda::thread_scope_device, cuda::thread_scope_device, flags});
     }
     void wait(ncclGinRequest_t&, ncclCoopThread, ncclGin_None, cuda::memory_order order) {
         assert(order == cuda::memory_order_acquire);
-        events.push_back({'W', -1, context, 0, 0, 0,
+        events.push_back({'W', -1, context, 0, 0, 0, no_signal,
                          cuda::thread_scope_device, cuda::thread_scope_device, 0});
+    }
+    void waitSignal(ncclCoopThread, ncclWindow_t, size_t signal,
+                    uint64_t expected, int width, cuda::memory_order order) {
+        assert(width == 64 && order == cuda::memory_order_acquire);
+        events.push_back({'A', -1, context, signal, size_t(expected), 0,
+                          signal, cuda::thread_scope_device,
+                          cuda::thread_scope_device, 0});
     }
 };
 ''' + functions + r'''
 int main() {
-    alignas(16) std::array<uint8_t, 65536> storage{};
+    alignas(128) std::array<uint8_t, 65536> storage{};
     auto* base = storage.data();
     MegaMoeGinTransport transport;
     transport.window = base;
@@ -262,9 +292,58 @@ int main() {
     assert(header.src == 0 && header.dst == 32768 && header.bytes == 16);
     assert(header.given == cuda::thread_scope_device &&
            header.required == cuda::thread_scope_device && header.flags == 0);
+    assert(header.signal == no_signal);
     assert(events[5].kind == 'F' && events[6].kind == 'W');
     assert(traces[4] == std::make_pair(67u, true));
     assert(traces.back() == std::make_pair(83u, false));
+
+    // The candidate queues the exact count before dynamically ordered spans.
+    // Its terminal belongs to the actual final submission, even when that is
+    // the lower-address span, and sender completion remains a separate pair.
+    events.clear(); traces.clear();
+    constexpr size_t signal = 64512;
+    mega_moe_gin_put_bulk_combine_header_async(
+        transport, 11, 0, base, base, base + 32768, 3);
+    mega_moe_gin_put_bulk_combine_span(
+        transport, 11, 0, base, base + 14384, base + 47152, 14368, 3);
+    mega_moe_gin_put_bulk_combine_terminal_span(
+        transport, 11, 0, base, base + 16, base + 32784,
+        base + signal, 7184, 3);
+    mega_moe_gin_flush_data_peer_async(transport, 11, 0, &request);
+    mega_moe_gin_wait_data_peer(transport, 0, request);
+    assert(events.size() == 5);
+    assert(events[0].kind == 'P' && events[0].src == 0 &&
+           events[0].dst == 32768 && events[0].bytes == 16 &&
+           events[0].signal == no_signal);
+    assert(events[1].kind == 'P' && events[1].src == 14384 &&
+           events[1].dst == 47152 && events[1].signal == no_signal);
+    assert(events[2].kind == 'P' && events[2].src == 16 &&
+           events[2].dst == 32784 && events[2].bytes == 7184 &&
+           events[2].signal == signal);
+    assert(events[2].given == cuda::thread_scope_device &&
+           events[2].required == cuda::thread_scope_system);
+    assert(events[3].kind == 'F' && events[4].kind == 'W');
+    mega_moe_gin_wait_bulk_combine_terminal(
+        transport, 0, base, base + signal, 7);
+    assert(events.back().kind == 'A' && events.back().context == 1 &&
+           events.back().dst == signal && events.back().src == 7);
+
+    // An empty pair still has an exact zero-count header, one standalone
+    // StrongVA increment, and one sender-local completion sequence.
+    events.clear(); traces.clear();
+    mega_moe_gin_put_bulk_combine_header_async(
+        transport, 11, 0, base, base, base + 32768, 3);
+    mega_moe_gin_signal_bulk_combine_terminal(
+        transport, 11, 0, base, base + signal);
+    mega_moe_gin_flush_data_peer_async(transport, 11, 0, &request);
+    mega_moe_gin_wait_data_peer(transport, 0, request);
+    assert(events.size() == 4);
+    assert(events[0].kind == 'P' && events[0].bytes == 16 &&
+           events[0].signal == no_signal);
+    assert(events[1].kind == 'S' && events[1].peer == 11 &&
+           events[1].context == 1 && events[1].signal == signal &&
+           events[1].required == cuda::thread_scope_system);
+    assert(events[2].kind == 'F' && events[3].kind == 'W');
 }
 ''')
 

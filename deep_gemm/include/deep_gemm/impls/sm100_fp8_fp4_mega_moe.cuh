@@ -76,6 +76,10 @@
 #define DG_MEGAMOE_GIN_COMBINE_OVERLAP 0
 #endif
 
+#ifndef DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL
+#define DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL 0
+#endif
+
 // Retired experiment switches must not silently select an unsupported path.
 #if defined(DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE) && DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE != 0
 #error "Expert-wave combine is not part of the clean single-context candidate"
@@ -183,6 +187,14 @@ static_assert(not kMegaMoeGinCombineOverlap or
                kMegaMoeGinDirectDispatch and kMegaMoeGinBulkCombine),
               "GIN combine overlap requires split direct dispatch and "
               "single-context bulk combine");
+static constexpr bool kMegaMoeGinStrongVACombineTerminal =
+    DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL != 0;
+static_assert(DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL == 0 or
+              DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL == 1,
+              "Invalid MegaMoE GIN StrongVA combine-terminal flag");
+static_assert(not kMegaMoeGinStrongVACombineTerminal or
+              kMegaMoeGinCombineOverlap,
+              "GIN StrongVA combine terminal requires combine overlap");
 
 template <
     uint32_t kNumMaxTokensPerRank,
@@ -399,6 +411,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 buffer.gin_workspace.scale_scratch_buffer.base) %
                 layout::kMegaMoeGinDirectDispatchPacketAlignment == 0);
     }
+    if constexpr (kUseGin and kMegaMoeGinStrongVACombineTerminal) {
+        // This candidate removes a world collective, so a rank-local fit
+        // fallback is forbidden. Host/JIT validation checks the same bound;
+        // keep a device assertion at the concrete registered layout too.
+        DG_DEVICE_ASSERT(
+            buffer.gin_workspace.combine_overlap_alias_fits());
+        DG_DEVICE_ASSERT(
+            buffer.gin_workspace.combine_terminal_signal_buffer
+                    .get_num_bytes() ==
+                kGinPeerCount *
+                    layout::kMegaMoeGinCombineTerminalSignalStride);
+    }
     const auto workspace = buffer.workspace;
     const auto use_gin_bulk_combine_this_launch = [&]() {
         if constexpr (kUseGin and kMegaMoeGinBulkCombine) {
@@ -418,11 +442,30 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     };
     const auto use_gin_combine_overlap_this_launch = [&]() {
         if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
-            // Local fit fallback is safe: only this owner's send mechanism
-            // changes. Packet headers, receivers and world collectives do not.
-            return use_gin_bulk_combine_this_launch() and
-                   use_gin_direct_dispatch_this_launch() and
+            const bool world_eligible =
+                use_gin_bulk_combine_this_launch() and
+                use_gin_direct_dispatch_this_launch();
+            if constexpr (kMegaMoeGinStrongVACombineTerminal) {
+                // Host preflight and the concrete assertion above guarantee
+                // the fixed scratch extent. Once receiver waits replace the
+                // world collective, no rank-local fit branch is permissible.
+                return world_eligible;
+            }
+            // Local fit fallback is safe only on the accepted path: it changes
+            // this owner's send mechanism while every receiver still reaches
+            // the same late header and world Put barrier.
+            return world_eligible and
                    buffer.gin_workspace.combine_overlap_alias_fits();
+        }
+        return false;
+    };
+    const auto use_gin_strongva_combine_terminal_this_launch = [&]() {
+        if constexpr (kUseGin and kMegaMoeGinStrongVACombineTerminal) {
+            // Both inputs are outputs of the existing world consensus. The
+            // concrete scratch fit is asserted above, never used as a local
+            // branch after this protocol removes the world Put barrier.
+            return use_gin_bulk_combine_this_launch() and
+                   use_gin_direct_dispatch_this_launch();
         }
         return false;
     };
@@ -991,6 +1034,26 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             use_gin_direct_dispatch_this_launch();
         const bool use_gin_combine_overlap =
             use_gin_combine_overlap_this_launch();
+        const bool use_gin_strongva_combine_terminal =
+            use_gin_strongva_combine_terminal_this_launch();
+
+        if constexpr (kUseGin and kMegaMoeGinStrongVACombineTerminal) {
+#ifdef DG_MEGAMOE_GIN
+            // Cumulative terminal cells are never reset. Advance this expected
+            // generation exactly once only on world-uniform eligible launches;
+            // local-only, T64 and ordinary fallback invocations pause it.
+            if (use_gin_strongva_combine_terminal and sm_idx == 0 and
+                warp_idx == 0 and lane_idx == 0) {
+                auto* epoch_ptr =
+                    workspace.get_gin_combine_terminal_epoch_ptr();
+                DG_DEVICE_ASSERT(
+                    *epoch_ptr < static_cast<uint64_t>(-1));
+                *epoch_ptr += 1;
+                __threadfence();
+            }
+            __syncwarp();
+#endif
+        }
 
         if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
 #ifdef DG_MEGAMOE_GIN
@@ -1035,13 +1098,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         if constexpr (kUseGin and kMegaMoeGinBulkCombine) {
 #ifdef DG_MEGAMOE_GIN
-            // A peer with no routes deliberately sends no packet.  Clear all
-            // receive counts every bulk launch so a CUDA Graph replay cannot
-            // reinterpret a previous launch's packet.  The existing dispatch
-            // grid sync and input Put barrier below publish this clear before
-            // any owner can reach the combine PUT phase.
+            // The accepted path may send no packet for an empty pair, so keep
+            // its startup clear. StrongVA instead queues one exact header for
+            // every pair, including zero, before its ordered terminal. Do not
+            // race that early NIC write with an unordered local clear; stale
+            // counts are never consumed before the current terminal acquire.
             if (use_gin_bulk_combine and sm_idx == 0 and
-                warp_idx == 0 and
+                not use_gin_strongva_combine_terminal and warp_idx == 0 and
                 lane_idx < kGinPeerCount) {
                 *buffer.gin_workspace.get_bulk_combine_packet_count_ptr(
                     /*send=*/ false, lane_idx) = 0;
@@ -2379,11 +2442,41 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const bool peer_lane = lane_idx < lsa_size;
                 const uint32_t peer = remote_base + lane_idx;
                 uint32_t sent_records = 0;
+                uint32_t expected_records = 0;
                 uint32_t expected_fragments[kNumExpertGroups];
                 bool discovered[kNumExpertGroups];
                 uint32_t ready_masks[kNumExpertGroups];
                 uint32_t pending_first = 0;
                 uint32_t pending_second = 0;
+                if constexpr (kMegaMoeGinStrongVACombineTerminal) {
+                    if (peer_lane) {
+                        // This exact count is immutable after input consensus.
+                        // Queue it before every dynamically ordered payload PUT
+                        // on the same context/peer. The actual last submitted
+                        // span (or empty-pair signal) later closes the chain.
+                        #pragma unroll
+                        for (uint32_t expert = 0;
+                             expert < kNumExpertsPerRank; ++expert)
+                            expected_records += static_cast<uint32_t>(
+                                *workspace.get_expert_recv_count_ptr(
+                                    peer, expert));
+                        constexpr uint32_t kBulkCapacity =
+                            layout::kMegaMoeGinBulkCombineMaxTokens * kNumTopk;
+                        DG_DEVICE_ASSERT(expected_records <= kBulkCapacity);
+                        auto* local_packet = buffer.gin_workspace
+                            .get_bulk_combine_packet_ptr(
+                                /*send=*/ true, lane_idx);
+                        *static_cast<uint32_t*>(local_packet) = expected_records;
+                        __threadfence_system();
+                        comm::mega_moe_gin_put_bulk_combine_header_async(
+                            gin_transport, peer, /*context_stripe=*/ 0u,
+                            sym_buffer.get_base_ptr(), local_packet,
+                            buffer.gin_workspace.get_bulk_combine_packet_ptr(
+                                /*send=*/ false, owner_lane),
+                            /*diagnostic_peer_lane=*/ lane_idx);
+                    }
+                    __syncwarp();
+                }
                 // Counts are exact, published before pulls, and remain live
                 // until the existing second dispatch/epilogue handoff. Read
                 // lane-owned cells directly: no varying-index scheduler query
@@ -2523,20 +2616,79 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // One closed Default PUT; no aggregate flag or new
                         // context. A singleton is sent as soon as this bounded
                         // ready-only planning finishes, with no batch-fill wait.
-                        comm::mega_moe_gin_put_bulk_combine_span(
-                            gin_transport, peer, /*context_stripe=*/ 0u,
-                            sym_buffer.get_base_ptr(),
-                            buffer.gin_workspace.get_bulk_combine_record_ptr(
-                                /*send=*/ true, lane_idx, batch_prefix),
-                            buffer.gin_workspace.get_bulk_combine_record_ptr(
-                                /*send=*/ false, owner_lane, batch_prefix),
-                            batch_records * buffer.gin_workspace.bulk_record_bytes,
-                            /*diagnostic_peer_lane=*/ lane_idx);
+                        const uint32_t remaining_first =
+                            pending_first & ~accepted_first;
+                        const uint32_t remaining_second =
+                            pending_second & ~accepted_second;
+                        if constexpr (kMegaMoeGinStrongVACombineTerminal) {
+                            DG_DEVICE_ASSERT(
+                                sent_records + batch_records <= expected_records);
+                            const bool is_final_submission =
+                                sent_records + batch_records == expected_records;
+                            // Readiness order is not address order. The terminal
+                            // belongs to whichever submitted span exhausts the
+                            // exact record count and both pending masks.
+                            DG_DEVICE_ASSERT(
+                                is_final_submission ==
+                                ((remaining_first | remaining_second) == 0));
+                            if (is_final_submission) {
+                                comm::mega_moe_gin_put_bulk_combine_terminal_span(
+                                    gin_transport, peer,
+                                    /*context_stripe=*/ 0u,
+                                    sym_buffer.get_base_ptr(),
+                                    buffer.gin_workspace
+                                        .get_bulk_combine_record_ptr(
+                                            /*send=*/ true, lane_idx,
+                                            batch_prefix),
+                                    buffer.gin_workspace
+                                        .get_bulk_combine_record_ptr(
+                                            /*send=*/ false, owner_lane,
+                                            batch_prefix),
+                                    buffer.gin_workspace
+                                        .get_combine_terminal_signal_ptr(
+                                            owner_lane),
+                                    batch_records *
+                                        buffer.gin_workspace.bulk_record_bytes,
+                                    /*diagnostic_peer_lane=*/ lane_idx);
+                            } else {
+                                comm::mega_moe_gin_put_bulk_combine_span(
+                                    gin_transport, peer,
+                                    /*context_stripe=*/ 0u,
+                                    sym_buffer.get_base_ptr(),
+                                    buffer.gin_workspace
+                                        .get_bulk_combine_record_ptr(
+                                            /*send=*/ true, lane_idx,
+                                            batch_prefix),
+                                    buffer.gin_workspace
+                                        .get_bulk_combine_record_ptr(
+                                            /*send=*/ false, owner_lane,
+                                            batch_prefix),
+                                    batch_records *
+                                        buffer.gin_workspace.bulk_record_bytes,
+                                    /*diagnostic_peer_lane=*/ lane_idx);
+                            }
+                        } else {
+                            comm::mega_moe_gin_put_bulk_combine_span(
+                                gin_transport, peer,
+                                /*context_stripe=*/ 0u,
+                                sym_buffer.get_base_ptr(),
+                                buffer.gin_workspace
+                                    .get_bulk_combine_record_ptr(
+                                        /*send=*/ true, lane_idx,
+                                        batch_prefix),
+                                buffer.gin_workspace
+                                    .get_bulk_combine_record_ptr(
+                                        /*send=*/ false, owner_lane,
+                                        batch_prefix),
+                                batch_records *
+                                    buffer.gin_workspace.bulk_record_bytes,
+                                /*diagnostic_peer_lane=*/ lane_idx);
+                        }
                         sent_records += batch_records;
                         // Keep pending state live until submission returns.
                         // Scalar masks avoid a varying-index local-array store.
-                        pending_first &= ~accepted_first;
-                        pending_second &= ~accepted_second;
+                        pending_first = remaining_first;
+                        pending_second = remaining_second;
                     }
                     __syncwarp();
                 }
@@ -2554,18 +2706,38 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         *buffer.gin_workspace.get_combine_overlap_sent_ptr(expert) = 1;
                 }
                 if (peer_lane) {
-                    uint32_t expected_records = 0;
-                    for (uint32_t expert = 0; expert < kNumExpertsPerRank; ++expert)
-                        expected_records += static_cast<uint32_t>(
-                            *workspace.get_expert_recv_count_ptr(peer, expert));
+                    if constexpr (not kMegaMoeGinStrongVACombineTerminal) {
+                        for (uint32_t expert = 0;
+                             expert < kNumExpertsPerRank; ++expert)
+                            expected_records += static_cast<uint32_t>(
+                                *workspace.get_expert_recv_count_ptr(
+                                    peer, expert));
+                    }
                     DG_DEVICE_ASSERT(sent_records == expected_records);
+                    if constexpr (kMegaMoeGinStrongVACombineTerminal) {
+                        auto* remote_signal = buffer.gin_workspace
+                            .get_combine_terminal_signal_ptr(owner_lane);
+                        if (expected_records == 0) {
+                            comm::mega_moe_gin_signal_bulk_combine_terminal(
+                                gin_transport, peer,
+                                /*context_stripe=*/ 0u,
+                                sym_buffer.get_base_ptr(), remote_signal);
+                        }
+                        // Local completion protects the exact header and every
+                        // immutable record source from cleanup/replay reuse. It
+                        // does not substitute for the receiver's signal wait.
+                        ncclGinRequest_t request{};
+                        comm::mega_moe_gin_flush_data_peer_async(
+                            gin_transport, peer, /*context_stripe=*/ 0u,
+                            &request);
+                        comm::mega_moe_gin_wait_data_peer(
+                            gin_transport, /*context_stripe=*/ 0u, request);
+                        DG_GIN_TRACE_IF(true, 80u + lane_idx);
+                    }
                 }
-                // Every Default PUT has returned, but payloads may still be
-                // in flight. The existing handoff/grid1 orders the later
-                // header PUT and same-(context1, peer) flush after all these
-                // submissions; that shared-QP completion protects source
-                // reuse. Keep the immutable slabs live until then. Slot101
-                // intentionally has no writer: no early payload-only flush.
+                // The accepted path still defers completion to its late header.
+                // StrongVA mode instead completed each same-context/peer chain
+                // above; receiver visibility remains a distinct later wait.
                 __syncwarp();
             }
 #endif
@@ -3791,6 +3963,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         DG_GIN_TRACE_IF(epilogue_warp_idx == 0 and lane_idx == 0, 54);
 
+        const bool use_gin_strongva_combine_terminal =
+            use_gin_strongva_combine_terminal_this_launch();
+
         if constexpr (kUseGin and kMegaMoeGinLocalAblationStage < 3) {
 #ifdef DG_MEGAMOE_GIN
             const bool run_remote_path =
@@ -3799,9 +3974,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     workspace.get_gin_world_active_ptr()) != 0;
             if (run_remote_path) {
             // Publish every same-LSA mapped store before handing phase 2 to
-            // the world collective. The first local barrier joins this CTA's
+            // its visibility protocol. The first local barrier joins this CTA's
             // dispatch phase; the grid below joins all early PUT submissions.
-            // Their source completion is deferred to the late header flush.
+            // StrongVA mode has also locally completed each peer chain here.
             __threadfence_system();
             ptx::sync_unaligned(
                 kNumDispatchThreads + kNumEpilogueThreads,
@@ -3824,7 +3999,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 use_single_combine_context = use_gin_bulk_combine and
                     use_gin_direct_dispatch_this_launch();
             }
-            if (sm_idx == 0 and epilogue_warp_idx == 0) {
+            if (sm_idx == 0 and epilogue_warp_idx == 0 and
+                not use_gin_strongva_combine_terminal) {
                 if constexpr (kMegaMoeGinBulkCombine) {
                     if (use_gin_bulk_combine) {
                         const uint32_t lsa_size = static_cast<uint32_t>(
@@ -3906,6 +4082,47 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __threadfence_system();
                 DG_GIN_TRACE_IF(lane_idx == 0, 57);
+            }
+            if constexpr (kMegaMoeGinStrongVACombineTerminal) {
+                if (use_gin_strongva_combine_terminal) {
+                    // Grid1 above is the prologue for same-LSA output stores;
+                    // grid2 below is the epilogue. StrongVA terminals establish
+                    // cross-LSA packet visibility without a world collective.
+                    comm::nvlink_lsa_barrier<
+                        kNumRanks, kGinPeerCount, kNumSMs,
+                        kNumEpilogueThreads, kEpilogueGridSyncIndex,
+                        kBeforeCombineReduceBarrierTag>(
+                            workspace, sym_buffer, sm_idx,
+                            epilogue_thread_idx,
+                            [&]() {
+                                ptx::sync_aligned(
+                                    kNumEpilogueThreads,
+                                    kEpilogueFullBarrierIdx);
+                            },
+                            /* Existing grid1 is the prologue */ false,
+                            /* Existing grid2 is the epilogue */ false);
+
+                    if (sm_idx == 0 and epilogue_warp_idx == 0) {
+                        // Lane0 may still be polling the LSA barrier arrival;
+                        // reconverge before lanes independently wait for all
+                        // remote owner terminals on shared data context 0.
+                        __syncwarp();
+                        DG_GIN_TRACE_IF(lane_idx == 0, 56);
+                        if (lane_idx < kGinPeerCount) {
+                            comm::mega_moe_gin_wait_bulk_combine_terminal(
+                                gin_transport, /*context_stripe=*/ 0u,
+                                sym_buffer.get_base_ptr(),
+                                buffer.gin_workspace
+                                    .get_combine_terminal_signal_ptr(lane_idx),
+                                *workspace
+                                     .get_gin_combine_terminal_epoch_ptr());
+                        }
+                        __syncwarp();
+                        if (lane_idx == 0)
+                            __threadfence_system();
+                        DG_GIN_TRACE_IF(lane_idx == 0, 57);
+                    }
+                }
             }
             comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
                 workspace, sm_idx, epilogue_thread_idx,
@@ -4033,16 +4250,19 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     kNumDispatchThreads + kNumEpilogueThreads,
                     kDispatchWithEpilogueBarrierIdx);
             } else {
-                comm::nvlink_lsa_barrier<
-                    kNumRanks, kGinPeerCount, kNumSMs, kNumEpilogueThreads,
-                    kEpilogueGridSyncIndex, kBeforeCombineReduceBarrierTag>(
-                        workspace, sym_buffer, sm_idx,
-                        epilogue_thread_idx,
-                        [&]() {
-                            ptx::sync_aligned(
-                                kNumEpilogueThreads,
-                                kEpilogueFullBarrierIdx);
-                        });
+                if (not use_gin_strongva_combine_terminal) {
+                    comm::nvlink_lsa_barrier<
+                        kNumRanks, kGinPeerCount, kNumSMs,
+                        kNumEpilogueThreads, kEpilogueGridSyncIndex,
+                        kBeforeCombineReduceBarrierTag>(
+                            workspace, sym_buffer, sm_idx,
+                            epilogue_thread_idx,
+                            [&]() {
+                                ptx::sync_aligned(
+                                    kNumEpilogueThreads,
+                                    kEpilogueFullBarrierIdx);
+                            });
+                }
 
                 ptx::sync_unaligned(
                     kNumDispatchThreads + kNumEpilogueThreads,
@@ -4078,10 +4298,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
             if (use_gin_direct_reduce) {
-                // The retained GIN Put fence plus grid2 establishes target
-                // visibility. Bridge that acquired global memory into TMA's
-                // async proxy once on every potential issuer, before reading
-                // immutable received packets. This is not a network drain.
+                // The selected world Put fence or StrongVA waits plus grid2
+                // establish target visibility. Bridge that acquired global
+                // memory into TMA's async proxy once on every potential issuer,
+                // before reading immutable received packets.
                 asm volatile("fence.proxy.async.global;" ::: "memory");
             }
         }

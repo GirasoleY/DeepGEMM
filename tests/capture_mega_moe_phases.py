@@ -92,6 +92,7 @@ def _raw_kernel_environment():
         "DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE",
         accuracy.GIN_SINGLE_COMBINE_CONTEXT_ENV,
         "DG_MEGAMOE_GIN_DISPATCH_OVERLAP", "DG_MEGAMOE_GIN_COMBINE_OVERLAP",
+        accuracy.GIN_STRONGVA_COMBINE_TERMINAL_ENV,
     )
     result = {name: os.environ.get(name, "0") for name in names}
     result["DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS"] = os.environ.get(
@@ -144,7 +145,10 @@ def _kernel_configuration(args, *, environment=None):
     single_context = int(single_raw)
     dispatch_raw = environment["DG_MEGAMOE_GIN_DISPATCH_OVERLAP"]
     combine_raw = environment["DG_MEGAMOE_GIN_COMBINE_OVERLAP"]
-    for name, raw in (("dispatch_overlap", dispatch_raw), ("combine_overlap", combine_raw)):
+    strongva_raw = environment[accuracy.GIN_STRONGVA_COMBINE_TERMINAL_ENV]
+    for name, raw in (("dispatch_overlap", dispatch_raw),
+                      ("combine_overlap", combine_raw),
+                      ("strongva_combine_terminal", strongva_raw)):
         if raw not in ("0", "1"):
             raise ValueError(f"{name} must be exactly 0 or 1")
     if dispatch_raw == "1" and not (
@@ -156,7 +160,11 @@ def _kernel_configuration(args, *, environment=None):
         raise ValueError("dispatch_overlap requires bulk/direct and preconsensus/cooperative packing")
     if combine_raw == "1" and not (single_raw == "1" and dispatch_raw == "1"):
         raise ValueError("combine_overlap requires single_combine_context=1 and dispatch_overlap=1")
+    if strongva_raw == "1" and combine_raw != "1":
+        raise ValueError("strongva_combine_terminal requires combine_overlap=1")
     combine_schedule = (
+        "peer_parallel_ready_coalesced_spans_with_final_strongva_terminal"
+        if strongva_raw == "1" else
         "peer_parallel_ready_coalesced_spans_then_late_header" if combine_raw == "1"
         else "post_compute_full_packet"
     )
@@ -166,24 +174,35 @@ def _kernel_configuration(args, *, environment=None):
         "combine_schedule": combine_schedule,
         "dispatch_overlap_requested": dispatch_raw == "1",
         "combine_overlap_requested": combine_raw == "1",
+        "strongva_combine_terminal_requested": strongva_raw == "1",
         "combine_schedule_is_requested_policy_not_device_observation": True,
         "combine_overlap_effective_policy": {
             "bulk_direct_remote_and_scratch_alias_fits_expert_metadata": combine_schedule,
-            "bulk_direct_remote_but_scratch_alias_insufficient": "post_compute_full_packet",
+            "bulk_direct_remote_but_scratch_alias_insufficient": (
+                "host_launch_rejected_before_world_collective_removal"
+                if strongva_raw == "1" else "post_compute_full_packet"
+            ),
             "remote_ineligible": "unchanged_fallback",
             "all_local": "unchanged_local_path",
         },
         "combine_payload_local_completion": {
             "requested_by_combine_overlap": combine_raw == "1",
-            "eligibility": "early_record_combine_path_and_scratch_alias_fits",
-            "completion": "late_header_same_context_peer",
+            "eligibility": (
+                "world_uniform_bulk_direct_remote_after_host_scratch_preflight"
+                if strongva_raw == "1" else
+                "early_record_combine_path_and_scratch_alias_fits"
+            ),
+            "completion": (
+                "post_terminal_same_context_peer_flush"
+                if strongva_raw == "1" else "late_header_same_context_peer"
+            ),
             "payload_only_flush_before_handoff": False,
             "all_input_flushes_retained": True,
-            "late_header_put_and_flush_retained": True,
+            "late_header_put_and_flush_retained": strongva_raw != "1",
             "original_handoff_and_grid_order_retained": True,
-            "final_world_put_barrier_retained": True,
-            "source_storage_retained_until_late_header_flush": True,
-            "header_flush_does_not_prove_remote_visibility": True,
+            "final_world_put_barrier_retained": strongva_raw != "1",
+            "source_storage_retained_until_late_header_flush": strongva_raw != "1",
+            "header_flush_does_not_prove_remote_visibility": strongva_raw != "1",
             "fallback": "unchanged_full_packet_local_flush",
             "slot101_writer_present": False,
             "policy_not_device_observation": True,
@@ -229,10 +248,19 @@ def _kernel_configuration(args, *, environment=None):
                       else "receiver_combined_control_payload_terminal_acquired"),
             "24_31": "late_sender_local_flush_not_receiver_arrival_or_last_payload_time",
             "64_71": "first_combine_issue_observation_per_peer",
-            "72_79": ("last_recorded_queue_observation_includes_late_header" if combine_raw == "1"
-                      else "whole_packet_queue_observation"),
-            "80_87": ("late_header_same_context_peer_local_completion_includes_payload_not_last_payload_time_or_remote_visibility" if combine_raw == "1"
-                      else "whole_packet_local_flush_not_receiver_arrival"),
+            "72_79": (
+                "last_recorded_queue_observation_is_final_span_terminal_or_zero_count_header"
+                if strongva_raw == "1" else
+                "last_recorded_queue_observation_includes_late_header"
+                if combine_raw == "1" else "whole_packet_queue_observation"
+            ),
+            "80_87": (
+                "post_terminal_same_context_peer_local_completion_includes_exact_header_and_payload_not_receiver_visibility"
+                if strongva_raw == "1" else
+                "late_header_same_context_peer_local_completion_includes_payload_not_last_payload_time_or_remote_visibility"
+                if combine_raw == "1" else
+                "whole_packet_local_flush_not_receiver_arrival"
+            ),
             "53": "epilogue_task_loop_exit_not_mma_completion_or_nic_visibility",
             "99": "first_ready_expert_selected_software_observation",
             "100": "all_combine_payload_puts_queued_not_remote_completion",
@@ -259,6 +287,8 @@ def _kernel_configuration(args, *, environment=None):
             "all_local": [],
         },
         "combine_barrier_protocol": (
+            "context1_strongva_owner_terminals_for_eligible_remote_else_all_context_world_put_fence"
+            if strongva_raw == "1" else
             "public_context1_world_put_fence_for_eligible_remote_else_all_context"
             if single_context else "unchanged_all_context_world_put_fence"
         ),

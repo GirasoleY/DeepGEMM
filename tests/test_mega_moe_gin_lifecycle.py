@@ -111,6 +111,7 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
             'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '0',
             'DG_MEGAMOE_GIN_DISPATCH_OVERLAP': '0',
             'DG_MEGAMOE_GIN_COMBINE_OVERLAP': '0',
+            'DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL': '0',
             'DG_MEGAMOE_GIN_PRECONSENSUS_PACK': '0',
             'DG_MEGAMOE_GIN_COOP_DIRECT_PACK': '0',
             'DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE': '0',

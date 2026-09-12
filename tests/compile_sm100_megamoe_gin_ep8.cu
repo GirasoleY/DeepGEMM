@@ -38,6 +38,9 @@
 #ifndef DG_MEGAMOE_GIN_COMBINE_OVERLAP
 #define DG_MEGAMOE_GIN_COMBINE_OVERLAP 1
 #endif
+#ifndef DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL
+#define DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL 1
+#endif
 #endif
 
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>

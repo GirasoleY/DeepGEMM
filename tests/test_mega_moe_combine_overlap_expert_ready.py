@@ -98,25 +98,30 @@ class ExpertReadySourceContracts(unittest.TestCase):
         self.assertNotIn("pending_", accepted)
         self.assertLess(body.index(planner) + len(planner), body.index("if (batch_records != 0)"))
         submission = braced_block(body, body.index("if (batch_records != 0)"))
-        self.assertEqual(body.count("comm::mega_moe_gin_put_bulk_combine_span("), 1)
+        # One ordinary helper remains in each compile-time branch: non-final
+        # StrongVA spans and the unchanged default-off path.
+        self.assertEqual(body.count("comm::mega_moe_gin_put_bulk_combine_span("), 2)
+        self.assertEqual(
+            body.count("comm::mega_moe_gin_put_bulk_combine_terminal_span("), 1)
         issue = submission.index("comm::mega_moe_gin_put_bulk_combine_span(")
-        self.assertLess(issue, submission.index("pending_first &= ~accepted_first"))
-        self.assertLess(issue, submission.index("pending_second &= ~accepted_second"))
+        self.assertLess(issue, submission.index("pending_first = remaining_first"))
+        self.assertLess(issue, submission.index("pending_second = remaining_second"))
         self.assertIn("/*context_stripe=*/ 0u", submission)
-        self.assertIn("batch_records * buffer.gin_workspace.bulk_record_bytes", submission)
-        self.assertRegex(body, r"pending_second &= ~accepted_second;\s*}\s*__syncwarp\(\);")
+        self.assertRegex(
+            submission,
+            r"batch_records\s*\*\s*buffer\.gin_workspace\.bulk_record_bytes",
+        )
+        self.assertRegex(body, r"pending_second = remaining_second;\s*}\s*__syncwarp\(\);")
         self.assertLess(body.index("DG_GIN_TRACE_IF(lane_idx == 0, 100)"),
                         body.index("get_combine_overlap_sent_ptr(expert) = 1"))
         self.assertLess(body.index("DG_GIN_TRACE_IF(lane_idx == 0, 100)"),
                         body.index("DG_DEVICE_ASSERT(sent_records == expected_records)"))
-        # R7 preserves the submission audit, but completion moves to the
-        # existing same-context/peer header flush after the handoff/grid1.
-        for forbidden in ("comm::mega_moe_gin_flush_data_peer_async(",
-                          "comm::mega_moe_gin_wait_data_peer(",
-                          "ncclGinRequest_t request", "DG_GIN_TRACE_IF(lane_idx == 0, 101)"):
-            self.assertNotIn(forbidden, body)
-        self.assertLess(body.index("DG_DEVICE_ASSERT(sent_records == expected_records)"),
-                        body.rindex("__syncwarp();"))
+        # The default-off branch still defers completion; the StrongVA branch
+        # completes once per peer after its exact final terminal.
+        audit = body.index("DG_DEVICE_ASSERT(sent_records == expected_records)")
+        self.assertLess(audit, body.index("mega_moe_gin_flush_data_peer_async(", audit))
+        self.assertLess(audit, body.index("mega_moe_gin_wait_data_peer(", audit))
+        self.assertNotRegex(source, r"DG_GIN_TRACE(?:_IF)?\([^;]*\b101\b")
 
     def test_all_dispatch_unpack_variants_save_existing_prefix_before_publication(self):
         source = self.source
