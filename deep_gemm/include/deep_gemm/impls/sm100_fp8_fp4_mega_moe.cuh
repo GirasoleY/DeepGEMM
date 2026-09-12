@@ -3111,10 +3111,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             if (sm_idx == 0 and warp_idx == 0) {
                 if constexpr (kMegaMoeGinStrongVACombineTerminal) {
                     if (use_gin_strongva_combine_terminal) {
-                        // All local packet readers and workspace cleanup have
-                        // crossed the final dispatch grid rendezvous. Retire
-                        // each sender chain now, immediately before the world
-                        // cleanup rendezvous permits kernel/replay source reuse.
+                        // The earlier dispatch/epilogue handoff retired every
+                        // local packet reader; this grid proves all dispatch
+                        // CTAs finished workspace cleanup. Retire each sender
+                        // chain now, immediately before the cleanup world
+                        // rendezvous permits kernel/replay source reuse.
                         const uint32_t lsa_size = static_cast<uint32_t>(
                             gin_transport.dev_comm.lsaSize);
                         DG_DEVICE_ASSERT(lsa_size == kGinPeerCount);
@@ -3133,8 +3134,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             DG_GIN_TRACE_IF(true, 80u + lane_idx);
                         }
                         // The world barrier below is warp-cooperative. Do not
-                        // let inactive peer lanes enter it before all eight
-                        // independent peer completions have returned.
+                        // let inactive peer lanes enter it before all active
+                        // LSA-peer completions have returned.
                         __syncwarp();
                     }
                 }

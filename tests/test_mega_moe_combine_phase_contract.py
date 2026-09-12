@@ -255,6 +255,9 @@ class CombinePhaseContract(unittest.TestCase):
         self.assertFalse(result["performance_claim"])
         self.assertTrue(any("not physical IB or MMA overlap proof" in note for note in result["notes"]))
         self.assertTrue(any("Do not infer last-payload timing" in note for note in result["notes"]))
+        self.assertTrue(any("With StrongVA" in note and
+                            "late-cleanup sender-local completion" in note
+                            for note in result["notes"]))
 
     def test_runtime_validation_precedes_allocation_and_success_follows_teardown(self):
         source = Path(capture.__file__).read_text()
