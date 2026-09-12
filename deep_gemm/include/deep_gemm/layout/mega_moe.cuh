@@ -27,6 +27,16 @@ static constexpr uint32_t kMegaMoeGinNumDataContexts = 8;
 static constexpr uint32_t kMegaMoeGinBulkCombineMaxTokens = 48;
 static constexpr uint32_t kMegaMoeGinBulkCombineHeaderBytes = 16;
 static constexpr uint32_t kMegaMoeGinBulkCombineRecordHeaderBytes = 16;
+// Keep the semantic packet and record headers unchanged, but isolate the
+// fixed-stride record array on 128-byte boundaries.  The packet header-only
+// PUT therefore remains exactly 16 bytes, while every record begins on its
+// own aligned address family.
+static constexpr uint32_t kMegaMoeGinBulkCombineRecordAlignment = 128;
+static constexpr uint32_t kMegaMoeGinBulkCombineRecordAreaOffset = 128;
+static_assert(kMegaMoeGinBulkCombineRecordAreaOffset >=
+              kMegaMoeGinBulkCombineHeaderBytes);
+static_assert(kMegaMoeGinBulkCombineRecordAreaOffset %
+                  kMegaMoeGinBulkCombineRecordAlignment == 0);
 
 // Stage-2 direct dispatch reinterprets the existing 384-row paired-ingress
 // mirrors as eight source-private lanes.  Its compact control packets alias
@@ -465,6 +475,7 @@ struct MegaMoeGinWorkspace {
     Buffer count_staging_buffer;
     Buffer route_staging_buffer;
     Buffer scale_scratch_buffer;
+    Buffer combine_outbox_alignment_padding_buffer;
     Buffer combine_outbox_buffer;
     Buffer bulk_combine_packet_tail_buffer;
     Buffer bulk_combine_return_index_buffer;
@@ -527,15 +538,44 @@ struct MegaMoeGinWorkspace {
             scale_layout,
             num_sms * kMegaMoeGinNumDispatchWarps * completion_batch, 1,
             route_staging_buffer.get_end_ptr());
+
+        // The public GIN context requires the symmetric allocation base to be
+        // NCCL_WIN_REQUIRED_ALIGNMENT-aligned (4096 bytes in the supported
+        // runtime), so the nullptr-based size layout and the concrete layout
+        // have the same residue modulo 128. Some public capacities place the
+        // end of scale scratch at +64 modulo 128; account that explicitly
+        // instead of relying on a target-shape assertion. Legacy/non-bulk
+        // layouts retain their exact offsets.
+        const auto unaligned_outbox_address = reinterpret_cast<uintptr_t>(
+            scale_scratch_buffer.get_end_ptr());
+        const uint32_t outbox_alignment_padding_bytes = bulk_combine ?
+            static_cast<uint32_t>(
+                (kMegaMoeGinBulkCombineRecordAlignment -
+                 unaligned_outbox_address %
+                     kMegaMoeGinBulkCombineRecordAlignment) %
+                kMegaMoeGinBulkCombineRecordAlignment) : 0u;
+        DG_UNIFIED_ASSERT(
+            outbox_alignment_padding_bytes <
+                kMegaMoeGinBulkCombineRecordAlignment and
+            outbox_alignment_padding_bytes % 16u == 0u);
+        combine_outbox_alignment_padding_buffer = Buffer(
+            Data(outbox_alignment_padding_bytes), 1, 1,
+            scale_scratch_buffer.get_end_ptr());
         combine_outbox_buffer = Buffer(
             combine_row_layout, outbox_depth,
             static_cast<uint32_t>(kMegaMoeGinMaxOutboxBlockM),
-            scale_scratch_buffer.get_end_ptr());
+            combine_outbox_alignment_padding_buffer.get_end_ptr());
+        if (bulk_combine) {
+            DG_UNIFIED_ASSERT(
+                reinterpret_cast<uintptr_t>(combine_outbox_buffer.base) %
+                    kMegaMoeGinBulkCombineRecordAlignment == 0);
+        }
 
-        // A compact owner->source packet has one 16-byte packet header followed
-        // by at most (48 tokens * top-k) fixed-stride records.  Each record's
-        // first 16 bytes carry the final token/top-k index and the remaining
-        // bytes carry one BF16 output row.
+        // A compact owner->source packet has one semantic 16-byte packet
+        // header, padding through byte 128, and at most (48 tokens * top-k)
+        // fixed-stride records. Each record's first 16 bytes carry the final
+        // token/top-k index, followed by one BF16 output row and tail padding
+        // through the next 128-byte boundary.
         // Only actual peers in the other LSA need packets. Keep the complete
         // fallback outbox even when EP8's four-peer packet pool is smaller.
         const auto bulk_base = combine_outbox_buffer.get_end_ptr();
@@ -543,11 +583,30 @@ struct MegaMoeGinWorkspace {
             const uint32_t bulk_capacity =
                 kMegaMoeGinBulkCombineMaxTokens * num_topk;
             const uint32_t num_remote_peers = num_ranks / 2;
-            bulk_record_bytes =
+            const uint64_t bulk_record_data_bytes =
                 kMegaMoeGinBulkCombineRecordHeaderBytes +
-                hidden * sizeof(uint16_t);
-            bulk_packet_bytes = kMegaMoeGinBulkCombineHeaderBytes +
-                bulk_capacity * bulk_record_bytes;
+                static_cast<uint64_t>(hidden) * sizeof(uint16_t);
+            DG_UNIFIED_ASSERT(
+                bulk_record_data_bytes <=
+                static_cast<uint64_t>(UINT32_MAX) -
+                    (kMegaMoeGinBulkCombineRecordAlignment - 1u));
+            bulk_record_bytes = math::align<uint32_t>(
+                static_cast<uint32_t>(bulk_record_data_bytes),
+                kMegaMoeGinBulkCombineRecordAlignment);
+            DG_UNIFIED_ASSERT(
+                bulk_record_bytes >= bulk_record_data_bytes and
+                bulk_record_bytes %
+                    kMegaMoeGinBulkCombineRecordAlignment == 0);
+            const uint64_t bulk_packet_bytes_u64 =
+                kMegaMoeGinBulkCombineRecordAreaOffset +
+                static_cast<uint64_t>(bulk_capacity) * bulk_record_bytes;
+            DG_UNIFIED_ASSERT(bulk_packet_bytes_u64 <=
+                              static_cast<uint64_t>(UINT32_MAX));
+            bulk_packet_bytes =
+                static_cast<uint32_t>(bulk_packet_bytes_u64);
+            DG_UNIFIED_ASSERT(
+                bulk_packet_bytes %
+                    kMegaMoeGinBulkCombineRecordAlignment == 0);
             const uint64_t bulk_packet_storage_bytes =
                 2ull * num_remote_peers * bulk_packet_bytes;
             const uint64_t outbox_storage_bytes =
@@ -863,9 +922,13 @@ struct MegaMoeGinWorkspace {
         // Bulk mode exclusively aliases the existing row-outbox allocation
         // plus a small appended tail.  Uniform fallback launches continue to
         // use combine_outbox_buffer's unchanged slot/row formula.
-        return math::advance_ptr(
+        auto* packet = math::advance_ptr(
             combine_outbox_buffer.base,
             static_cast<uint64_t>(packet_idx) * bulk_packet_bytes);
+        DG_UNIFIED_ASSERT(
+            reinterpret_cast<uintptr_t>(packet) %
+                kMegaMoeGinBulkCombineRecordAlignment == 0);
+        return packet;
     }
 
     CUTLASS_DEVICE
@@ -881,10 +944,19 @@ struct MegaMoeGinWorkspace {
                                       const uint32_t& peer_in_lsa,
                                       const uint32_t& return_idx) const {
         DG_DEVICE_ASSERT(bulk_combine);
-        return math::advance_ptr(
+        DG_DEVICE_ASSERT(
+            kMegaMoeGinBulkCombineRecordAreaOffset +
+                    (static_cast<uint64_t>(return_idx) + 1ull) *
+                        bulk_record_bytes <=
+                bulk_packet_bytes);
+        auto* record = math::advance_ptr(
             get_bulk_combine_packet_ptr(send, peer_in_lsa),
-            kMegaMoeGinBulkCombineHeaderBytes +
+            kMegaMoeGinBulkCombineRecordAreaOffset +
                 return_idx * bulk_record_bytes);
+        DG_DEVICE_ASSERT(
+            reinterpret_cast<uintptr_t>(record) %
+                kMegaMoeGinBulkCombineRecordAlignment == 0);
+        return record;
     }
 
     CUTLASS_DEVICE
@@ -899,6 +971,8 @@ struct MegaMoeGinWorkspace {
     void* get_bulk_combine_record_payload_ptr(
         const bool send, const uint32_t& peer_in_lsa,
         const uint32_t& return_idx) const {
+        DG_DEVICE_ASSERT(kMegaMoeGinBulkCombineRecordHeaderBytes <=
+                         bulk_record_bytes);
         return math::advance_ptr(
             get_bulk_combine_record_ptr(send, peer_in_lsa, return_idx),
             kMegaMoeGinBulkCombineRecordHeaderBytes);

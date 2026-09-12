@@ -38,6 +38,11 @@ static std::runtime_error unsupported(const std::string& reason, const std::stri
 
 static_assert(NCCL_VERSION_CODE == kRequiredNcclVersion,
               "DG_MEGAMOE_GIN prototype requires exactly NCCL 2.30.7");
+// MegaMoeGinWorkspace computes alignment padding from offsets when the host
+// sizes a nullptr-based layout, then from concrete addresses in the kernel.
+// The public buffer check below makes those residues identical.
+static_assert(NCCL_WIN_REQUIRED_ALIGNMENT % 128 == 0,
+              "MegaMoE GIN requires window alignment divisible by 128");
 #ifdef DG_NCCL_VERSION_CODE
 static_assert(NCCL_VERSION_CODE == DG_NCCL_VERSION_CODE,
               "setup.py NCCL version does not match the included NCCL headers");

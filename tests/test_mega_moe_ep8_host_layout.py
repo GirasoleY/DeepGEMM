@@ -132,13 +132,14 @@ class EP8PublicContract(unittest.TestCase):
 
     def test_constructor_exact_bulk_and_direct_shapes_before_allocation(self):
         for world in (8, 16):
-            for bulk, direct in ((True, False), (False, True), (True, True)):
-                group = types.SimpleNamespace(size=lambda: world)
-                with self.assertRaises(ReachedAllocation):
-                    self.cls(group, world * 56, 384, 16, 3584, 3072,
-                             enable_gin=True, gin_completion_batch=8,
-                             gin_active_fast_path=True, gin_outbox_depth=64,
-                             gin_bulk_combine=bulk, gin_direct_dispatch=direct)
+            for capacity in (384, 768):
+                for bulk, direct in ((True, False), (False, True), (True, True)):
+                    group = types.SimpleNamespace(size=lambda: world)
+                    with self.assertRaises(ReachedAllocation):
+                        self.cls(group, world * 56, capacity, 16, 3584, 3072,
+                                 enable_gin=True, gin_completion_batch=8,
+                                 gin_active_fast_path=True, gin_outbox_depth=64,
+                                 gin_bulk_combine=bulk, gin_direct_dispatch=direct)
         for world, experts, capacity in ((8, 896, 384), (16, 448, 384),
                                         (4, 224, 384), (8, 448, 383)):
             group = types.SimpleNamespace(size=lambda: world)
@@ -225,6 +226,10 @@ int main() {
                         binding.index("py::gil_scoped_release"))
         self.assertIn("fields[2] != peer % expected_lsa_size_", source)
         self.assertIn("fields[3] != expected_lsa_size_", source)
+        self.assertIn(
+            "static_assert(NCCL_WIN_REQUIRED_ALIGNMENT % 128 == 0",
+            source,
+        )
 
     def test_actual_jit_selects_requested_specializations_or_rejects(self):
         source = JIT.read_text()
@@ -292,13 +297,24 @@ int main() {
     static_assert(kMegaMoeGinDirectDispatchStorageBytes == 57344);
     static_assert(get_mega_moe_gin_combine_overlap_scratch_bytes() == 2304);
     static_assert(kMegaMoeGinDirectReduceOrdinalBytes == 3072);
-    std::vector<uint8_t> storage(128*1024*1024);
+    static_assert(kMegaMoeGinBulkCombineRecordAlignment == 128);
+    static_assert(kMegaMoeGinBulkCombineRecordAreaOffset == 128);
+    const uint64_t record_data_bytes=16+3584*2;
+    const uint64_t record_bytes=7296;
+    const uint64_t packet_bytes=128+768*record_bytes;
+    assert(record_data_bytes==7184);
+    assert(packet_bytes==5603456);
+    std::vector<uint8_t> storage(128*1024*1024+127);
+    const auto storage_address=reinterpret_cast<uintptr_t>(storage.data());
+    auto* storage_base=reinterpret_cast<uint8_t*>(
+        (storage_address+127u)&~uintptr_t(127u));
     for (uint32_t world : {8u,16u}) for (bool bulk : {false,true}) {
-        MegaMoeGinWorkspace w(storage.data(),3584,world,world*56,384,16,152,8,64,bulk);
+        MegaMoeGinWorkspace w(storage_base,3584,world,world*56,384,16,152,8,64,bulk);
         const uint64_t outbox=64ull*192*3584*2;
-        const uint64_t packets=world*(16ull+768*(16+3584*2));
+        const uint64_t packets=world*packet_bytes;
+        const uint64_t legacy_packets=world*(16ull+768*record_data_bytes);
         assert(w.combine_outbox_buffer.get_num_bytes()==outbox);
-        assert(w.get_num_bytes()<=storage.size());
+        assert(w.get_num_bytes()<=128*1024*1024);
         assert(w.direct_dispatch_mirrors_fit());
         assert(w.combine_direct_reduce_alias_fits());
         auto* scratch=static_cast<uint8_t*>(w.scale_scratch_buffer.base);
@@ -307,28 +323,177 @@ int main() {
         assert(static_cast<uint8_t*>(w.get_direct_dispatch_packet_ptr(false,7))
                ==scratch+15*3584);
         if (!bulk) {
+            assert(w.combine_outbox_alignment_padding_buffer.get_num_bytes()==0);
             assert(w.bulk_combine_packet_tail_buffer.get_num_bytes()==0);
             assert(w.bulk_combine_return_index_buffer.get_num_bytes()==0);
             continue;
         }
         const uint64_t reserved=std::max(outbox,packets);
+        const uint64_t legacy_reserved=std::max(outbox,legacy_packets);
         const auto base=static_cast<uint8_t*>(w.combine_outbox_buffer.base);
+        assert(w.combine_outbox_alignment_padding_buffer.get_num_bytes()==0);
+        assert(reinterpret_cast<uintptr_t>(base)%128==0);
+        assert(w.bulk_record_bytes==record_bytes);
+        assert(w.bulk_packet_bytes==packet_bytes);
         assert(w.bulk_combine_packet_tail_buffer.get_num_bytes()==reserved-outbox);
         assert(w.bulk_combine_return_index_buffer.base==base+reserved);
-        // EP16 retains the exact old packet-tail and return-index offsets.
-        if (world==16) assert(reserved==packets);
-        else assert(reserved==outbox && packets<outbox);
+        if (world==16) {
+            assert(packets==89655296);
+            assert(reserved==packets);
+            assert(reserved-outbox==1574912);
+            assert(reserved-legacy_reserved==1378048);
+            assert(w.bulk_combine_return_index_buffer.get_num_bytes()==436224);
+        } else {
+            // Both the old compact geometry and the aligned geometry fit
+            // inside the pre-existing row outbox, so EP8 allocates no bytes.
+            assert(packets==44827648);
+            assert(packets<outbox && reserved==outbox);
+            assert(legacy_reserved==reserved);
+            assert(w.bulk_combine_packet_tail_buffer.get_num_bytes()==0);
+            assert(w.bulk_combine_return_index_buffer.get_num_bytes()==239616);
+        }
         for (uint32_t peer=0;peer<world/2;++peer) for (bool send : {false,true}) {
             auto* packet=static_cast<uint8_t*>(w.get_bulk_combine_packet_ptr(send,peer));
             assert(packet==base+((send?0:world/2)+peer)*uint64_t(w.bulk_packet_bytes));
-            auto* end=static_cast<uint8_t*>(w.get_bulk_combine_record_payload_ptr(send,peer,767))
-                +3584*2;
-            assert(end==packet+w.bulk_packet_bytes);
-            assert(end<=base+reserved);
+            assert(reinterpret_cast<uintptr_t>(packet)%128==0);
+            auto* first=static_cast<uint8_t*>(w.get_bulk_combine_record_ptr(send,peer,0));
+            assert(first==packet+128);
+            assert(reinterpret_cast<uintptr_t>(first)%128==0);
+            auto* last=static_cast<uint8_t*>(w.get_bulk_combine_record_ptr(send,peer,767));
+            auto* payload=static_cast<uint8_t*>(
+                w.get_bulk_combine_record_payload_ptr(send,peer,767));
+            assert(payload==last+16);
+            assert(reinterpret_cast<uintptr_t>(last)%128==0);
+            auto* payload_end=payload+3584*2;
+            assert(payload_end+112==packet+w.bulk_packet_bytes);
+            assert(packet+w.bulk_packet_bytes<=base+reserved);
         }
         auto* last=static_cast<uint8_t*>(w.get_combine_outbox_row_ptr(63,191));
         assert(last+3584*2==base+outbox);
         assert(last+3584*2<=static_cast<uint8_t*>(w.bulk_combine_return_index_buffer.base));
+    }
+}
+''')
+
+    def test_actual_mega_buffer_aligns_bulk_outbox_for_public_capacities(self):
+        source = LAYOUT.read_text()
+        declarations = source[
+            source.index("static constexpr int kNumCandidateBlockMs"):
+            source.index("} // namespace deep_gemm::layout")
+        ]
+        self.compile_run(r'''
+#include <algorithm>
+#include <cassert>
+#include <cstdint>
+#define CUTLASS_HOST_DEVICE
+#define CUTLASS_DEVICE
+#define __CLION_IDE__
+#define DG_UNIFIED_ASSERT(x) assert(x)
+#define DG_DEVICE_ASSERT(x) assert(x)
+#define DG_STATIC_ASSERT(x, ...) static_assert(x, __VA_ARGS__)
+namespace math {
+template<class T> constexpr T constexpr_min(T a,T b) { return a < b ? a : b; }
+template<class T> constexpr T constexpr_ceil_div(T a,T b) { return (a+b-1)/b; }
+template<class T> T ceil_div(T a,T b) { return constexpr_ceil_div(a,b); }
+template<class T> constexpr T constexpr_align(T a,T b) {
+    return constexpr_ceil_div(a,b)*b;
+}
+template<class T> T align(T a,T b) { return constexpr_align(a,b); }
+template<class T=void> T* advance_ptr(void* p,uint64_t n) {
+    return reinterpret_cast<T*>(static_cast<uint8_t*>(p)+n);
+}
+}
+namespace layout {
+''' + declarations + r'''
+}
+uint64_t address(const void* ptr) {
+    return reinterpret_cast<uintptr_t>(ptr);
+}
+int main() {
+    constexpr uint64_t allocator_bases[] = {0x100000000ull, 0x100001000ull};
+    constexpr uint32_t ring_tokens=384;
+    constexpr uint32_t sf_ring_tokens=6144;
+    constexpr uint64_t outbox_bytes=64ull*192*3584*2;
+    constexpr uint64_t packet_bytes=128ull+768*7296;
+    constexpr uint64_t legacy_packet_bytes=16ull+768*7184;
+    for (uint32_t world : {8u,16u}) {
+        for (uint32_t capacity : {384u,768u,1152u,1536u}) {
+          for (uint32_t sms : {147u,148u,149u,152u}) {
+           for (uint32_t completion_batch : {1u,2u,4u,8u}) {
+            layout::MegaMoEBuffer sizing(
+                nullptr,3584,3072,world,world*56,capacity,16,
+                ring_tokens,sf_ring_tokens,true,0,true,sms,
+                completion_batch,64,true);
+            const uint64_t sizing_outbox=address(
+                sizing.gin_workspace.combine_outbox_buffer.base);
+            const uint64_t unaligned_outbox=address(sizing.gin_workspace
+                .combine_outbox_alignment_padding_buffer.base);
+            const uint32_t expected_padding=static_cast<uint32_t>(
+                (128-unaligned_outbox%128)%128);
+            assert(sizing.gin_workspace.combine_outbox_alignment_padding_buffer
+                       .get_num_bytes()==expected_padding);
+            assert(sizing_outbox%128==0);
+            if (sms==147 && completion_batch==1) {
+                assert(expected_padding==(
+                    (capacity/384)%2==1 ? 64u : 0u));
+            }
+            if (sms==152 && completion_batch==8) {
+                assert(expected_padding==(
+                    (capacity/384)%2==1 ? 0u : 64u));
+            }
+            const uint64_t packet_storage=world*packet_bytes;
+            const uint64_t legacy_packet_storage=world*legacy_packet_bytes;
+            const uint64_t reserved=std::max(outbox_bytes,packet_storage);
+            const uint64_t legacy_reserved=std::max(
+                outbox_bytes,legacy_packet_storage);
+            const uint64_t expected_allocation_delta=
+                expected_padding+reserved-legacy_reserved;
+            assert(expected_allocation_delta==
+                (world==8 ? expected_padding : 1378048+expected_padding));
+            assert(sizing.gin_workspace.bulk_combine_packet_tail_buffer
+                       .get_num_bytes()==reserved-outbox_bytes);
+
+            for (uint64_t allocator_base : allocator_bases) {
+                // Both bases satisfy the public 4096-byte GIN window check;
+                // deliberately shifted 64-byte bases are not public inputs.
+                assert(allocator_base%4096==0);
+                layout::MegaMoEBuffer concrete(
+                    reinterpret_cast<void*>(allocator_base),3584,3072,
+                    world,world*56,capacity,16,ring_tokens,sf_ring_tokens,
+                    true,0,true,sms,completion_batch,64,true);
+                const auto concrete_outbox=address(
+                    concrete.gin_workspace.combine_outbox_buffer.base);
+                assert(concrete_outbox%128==0);
+                assert(concrete_outbox-allocator_base==sizing_outbox);
+                assert(concrete.get_num_bytes()==sizing.get_num_bytes());
+                assert(concrete.gin_workspace
+                           .combine_outbox_alignment_padding_buffer
+                           .get_num_bytes()==expected_padding);
+                for (uint32_t peer=0;peer<world/2;++peer) {
+                    for (bool send : {false,true}) {
+                        const auto packet=address(concrete.gin_workspace
+                            .get_bulk_combine_packet_ptr(send,peer));
+                        const auto first=address(concrete.gin_workspace
+                            .get_bulk_combine_record_ptr(send,peer,0));
+                        const auto last=address(concrete.gin_workspace
+                            .get_bulk_combine_record_ptr(send,peer,767));
+                        assert(packet%128==0 && first==packet+128);
+                        assert(first%128==0 && last%128==0);
+                        assert(last+7296==packet+packet_bytes);
+                    }
+                }
+            }
+
+            layout::MegaMoEBuffer legacy_layout(
+                nullptr,3584,3072,world,world*56,capacity,16,
+                ring_tokens,sf_ring_tokens,true,0,true,sms,
+                completion_batch,64,false);
+            assert(legacy_layout.gin_workspace
+                       .combine_outbox_alignment_padding_buffer
+                       .get_num_bytes()==0);
+           }
+          }
+        }
     }
 }
 ''')

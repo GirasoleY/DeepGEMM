@@ -3862,9 +3862,12 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                         .get_bulk_combine_packet_ptr(
                                             /*send=*/ false, owner_in_lsa);
                                 const uint32_t packet_bytes =
-                                    layout::kMegaMoeGinBulkCombineHeaderBytes +
+                                    layout::kMegaMoeGinBulkCombineRecordAreaOffset +
                                     route_count *
                                         buffer.gin_workspace.bulk_record_bytes;
+                                DG_DEVICE_ASSERT(
+                                    packet_bytes <=
+                                    buffer.gin_workspace.bulk_packet_bytes);
                                 if (use_gin_combine_overlap) {
                                     // Records were already sent by dispatch.
                                     // Retain late count publication to avoid a

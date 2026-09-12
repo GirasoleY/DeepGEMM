@@ -1054,17 +1054,79 @@ class TestMegaMoeBulkCombineSourceContract(unittest.TestCase):
         self.assertNotIn("bulk_combine_send_buffer", self.layout)
         self.assertNotIn("bulk_combine_recv_buffer", self.layout)
         row_outbox_bytes = 64 * 192 * 7168
-        record_bytes = 16 + 7168
-        packet_bytes = 16 + 48 * 16 * record_bytes
-        packet_storage_bytes = 2 * 8 * packet_bytes
-        max_pool_tokens = 109_056
-        return_index_bytes = max_pool_tokens * 4
+        record_data_bytes = 16 + 7168
+        record_bytes = (record_data_bytes + 127) // 128 * 128
+        packet_bytes = 128 + 48 * 16 * record_bytes
+        ep8_packet_storage_bytes = 2 * 4 * packet_bytes
+        ep16_packet_storage_bytes = 2 * 8 * packet_bytes
+        legacy_packet_bytes = 16 + 48 * 16 * record_data_bytes
+        ep8_legacy_packet_storage_bytes = 2 * 4 * legacy_packet_bytes
+        ep16_max_pool_tokens = 109_056
+        ep16_return_index_bytes = ep16_max_pool_tokens * 4
         self.assertEqual(row_outbox_bytes, 88_080_384)
-        self.assertEqual(packet_storage_bytes - row_outbox_bytes, 196_864)
-        self.assertEqual(return_index_bytes, 436_224)
+        self.assertEqual(record_data_bytes, 7_184)
+        self.assertEqual(record_bytes, 7_296)
+        self.assertEqual(packet_bytes, 5_603_456)
+        # EP8's aligned packet pool still aliases wholly inside the existing
+        # row outbox, exactly as the old compact packet pool did.
+        self.assertLess(ep8_packet_storage_bytes, row_outbox_bytes)
+        self.assertLess(ep8_legacy_packet_storage_bytes, row_outbox_bytes)
         self.assertEqual(
-            packet_storage_bytes - row_outbox_bytes + return_index_bytes,
-            633_088,
+            max(ep8_packet_storage_bytes, row_outbox_bytes),
+            max(ep8_legacy_packet_storage_bytes, row_outbox_bytes),
+        )
+        outbox_alignment_padding = {384: 0, 768: 64, 1152: 0, 1536: 64}
+        self.assertEqual(
+            {
+                capacity: padding
+                + max(ep8_packet_storage_bytes, row_outbox_bytes)
+                - max(ep8_legacy_packet_storage_bytes, row_outbox_bytes)
+                for capacity, padding in outbox_alignment_padding.items()
+            },
+            {384: 0, 768: 64, 1152: 0, 1536: 64},
+        )
+        # EP16 has eight send plus eight receive packets and therefore grows
+        # only by the exact alignment padding represented below.
+        self.assertEqual(ep16_packet_storage_bytes, 89_655_296)
+        self.assertEqual(
+            ep16_packet_storage_bytes - row_outbox_bytes, 1_574_912
+        )
+        self.assertEqual(ep16_return_index_bytes, 436_224)
+        self.assertEqual(
+            ep16_packet_storage_bytes - row_outbox_bytes
+            + ep16_return_index_bytes,
+            2_011_136,
+        )
+        ep16_legacy_packet_storage_bytes = 2 * 8 * legacy_packet_bytes
+        self.assertEqual(
+            {
+                capacity: padding
+                + ep16_packet_storage_bytes
+                - ep16_legacy_packet_storage_bytes
+                for capacity, padding in outbox_alignment_padding.items()
+            },
+            {
+                384: 1_378_048,
+                768: 1_378_112,
+                1152: 1_378_048,
+                1536: 1_378_112,
+            },
+        )
+        self.assertIn(
+            "kMegaMoeGinBulkCombineRecordAreaOffset +",
+            self.layout,
+        )
+        self.assertIn(
+            "kMegaMoeGinBulkCombineRecordAlignment",
+            self.layout,
+        )
+        self.assertIn(
+            "combine_outbox_alignment_padding_buffer",
+            self.layout,
+        )
+        self.assertIn(
+            "layout::kMegaMoeGinBulkCombineRecordAreaOffset +",
+            self.kernel,
         )
 
     def test_bulk_selection_is_world_uniform_and_falls_back(self):
