@@ -290,7 +290,7 @@ class StrongVASourceContracts(unittest.TestCase):
         self.assertIn("ncclGin_StrongVASignalInc", empty)
         self.assertNotIn("gin.put(", empty)
 
-    def test_actual_final_span_empty_pair_and_sender_completion_order(self):
+    def test_actual_final_span_and_empty_pair_do_not_wait_in_drainer(self):
         begin = self.kernel.index(
             "if (use_gin_combine_overlap and sm_idx == 0 and warp_idx == 0)")
         end = self.kernel.index(
@@ -306,17 +306,43 @@ class StrongVASourceContracts(unittest.TestCase):
         sent_update = drainer.index("sent_records += batch_records;")
         pending_update = drainer.index("pending_first = remaining_first;")
         empty = drainer.index("if (expected_records == 0)")
-        flush = drainer.index("mega_moe_gin_flush_data_peer_async(", empty)
-        wait = drainer.index("mega_moe_gin_wait_data_peer(", flush)
         self.assertLess(expected, header)
         self.assertLess(header, loop)
         self.assertLess(final, terminal)
         self.assertLess(terminal, sent_update)
         self.assertLess(sent_update, pending_update)
-        self.assertLess(empty, flush)
-        self.assertLess(flush, wait)
+        self.assertLess(terminal, empty)
+        self.assertNotIn("mega_moe_gin_flush_data_peer_async(", drainer)
+        self.assertNotIn("mega_moe_gin_wait_data_peer(", drainer)
+        self.assertNotIn("DG_GIN_TRACE_IF(true, 80u + lane_idx)", drainer)
         self.assertIn("get_combine_terminal_signal_ptr(owner_lane)", drainer)
         self.assertIn("DG_DEVICE_ASSERT(sent_records == expected_records)", drainer)
+
+    def test_sender_completion_moves_after_cleanup_grid_before_world_rendezvous(self):
+        cleanup_begin = self.kernel.index(
+            "// Wait for all ranks to finish cleaning")
+        cleanup_end = self.kernel.index(
+            "} else if (warp_idx == kNumDispatchWarps)", cleanup_begin)
+        cleanup = self.kernel[cleanup_begin:cleanup_end]
+        grid = cleanup.index("comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(")
+        strongva = cleanup.index(
+            "if constexpr (kMegaMoeGinStrongVACombineTerminal)", grid)
+        flush = cleanup.index("mega_moe_gin_flush_data_peer_async(", strongva)
+        wait = cleanup.index("mega_moe_gin_wait_data_peer(", flush)
+        marker = cleanup.index("DG_GIN_TRACE_IF(true, 80u + lane_idx)", wait)
+        warp_join = cleanup.index("__syncwarp();", marker)
+        world = cleanup.index("comm::mega_moe_gin_world_barrier(", warp_join)
+        self.assertLess(grid, strongva)
+        self.assertLess(strongva, flush)
+        self.assertLess(flush, wait)
+        self.assertLess(wait, marker)
+        self.assertLess(marker, warp_join)
+        self.assertLess(warp_join, world)
+        self.assertIn("/*context_stripe=*/ 0u", cleanup[flush:wait])
+        self.assertIn("if (use_gin_strongva_combine_terminal)",
+                      cleanup[strongva:flush])
+        self.assertEqual(
+            self.kernel.count("DG_GIN_TRACE_IF(true, 80u + lane_idx)"), 1)
 
     def test_early_header_cannot_race_the_accepted_startup_count_clear(self):
         begin = self.kernel.index(

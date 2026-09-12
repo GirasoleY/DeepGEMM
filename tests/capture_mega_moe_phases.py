@@ -193,7 +193,7 @@ def _kernel_configuration(args, *, environment=None):
                 "early_record_combine_path_and_scratch_alias_fits"
             ),
             "completion": (
-                "post_terminal_same_context_peer_flush"
+                "late_cleanup_post_terminal_same_context_peer_flush"
                 if strongva_raw == "1" else "late_header_same_context_peer"
             ),
             "payload_only_flush_before_handoff": False,
@@ -255,7 +255,7 @@ def _kernel_configuration(args, *, environment=None):
                 if combine_raw == "1" else "whole_packet_queue_observation"
             ),
             "80_87": (
-                "post_terminal_same_context_peer_local_completion_includes_exact_header_and_payload_not_receiver_visibility"
+                "late_cleanup_post_terminal_same_context_peer_local_completion_includes_exact_header_and_payload_not_receiver_visibility"
                 if strongva_raw == "1" else
                 "late_header_same_context_peer_local_completion_includes_payload_not_last_payload_time_or_remote_visibility"
                 if combine_raw == "1" else

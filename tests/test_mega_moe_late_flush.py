@@ -258,7 +258,7 @@ class LateFlushSourceContracts(unittest.TestCase):
         cls.kernel = (root / "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh").read_text()
         cls.helper = (root / "deep_gemm/include/deep_gemm/comm/mega_moe_gin.cuh").read_text()
 
-    def test_drainer_retains_count_audit_and_candidate_local_completion(self):
+    def test_drainer_retains_count_audit_but_defers_strongva_completion(self):
         source = self.kernel
         body = braced_block(source, source.index(
             "if (use_gin_combine_overlap and sm_idx == 0 and warp_idx == 0)",
@@ -268,12 +268,27 @@ class LateFlushSourceContracts(unittest.TestCase):
         self.assertIn("/*context_stripe=*/ 0u", body)
         self.assertIn("DG_GIN_TRACE_IF(lane_idx == 0, 100)", body)
         self.assertIn("DG_DEVICE_ASSERT(sent_records == expected_records)", body)
-        self.assertIn("flush_data_peer_async", body)
-        self.assertIn("wait_data_peer", body)
-        self.assertIn("ncclGinRequest_t", body)
+        self.assertNotIn("flush_data_peer_async", body)
+        self.assertNotIn("wait_data_peer", body)
+        self.assertNotIn("ncclGinRequest_t", body)
+        self.assertNotIn("DG_GIN_TRACE_IF(true, 80u + lane_idx)", body)
         self.assertNotRegex(source, r"DG_GIN_TRACE(?:_IF)?\([^;]*\b101\b")
         self.assertLess(body.index("DG_DEVICE_ASSERT(sent_records == expected_records)"),
                         body.rindex("__syncwarp();"))
+
+        cleanup_begin = source.index("// Wait for all ranks to finish cleaning")
+        cleanup_end = source.index(
+            "} else if (warp_idx == kNumDispatchWarps)", cleanup_begin)
+        cleanup = source[cleanup_begin:cleanup_end]
+        grid = cleanup.index("comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(")
+        flush = cleanup.index("mega_moe_gin_flush_data_peer_async(", grid)
+        wait = cleanup.index("mega_moe_gin_wait_data_peer(", flush)
+        marker = cleanup.index("DG_GIN_TRACE_IF(true, 80u + lane_idx)", wait)
+        world = cleanup.index("comm::mega_moe_gin_world_barrier(", marker)
+        self.assertLess(grid, flush)
+        self.assertLess(flush, wait)
+        self.assertLess(wait, marker)
+        self.assertLess(marker, world)
 
     def test_late_header_same_context_peer_flush_stays_after_handoff_grid(self):
         source = self.kernel

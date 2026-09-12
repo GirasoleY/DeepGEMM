@@ -2723,21 +2723,15 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 /*context_stripe=*/ 0u,
                                 sym_buffer.get_base_ptr(), remote_signal);
                         }
-                        // Local completion protects the exact header and every
-                        // immutable record source from cleanup/replay reuse. It
-                        // does not substitute for the receiver's signal wait.
-                        ncclGinRequest_t request{};
-                        comm::mega_moe_gin_flush_data_peer_async(
-                            gin_transport, peer, /*context_stripe=*/ 0u,
-                            &request);
-                        comm::mega_moe_gin_wait_data_peer(
-                            gin_transport, /*context_stripe=*/ 0u, request);
-                        DG_GIN_TRACE_IF(true, 80u + lane_idx);
+                        // Do not gate compute on sender-local completion. The
+                        // exact header and record sources remain immutable
+                        // until the same peer chain is flushed after dispatch
+                        // cleanup, immediately before its final world barrier.
                     }
                 }
                 // The accepted path still defers completion to its late header.
-                // StrongVA mode instead completed each same-context/peer chain
-                // above; receiver visibility remains a distinct later wait.
+                // StrongVA mode instead defers each same-context/peer completion
+                // until cleanup; receiver visibility remains a distinct wait.
                 __syncwarp();
             }
 #endif
@@ -3115,6 +3109,35 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         kNumDispatchThreads, kDispatchBarrierIdx);
                 });
             if (sm_idx == 0 and warp_idx == 0) {
+                if constexpr (kMegaMoeGinStrongVACombineTerminal) {
+                    if (use_gin_strongva_combine_terminal) {
+                        // All local packet readers and workspace cleanup have
+                        // crossed the final dispatch grid rendezvous. Retire
+                        // each sender chain now, immediately before the world
+                        // cleanup rendezvous permits kernel/replay source reuse.
+                        const uint32_t lsa_size = static_cast<uint32_t>(
+                            gin_transport.dev_comm.lsaSize);
+                        DG_DEVICE_ASSERT(lsa_size == kGinPeerCount);
+                        if (lane_idx < lsa_size) {
+                            const uint32_t remote_base =
+                                (1u - sym_buffer.rank_idx / lsa_size) *
+                                lsa_size;
+                            const uint32_t peer = remote_base + lane_idx;
+                            ncclGinRequest_t request{};
+                            comm::mega_moe_gin_flush_data_peer_async(
+                                gin_transport, peer,
+                                /*context_stripe=*/ 0u, &request);
+                            comm::mega_moe_gin_wait_data_peer(
+                                gin_transport, /*context_stripe=*/ 0u,
+                                request);
+                            DG_GIN_TRACE_IF(true, 80u + lane_idx);
+                        }
+                        // The world barrier below is warp-cooperative. Do not
+                        // let inactive peer lanes enter it before all eight
+                        // independent peer completions have returned.
+                        __syncwarp();
+                    }
+                }
                 comm::mega_moe_gin_world_barrier(
                     gin_transport, kGinCleanupBarrierIdx,
                     ncclGinFenceLevel::None);
@@ -3976,7 +3999,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // Publish every same-LSA mapped store before handing phase 2 to
             // its visibility protocol. The first local barrier joins this CTA's
             // dispatch phase; the grid below joins all early PUT submissions.
-            // StrongVA mode has also locally completed each peer chain here.
+            // StrongVA mode has queued every peer terminal here, while its
+            // sender-local completion remains deferred until late cleanup.
             __threadfence_system();
             ptx::sync_unaligned(
                 kNumDispatchThreads + kNumEpilogueThreads,

@@ -124,7 +124,7 @@ class ComparisonContractTest(unittest.TestCase):
         )
         self.assertEqual(
             completion["completion"],
-            "post_terminal_same_context_peer_flush",
+            "late_cleanup_post_terminal_same_context_peer_flush",
         )
         self.assertFalse(completion["late_header_put_and_flush_retained"])
         self.assertFalse(completion["final_world_put_barrier_retained"])

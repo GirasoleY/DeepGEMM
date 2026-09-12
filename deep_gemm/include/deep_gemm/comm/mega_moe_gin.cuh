@@ -34,7 +34,8 @@ namespace deep_gemm::comm {
 // 54 TMEM free, 55 combine grid1, 56:58 world barrier begin/end,
 // 58 combine grid2, 59 scatter leader done, 60 scatter grid, 61 reduction begin,
 // 62 cleanup begins, 63 cleanup world barrier done;
-// 64:72 combine issue, 72:80 combine queued, 80:88 combine local completion;
+// 64:72 combine issue, 72:80 combine queued, 80:88 combine local completion
+// (StrongVA terminal mode records this only at late dispatch cleanup);
 // 88:96 reduction-loop exit per warp (last TMA STORE ISSUED, not settled);
 // 96 first MMA task acquired, 97 first MMA operands ready, 98 MMA loop exit;
 // 99 first ready expert selected, 100 all expert payload PUTs queued,
@@ -587,8 +588,8 @@ NCCL_DEVICE_INLINE void mega_moe_gin_put_bulk_combine_span(
 // This PUT deliberately has no completion and no visibility signal. The final
 // submitted record span (or the empty-pair signal below) is the StrongVA
 // terminal for the same (context, peer), and the caller flushes that chain once
-// after posting its terminal. A closed Default PUT keeps the header from
-// holding an aggregate request open while expert computation is still running.
+// at late cleanup before source reuse. A closed Default PUT keeps the header
+// from holding an aggregate request open while expert computation is running.
 NCCL_DEVICE_INLINE void mega_moe_gin_put_bulk_combine_header_async(
     const MegaMoeGinTransport& transport,
     const uint32_t peer,

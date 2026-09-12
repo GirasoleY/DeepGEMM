@@ -950,7 +950,7 @@ def dispatch_candidate_metadata(flags):
                     if strongva_enabled else
                     "early_record_combine_path_and_scratch_alias_fits"
                 ),
-                "completion": ("post_terminal_same_context_peer_flush"
+                "completion": ("late_cleanup_post_terminal_same_context_peer_flush"
                                if strongva_enabled else
                                "late_header_same_context_peer"),
                 "payload_only_flush_before_handoff": False,

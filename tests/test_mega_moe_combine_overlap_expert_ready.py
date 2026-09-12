@@ -116,11 +116,23 @@ class ExpertReadySourceContracts(unittest.TestCase):
                         body.index("get_combine_overlap_sent_ptr(expert) = 1"))
         self.assertLess(body.index("DG_GIN_TRACE_IF(lane_idx == 0, 100)"),
                         body.index("DG_DEVICE_ASSERT(sent_records == expected_records)"))
-        # The default-off branch still defers completion; the StrongVA branch
-        # completes once per peer after its exact final terminal.
+        # Neither branch locally completes in this drainer. The default-off
+        # path retains its late header completion; StrongVA retires each peer
+        # only after dispatch cleanup has overlapped the reducer.
         audit = body.index("DG_DEVICE_ASSERT(sent_records == expected_records)")
-        self.assertLess(audit, body.index("mega_moe_gin_flush_data_peer_async(", audit))
-        self.assertLess(audit, body.index("mega_moe_gin_wait_data_peer(", audit))
+        self.assertLess(audit, body.rindex("__syncwarp();"))
+        self.assertNotIn("mega_moe_gin_flush_data_peer_async(", body)
+        self.assertNotIn("mega_moe_gin_wait_data_peer(", body)
+        self.assertNotIn("DG_GIN_TRACE_IF(true, 80u + lane_idx)", body)
+        cleanup = source[source.index("// Wait for all ranks to finish cleaning"):]
+        cleanup_grid = cleanup.index(
+            "comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(")
+        late_flush = cleanup.index("mega_moe_gin_flush_data_peer_async(", cleanup_grid)
+        late_wait = cleanup.index("mega_moe_gin_wait_data_peer(", late_flush)
+        cleanup_world = cleanup.index("comm::mega_moe_gin_world_barrier(", late_wait)
+        self.assertLess(cleanup_grid, late_flush)
+        self.assertLess(late_flush, late_wait)
+        self.assertLess(late_wait, cleanup_world)
         self.assertNotRegex(source, r"DG_GIN_TRACE(?:_IF)?\([^;]*\b101\b")
 
     def test_all_dispatch_unpack_variants_save_existing_prefix_before_publication(self):
