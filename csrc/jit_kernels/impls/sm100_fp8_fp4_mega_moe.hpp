@@ -43,6 +43,7 @@ public:
         bool gin_dispatch_overlap;
         bool gin_combine_overlap;
         bool gin_strongva_combine_terminal;
+        int gin_combine_owner_waves;
         MegaMoEConfig config;
 
         // Runtime arguments
@@ -93,6 +94,7 @@ public:
 #define DG_MEGAMOE_GIN_DISPATCH_OVERLAP {}
 #define DG_MEGAMOE_GIN_COMBINE_OVERLAP {}
 #define DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL {}
+#define DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES {}
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -130,6 +132,7 @@ static void __instantiate_kernel() {{
     args.gin_dispatch_overlap ? "1" : "0",
     args.gin_combine_overlap ? "1" : "0",
     args.gin_strongva_combine_terminal ? "1" : "0",
+    args.gin_combine_owner_waves,
     args.num_max_tokens_per_rank,
     args.hidden, args.intermediate_hidden,
     args.num_experts, args.num_shared_experts,
@@ -342,6 +345,13 @@ static void sm100_fp8_fp4_mega_moe(
             "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL", "0");
     DG_HOST_ASSERT(gin_strongva_combine_terminal_value == "0" or
                    gin_strongva_combine_terminal_value == "1");
+    const auto gin_combine_owner_waves_value =
+        get_env<std::string>(
+            "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES", "0");
+    DG_HOST_ASSERT(gin_combine_owner_waves_value == "0" or
+                   gin_combine_owner_waves_value == "2" or
+                   gin_combine_owner_waves_value == "4" or
+                   gin_combine_owner_waves_value == "8");
 #ifdef DG_MEGAMOE_GIN
     const int gin_local_ablation_stage = gin_transport_opt.has_value() ?
         get_env<int>("DG_MEGAMOE_GIN_LOCAL_ABLATION_STAGE", 0) : 0;
@@ -456,9 +466,20 @@ static void sm100_fp8_fp4_mega_moe(
                 layout::kMegaMoeGinNumDispatchWarps * (hidden / 32) >=
             layout::kMegaMoeGinDirectDispatchStorageBytes +
                 layout::get_mega_moe_gin_combine_overlap_scratch_bytes());
+    const int gin_combine_owner_waves =
+        gin_combine_owner_waves_value == "2" ? 2 :
+        gin_combine_owner_waves_value == "4" ? 4 :
+        gin_combine_owner_waves_value == "8" ? 8 : 0;
+    DG_HOST_ASSERT(not gin_combine_owner_waves or
+                   (num_ranks == 8 and num_experts == 448 and
+                    gin_strongva_combine_terminal and gin_combine_overlap and
+                    gin_single_combine_context and gin_dispatch_overlap and
+                    gin_direct_dispatch and gin_bulk_combine and
+                    num_experts_per_rank == 56));
 #else
     DG_HOST_ASSERT(gin_combine_overlap_value == "0");
     DG_HOST_ASSERT(gin_strongva_combine_terminal_value == "0");
+    DG_HOST_ASSERT(gin_combine_owner_waves_value == "0");
     constexpr int gin_local_ablation_stage = 0;
     constexpr bool gin_active_fast_path = false;
     constexpr bool gin_activity_gate_opt = false;
@@ -472,6 +493,7 @@ static void sm100_fp8_fp4_mega_moe(
     constexpr bool gin_dispatch_overlap = false;
     constexpr bool gin_combine_overlap = false;
     constexpr bool gin_strongva_combine_terminal = false;
+    constexpr int gin_combine_owner_waves = 0;
 #endif
     const SM100FP8FP4MegaMoERuntime::Args args = {
         .num_max_tokens_per_rank = num_max_tokens_per_rank,
@@ -499,6 +521,7 @@ static void sm100_fp8_fp4_mega_moe(
         .gin_dispatch_overlap = gin_dispatch_overlap,
         .gin_combine_overlap = gin_combine_overlap,
         .gin_strongva_combine_terminal = gin_strongva_combine_terminal,
+        .gin_combine_owner_waves = gin_combine_owner_waves,
         .config = config,
         .y = y.data_ptr(),
         .cumulative_local_expert_recv_stats = cumulative_local_expert_recv_stats_ptr,

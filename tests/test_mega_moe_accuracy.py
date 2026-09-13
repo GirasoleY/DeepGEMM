@@ -104,6 +104,7 @@ GIN_COMBINE_OVERLAP_ENV = "DG_MEGAMOE_GIN_COMBINE_OVERLAP"
 GIN_STRONGVA_COMBINE_TERMINAL_ENV = (
     "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL"
 )
+GIN_COMBINE_OWNER_WAVES_ENV = "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES"
 GIN_EXPERIMENT_FLAG_ENVS: Tuple[str, ...] = (
     GIN_DISPATCH_WARP_SCAN_ENV,
     GIN_COOP_DIRECT_PACK_ENV,
@@ -123,6 +124,13 @@ GIN_LOCAL_ABLATION_STAGES: Dict[int, str] = {
     3: "cumulative_lsa_barriers_and_native_local_counts",
     4: "cumulative_bypass_outbox_and_drainer",
 }
+
+
+def _parse_gin_combine_owner_waves(raw: str) -> int:
+    if raw not in ("0", "2", "4", "8"):
+        raise argparse.ArgumentTypeError(
+            "combine owner waves must be exactly 0, 2, 4, or 8")
+    return int(raw)
 
 
 @dataclass
@@ -2763,6 +2771,14 @@ def _validate_args(args: argparse.Namespace, world_size: int, *,
             raise ValueError(
                 "--gin-direct-dispatch requires "
                 "--num-max-tokens-per-rank >= 384")
+    combine_owner_waves = getattr(args, "gin_combine_owner_waves", 0)
+    if combine_owner_waves:
+        if not (world_size == 8 and args.num_experts == 448 and
+                args.require_gin and args.gin_bulk_combine and
+                args.gin_direct_dispatch and experts_per_rank == 56):
+            raise ValueError(
+                "--gin-combine-owner-waves requires EP8/E448 GIN "
+                "bulk/direct mode")
 
 
 def _validate_gin_host_placement(
@@ -2798,7 +2814,7 @@ def _collect_gin_experiment_flags(
     rank: int,
     world_size: int,
     dist: Any,
-) -> Dict[str, bool]:
+) -> Dict[str, Any]:
     """Validate JIT flags collectively before the first kernel can launch."""
     local_record = {
         "rank": rank,
@@ -2808,11 +2824,15 @@ def _collect_gin_experiment_flags(
         },
         "expert_width": os.getenv("DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE", "0"),
         "barrier_warps": os.getenv("DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS", "1"),
+        "owner_waves": os.getenv(GIN_COMBINE_OWNER_WAVES_ENV, "0"),
     }
     gathered: List[Optional[Dict[str, Any]]] = [None] * world_size
     dist.all_gather_object(gathered, local_record)
 
-    expected_record_keys = {"rank", "direct_dispatch", "flags", "expert_width", "barrier_warps"}
+    expected_record_keys = {
+        "rank", "direct_dispatch", "flags", "expert_width",
+        "barrier_warps", "owner_waves",
+    }
     expected_flag_keys = set(GIN_VALIDATED_FLAG_ENVS)
     for expected_rank, record in enumerate(gathered):
         if not isinstance(record, dict) or set(record) != expected_record_keys:
@@ -2850,7 +2870,7 @@ def _collect_gin_experiment_flags(
         )
     direct_dispatch = direct_dispatch_values[0]
 
-    result: Dict[str, bool] = {}
+    result: Dict[str, Any] = {}
     for name in GIN_VALIDATED_FLAG_ENVS:
         raw_values = [record["flags"][name] for record in gathered]
         invalid = [
@@ -2897,6 +2917,43 @@ def _collect_gin_experiment_flags(
             f"{GIN_PRECONSENSUS_PACK_ENV}=1 requires "
             f"{GIN_COOP_DIRECT_PACK_ENV}=1 on every rank"
         )
+    owner_wave_values = [record["owner_waves"] for record in gathered]
+    invalid_owner_waves = [
+        (rank_idx, value)
+        for rank_idx, value in enumerate(owner_wave_values)
+        if value not in ("0", "2", "4", "8")
+    ]
+    if invalid_owner_waves:
+        raise RuntimeError(
+            f"{GIN_COMBINE_OWNER_WAVES_ENV} must be exactly 0, 2, 4, or 8 "
+            "on every rank, got "
+            + ", ".join(
+                f"rank {rank_idx}={value!r}"
+                for rank_idx, value in invalid_owner_waves
+            )
+        )
+    if len(set(owner_wave_values)) != 1:
+        raise RuntimeError(
+            f"{GIN_COMBINE_OWNER_WAVES_ENV} is not uniform across ranks: "
+            + ", ".join(
+                f"rank {rank_idx}={value!r}"
+                for rank_idx, value in enumerate(owner_wave_values)
+            )
+        )
+    combine_owner_waves = int(owner_wave_values[0])
+    if combine_owner_waves and not (
+            direct_dispatch and world_size == 8 and
+            result[GIN_STRONGVA_COMBINE_TERMINAL_ENV] and
+            result[GIN_COMBINE_OVERLAP_ENV] and
+            result[GIN_SINGLE_COMBINE_CONTEXT_ENV] and
+            result[GIN_DISPATCH_OVERLAP_ENV]):
+        raise RuntimeError(
+            f"{GIN_COMBINE_OWNER_WAVES_ENV}={combine_owner_waves} requires "
+            "EP8 direct dispatch, STRONGVA_COMBINE_TERMINAL=1, "
+            "COMBINE_OVERLAP=1, SINGLE_COMBINE_CONTEXT=1 and "
+            "DISPATCH_OVERLAP=1 on every rank"
+        )
+    result[GIN_COMBINE_OWNER_WAVES_ENV] = combine_owner_waves
     incompatible = [
         record["rank"] for record in gathered
         if record["expert_width"] != "0" or record["barrier_warps"] != "1"
@@ -3162,6 +3219,8 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace,
     # The private compile-time knob must never affect the normal correctness
     # suite, even if a parent shell happens to export it.
     os.environ[GIN_LOCAL_ABLATION_ENV] = "0"
+    os.environ[GIN_COMBINE_OWNER_WAVES_ENV] = str(
+        getattr(args, "gin_combine_owner_waves", 0))
     torch, dist, deep_gemm = _load_runtime()
     buffer = None
     symmetric_memory_registration = None
@@ -3478,6 +3537,7 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace,
                         "combine_chunk_bytes": args.gin_combine_chunk_bytes,
                         "outbox_depth": args.gin_outbox_depth,
                         "combine_issue_wave": args.gin_combine_issue_wave,
+                        "combine_owner_waves": args.gin_combine_owner_waves,
                         "queue_depth": args.gin_queue_depth,
                         "active_fast_path": args.gin_active_fast_path,
                         "bulk_combine": args.gin_bulk_combine,
@@ -3517,6 +3577,7 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace,
             print(perf_record, flush=True)
     finally:
         os.environ[GIN_LOCAL_ABLATION_ENV] = "0"
+        os.environ[GIN_COMBINE_OWNER_WAVES_ENV] = "0"
         # Also retire graphs on a failed validation/benchmark before the
         # symmetric allocation and its GIN registration are destroyed.
         benchmark_graph = None
@@ -3629,6 +3690,16 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gin-combine-issue-wave", type=int, choices=(1, 2, 4, 8), default=8
+    )
+    parser.add_argument(
+        "--gin-combine-owner-waves",
+        type=_parse_gin_combine_owner_waves,
+        choices=(0, 2, 4, 8),
+        default=0,
+        help=(
+            "Compile the StrongVA combine sender with 2, 4, or 8 fixed "
+            "contiguous owner-expert readiness ranges; 0 preserves r4"
+        ),
     )
     parser.add_argument(
         "--gin-active-fast-path",

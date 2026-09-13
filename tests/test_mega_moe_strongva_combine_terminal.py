@@ -382,10 +382,11 @@ class StrongVASourceContracts(unittest.TestCase):
         self.assertIn("if (not use_gin_strongva_combine_terminal)", late)
 
     def test_signal_cells_are_persistent_and_never_reset_by_kernel(self):
-        # The accessor occurs only as a remote terminal target or local wait.
+        # The accessor occurs only as a remote terminal target or local wait;
+        # the compile-time-exclusive owner-wave sender has its own target call.
         # No assignment through it appears in startup, fallback, or cleanup.
         occurrences = self.kernel.count("get_combine_terminal_signal_ptr(")
-        self.assertEqual(occurrences, 3)
+        self.assertEqual(occurrences, 4)
         self.assertNotIn("*buffer.gin_workspace\n"
                          "                     .get_combine_terminal_signal_ptr",
                          self.kernel)

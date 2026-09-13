@@ -98,11 +98,11 @@ class ExpertReadySourceContracts(unittest.TestCase):
         self.assertNotIn("pending_", accepted)
         self.assertLess(body.index(planner) + len(planner), body.index("if (batch_records != 0)"))
         submission = braced_block(body, body.index("if (batch_records != 0)"))
-        # One ordinary helper remains in each compile-time branch: non-final
-        # StrongVA spans and the unchanged default-off path.
-        self.assertEqual(body.count("comm::mega_moe_gin_put_bulk_combine_span("), 2)
+        # The default r4 branch retains its two compile-time cases; the
+        # mutually exclusive owner-wave branch adds one non-final span call.
+        self.assertEqual(body.count("comm::mega_moe_gin_put_bulk_combine_span("), 3)
         self.assertEqual(
-            body.count("comm::mega_moe_gin_put_bulk_combine_terminal_span("), 1)
+            body.count("comm::mega_moe_gin_put_bulk_combine_terminal_span("), 2)
         issue = submission.index("comm::mega_moe_gin_put_bulk_combine_span(")
         self.assertLess(issue, submission.index("pending_first = remaining_first"))
         self.assertLess(issue, submission.index("pending_second = remaining_second"))

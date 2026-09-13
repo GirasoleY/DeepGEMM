@@ -21,6 +21,9 @@ GIN uses the existing full MegaMoE/DeepEP+TRT benchmark pair unchanged. Native
 times only MegaMoE, with the same backend-isolated CUDA-event convention.
 Inputs/weights are sparse-valued full-shape fixtures, not random-dense timing.
 This is not a production trace or a compute-only floor measurement.
+
+Use ``--gin-combine-owner-waves {2,4,8}`` for the immutable coarse owner-range
+sweep. The default 0 is the unchanged r4 ready-expert sender.
 """
 
 from __future__ import annotations
@@ -75,6 +78,16 @@ def parse_args(argv=None):
     parser.add_argument("--graph-replays", type=int, default=32)
     parser.add_argument("--payload-epochs", type=int, default=3)
     parser.add_argument("--profile-recipe", action="store_true")
+    parser.add_argument(
+        "--gin-combine-owner-waves",
+        type=accuracy._parse_gin_combine_owner_waves,
+        choices=(0, 2, 4, 8),
+        default=0,
+        help=(
+            "Compile 2, 4, or 8 independently ready contiguous owner-expert "
+            "ranges; 0 preserves the r4 sender"
+        ),
+    )
     options = parser.parse_args(argv)
     if options.comparison_replays < 2:
         parser.error("at least two timed replays are required for split summaries")
@@ -85,6 +98,9 @@ def parse_args(argv=None):
         parser.error("changing-payload correctness must remain enabled")
     if options.profile_recipe and options.mode not in GIN_MODES:
         parser.error("recipe profiling applies only to the GIN + DeepEP/TRT job")
+    if options.gin_combine_owner_waves and (
+            options.mode not in GIN_MODES or options.world_size != 8):
+        parser.error("--gin-combine-owner-waves requires an EP8 GIN mode")
     common = ["--k3", "--decode-mns", str(options.decode_mns),
               "--num-experts", str(56 * options.world_size),
               "--eager-iterations", str(options.eager_iterations),
@@ -92,6 +108,7 @@ def parse_args(argv=None):
               "--payload-epochs", str(options.payload_epochs), "--require-cross-host",
               "--no-fast-math", "--activation-clamp", "10",
               "--gin-completion-batch", "8", "--gin-combine-issue-wave", "8",
+              "--gin-combine-owner-waves", str(options.gin_combine_owner_waves),
               "--gin-outbox-depth", "64", "--gin-combine-chunk-bytes", "7168"]
     if options.mode in GIN_MODES:
         common += ["--require-gin", "--gin-active-fast-path", "--gin-bulk-combine",
@@ -111,12 +128,17 @@ def parse_args(argv=None):
     return options, args, comparison
 
 
-def fixed_environment(mode):
+def fixed_environment(mode, combine_owner_waves=0):
     if mode not in MODES:
         raise ValueError("mode must be native_nvl, gin_ib or gin_roce")
+    if type(combine_owner_waves) is not int or combine_owner_waves not in (0, 2, 4, 8):
+        raise ValueError("combine_owner_waves must be exactly 0, 2, 4, or 8")
+    if combine_owner_waves and mode not in GIN_MODES:
+        raise ValueError("combine_owner_waves requires a GIN mode")
     enabled = "1" if mode in GIN_MODES else "0"
     return {
         **{name: enabled for name in accuracy.GIN_VALIDATED_FLAG_ENVS},
+        accuracy.GIN_COMBINE_OWNER_WAVES_ENV: str(combine_owner_waves),
         accuracy.GIN_ACTIVITY_GATE_OPT_ENV: enabled,
         "DG_MEGAMOE_GIN_DIAGNOSTICS": "0",
         accuracy.GIN_LOCAL_ABLATION_ENV: "0",
@@ -192,7 +214,28 @@ def configuration(options, args, comparison, sources):
         "profile_recipe": comparison.profile_recipe,
         "deepep": {"num_sms": 16, "num_qps": 9, "capacity": 384,
                    **comparison.dispatch_bucket_evidence},
-        "megamoe_environment": fixed_environment(options.mode),
+        "megamoe_environment": fixed_environment(
+            options.mode, options.gin_combine_owner_waves),
+        "combine_owner_waves": {
+            "requested": options.gin_combine_owner_waves,
+            "expert_ranges": (
+                [
+                    [wave * (56 // options.gin_combine_owner_waves),
+                     (wave + 1) * (56 // options.gin_combine_owner_waves)]
+                    for wave in range(options.gin_combine_owner_waves)
+                ]
+                if options.gin_combine_owner_waves else []
+            ),
+            "readiness": (
+                "all contributing expert assignments in each peer/range"
+            ),
+            "nonempty_submission": "one dense payload span per ready range",
+            "range_submission_order": "readiness order, not address order",
+            "terminal": "actual last submitted nonempty range carries StrongVA",
+            "empty_pair_terminal": "unchanged signal-only terminal",
+            "header_late_completion_receiver_reducer_layout_math_tiling_sm_changed": False,
+            "basis": "explicit option and source contract, not device observation",
+        },
         "math": {"fast_math": False, "activation_clamp": 10.0,
                  "compute_hint": None, "compute_configuration_override": None},
         "source_sha256": sources,
@@ -375,7 +418,8 @@ def main():
             or os.getenv("WORLD_SIZE") != str(options.world_size)):
         raise RuntimeError("use a fresh torchrun job with four workers/host and the selected EP8/EP16 world")
     matched.validate_clean_experiment_environment()
-    os.environ.update(fixed_environment(options.mode))
+    os.environ.update(fixed_environment(
+        options.mode, options.gin_combine_owner_waves))
     from mega_moe_gb200_topology import GB200Topology
     sources = source_manifest()
     config = configuration(options, args, comparison, sources)
@@ -455,7 +499,8 @@ def main():
         "source_attestation_scope": "listed source files plus per-rank extension hash; external headers/JIT binary not attested",
     }
     if options.mode in GIN_MODES:
-        record.update(matched.dispatch_candidate_metadata(fixed_environment(options.mode)))
+        record.update(matched.dispatch_candidate_metadata(fixed_environment(
+            options.mode, options.gin_combine_owner_waves)))
         record["quantization_boundary"] = {
             "intermediate_quantizers_identical": False,
             "trtllm_intermediate_scale": "2**(floor(log2(amax))-8), per32 UE8M0 with saturating FP8 RNE",

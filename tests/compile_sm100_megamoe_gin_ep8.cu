@@ -1,5 +1,5 @@
 // Compile-only EP8/E448 coverage; the existing EP16 TU is unchanged.
-// Compile twice with DG_MEGAMOE_GIN_COMBINE_OVERLAP=0/1 for R7b controls.
+// Compile with DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES=0/2/4/8 for the r9 sweep.
 // DG_EP8_COMPILE_NATIVE=1 selects the native EP8 specialization instead.
 // These representative template profiles do not override runtime heuristics:
 // actual selected stages/ring sizes must still be recorded by the GPU harness.

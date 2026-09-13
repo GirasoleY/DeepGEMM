@@ -80,6 +80,10 @@
 #define DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL 0
 #endif
 
+#ifndef DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES
+#define DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES 0
+#endif
+
 // Retired experiment switches must not silently select an unsupported path.
 #if defined(DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE) && DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE != 0
 #error "Expert-wave combine is not part of the clean single-context candidate"
@@ -195,6 +199,16 @@ static_assert(DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL == 0 or
 static_assert(not kMegaMoeGinStrongVACombineTerminal or
               kMegaMoeGinCombineOverlap,
               "GIN StrongVA combine terminal requires combine overlap");
+static constexpr uint32_t kMegaMoeGinCombineOwnerWaves =
+    DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES;
+static_assert(kMegaMoeGinCombineOwnerWaves == 0 or
+              kMegaMoeGinCombineOwnerWaves == 2 or
+              kMegaMoeGinCombineOwnerWaves == 4 or
+              kMegaMoeGinCombineOwnerWaves == 8,
+              "Invalid MegaMoE GIN combine owner-wave count");
+static_assert(kMegaMoeGinCombineOwnerWaves == 0 or
+              kMegaMoeGinStrongVACombineTerminal,
+              "GIN combine owner waves require the StrongVA terminal protocol");
 
 template <
     uint32_t kNumMaxTokensPerRank,
@@ -2507,6 +2521,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
 
+                if constexpr (kMegaMoeGinCombineOwnerWaves == 0) {
                 // Every lane stays in the uniform outer loop, including idle
                 // peers and lanes8..31 which discover the other experts. Peer
                 // lanes may choose DIFFERENT expert spans in the same round.
@@ -2691,6 +2706,226 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         pending_second = remaining_second;
                     }
                     __syncwarp();
+                }
+                } else {
+                    // Divide the fixed 56 owner experts into equal, contiguous
+                    // ranges.  Each source-peer lane owns an independent pending
+                    // range mask: a nonempty range is submitted exactly once as
+                    // soon as every expert contributing records to that peer is
+                    // complete. Different peers and ranges may therefore issue
+                    // in different (including non-address) orders.
+                    constexpr uint32_t kOwnerWaveDivisor =
+                        kMegaMoeGinCombineOwnerWaves == 0
+                            ? 1u : kMegaMoeGinCombineOwnerWaves;
+                    DG_STATIC_ASSERT(
+                        kNumRanks == 8 and kNumExperts == 448 and
+                        kGinPeerCount == 4 and kNumExpertsPerRank == 56 and
+                        kNumExpertsPerRank % kOwnerWaveDivisor == 0,
+                        "Owner waves require EP8/E448 with 56 evenly "
+                        "partitioned experts");
+                    constexpr uint32_t kExpertsPerOwnerWave =
+                        kNumExpertsPerRank / kOwnerWaveDivisor;
+                    const auto get_owner_wave_group_mask = [=](
+                            const uint32_t& owner_wave,
+                            const uint32_t& group) {
+                        const uint32_t range_begin =
+                            owner_wave * kExpertsPerOwnerWave;
+                        const uint32_t range_end =
+                            range_begin + kExpertsPerOwnerWave;
+                        const uint32_t group_begin = group * 32u;
+                        const uint32_t group_end = group_begin + 32u;
+                        const uint32_t begin = range_begin > group_begin
+                            ? range_begin : group_begin;
+                        const uint32_t end = range_end < group_end
+                            ? range_end : group_end;
+                        if (begin >= end)
+                            return 0u;
+                        const uint32_t width = end - begin;
+                        const uint32_t low_bits = width == 32u
+                            ? 0xffffffffu : (1u << width) - 1u;
+                        return low_bits << (begin - group_begin);
+                    };
+                    uint32_t pending_owner_waves = 0;
+                    if (peer_lane) {
+                        #pragma unroll
+                        for (uint32_t owner_wave = 0;
+                             owner_wave < kMegaMoeGinCombineOwnerWaves;
+                             ++owner_wave) {
+                            const bool nonempty_wave =
+                                (pending_first &
+                                 get_owner_wave_group_mask(owner_wave, 0u)) != 0 or
+                                (pending_second &
+                                 get_owner_wave_group_mask(owner_wave, 1u)) != 0;
+                            if (nonempty_wave)
+                                pending_owner_waves |= 1u << owner_wave;
+                        }
+                    }
+
+                    while (__any_sync(
+                            0xffffffffu, pending_owner_waves != 0)) {
+                        // Preserve the r4 warp-parallel monotonic readiness
+                        // discovery.  A peer-specific range becomes eligible
+                        // only when its complete nonempty expert subset is in
+                        // these common ready masks.
+                        #pragma unroll
+                        for (uint32_t group = 0;
+                             group < kNumExpertGroups; ++group) {
+                            const uint32_t expert = group * 32u + lane_idx;
+                            bool newly_ready = false;
+                            if (not discovered[group]) {
+                                const uint32_t completed =
+                                    comm::mega_moe_gin_combine_ready_acquire(
+                                        buffer.gin_workspace
+                                            .get_combine_overlap_ready_ptr(
+                                                expert));
+                                DG_DEVICE_ASSERT(
+                                    completed <= expected_fragments[group]);
+                                newly_ready =
+                                    completed == expected_fragments[group];
+                                discovered[group] = newly_ready;
+                            }
+                            ready_masks[group] |= __ballot_sync(
+                                0xffffffffu, newly_ready);
+                        }
+
+                        uint32_t ready_owner_waves = 0;
+                        if (peer_lane) {
+                            #pragma unroll
+                            for (uint32_t owner_wave = 0;
+                                 owner_wave < kMegaMoeGinCombineOwnerWaves;
+                                 ++owner_wave) {
+                                const uint32_t owner_wave_bit =
+                                    1u << owner_wave;
+                                if ((pending_owner_waves & owner_wave_bit) == 0)
+                                    continue;
+                                const uint32_t contributing_first =
+                                    pending_first &
+                                    get_owner_wave_group_mask(owner_wave, 0u);
+                                const uint32_t contributing_second =
+                                    pending_second &
+                                    get_owner_wave_group_mask(owner_wave, 1u);
+                                const bool all_contributing_experts_ready =
+                                    (contributing_first & ~ready_masks[0]) == 0 and
+                                    (contributing_second & ~ready_masks[1]) == 0;
+                                if (all_contributing_experts_ready)
+                                    ready_owner_waves |= owner_wave_bit;
+                            }
+                        }
+
+                        const bool has_ready_owner_wave =
+                            ready_owner_waves != 0;
+#if DG_MEGAMOE_GIN_DIAGNOSTICS
+                        const uint32_t ready_peer_lanes = __ballot_sync(
+                            0xffffffffu, has_ready_owner_wave);
+                        DG_GIN_TRACE_FIRST_IF(
+                            lane_idx == 0 and ready_peer_lanes != 0, 99);
+#endif
+                        if (has_ready_owner_wave) {
+                            const uint32_t owner_wave =
+                                static_cast<uint32_t>(
+                                    __ffs(ready_owner_waves) - 1);
+                            const uint32_t owner_wave_bit = 1u << owner_wave;
+                            const uint32_t expert_begin =
+                                owner_wave * kExpertsPerOwnerWave;
+                            const uint32_t expert_end =
+                                expert_begin + kExpertsPerOwnerWave;
+                            uint32_t batch_prefix = 0;
+                            uint32_t batch_records = 0;
+                            for (uint32_t expert = expert_begin;
+                                 expert < expert_end; ++expert) {
+                                const uint32_t count = static_cast<uint32_t>(
+                                    *workspace.get_expert_recv_count_ptr(
+                                        peer, expert));
+                                if (count == 0)
+                                    continue;
+                                const uint32_t prefix =
+                                    *buffer.gin_workspace
+                                         .get_combine_overlap_prefix_ptr(
+                                             lane_idx, expert);
+                                const uint32_t target =
+                                    math::ceil_div(static_cast<uint32_t>(
+                                        *workspace
+                                             .get_expert_recv_count_sum_ptr(
+                                                 expert)), BLOCK_M) *
+                                    kNumL2Fragments;
+                                DG_DEVICE_ASSERT(
+                                    target != 0 and
+                                    prefix + count <=
+                                        layout::kMegaMoeGinBulkCombineMaxTokens *
+                                            kNumTopk);
+                                uint32_t completed;
+                                do {
+                                    completed =
+                                        comm::mega_moe_gin_combine_ready_acquire(
+                                            buffer.gin_workspace
+                                                .get_combine_overlap_ready_ptr(
+                                                    expert));
+                                    DG_DEVICE_ASSERT(completed <= target);
+                                } while (completed != target);
+                                if (batch_records == 0) {
+                                    batch_prefix = prefix;
+                                } else {
+                                    DG_DEVICE_ASSERT(
+                                        prefix == batch_prefix + batch_records);
+                                }
+                                batch_records += count;
+                            }
+                            DG_DEVICE_ASSERT(batch_records != 0);
+                            const uint32_t remaining_owner_waves =
+                                pending_owner_waves & ~owner_wave_bit;
+                            DG_DEVICE_ASSERT(
+                                sent_records + batch_records <=
+                                    expected_records);
+                            const bool is_final_submission =
+                                remaining_owner_waves == 0;
+                            DG_DEVICE_ASSERT(
+                                is_final_submission ==
+                                (sent_records + batch_records ==
+                                 expected_records));
+                            if (is_final_submission) {
+                                // The terminal follows submission order, not
+                                // expert-address order: StrongVA settles every
+                                // preceding same-context/peer range and header.
+                                comm::mega_moe_gin_put_bulk_combine_terminal_span(
+                                    gin_transport, peer,
+                                    /*context_stripe=*/ 0u,
+                                    sym_buffer.get_base_ptr(),
+                                    buffer.gin_workspace
+                                        .get_bulk_combine_record_ptr(
+                                            /*send=*/ true, lane_idx,
+                                            batch_prefix),
+                                    buffer.gin_workspace
+                                        .get_bulk_combine_record_ptr(
+                                            /*send=*/ false, owner_lane,
+                                            batch_prefix),
+                                    buffer.gin_workspace
+                                        .get_combine_terminal_signal_ptr(
+                                            owner_lane),
+                                    batch_records *
+                                        buffer.gin_workspace.bulk_record_bytes,
+                                    /*diagnostic_peer_lane=*/ lane_idx);
+                            } else {
+                                comm::mega_moe_gin_put_bulk_combine_span(
+                                    gin_transport, peer,
+                                    /*context_stripe=*/ 0u,
+                                    sym_buffer.get_base_ptr(),
+                                    buffer.gin_workspace
+                                        .get_bulk_combine_record_ptr(
+                                            /*send=*/ true, lane_idx,
+                                            batch_prefix),
+                                    buffer.gin_workspace
+                                        .get_bulk_combine_record_ptr(
+                                            /*send=*/ false, owner_lane,
+                                            batch_prefix),
+                                    batch_records *
+                                        buffer.gin_workspace.bulk_record_bytes,
+                                    /*diagnostic_peer_lane=*/ lane_idx);
+                            }
+                            sent_records += batch_records;
+                            pending_owner_waves = remaining_owner_waves;
+                        }
+                        __syncwarp();
+                    }
                 }
 
                 DG_GIN_TRACE_IF(lane_idx == 0, 100);

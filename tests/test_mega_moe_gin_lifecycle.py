@@ -112,6 +112,7 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
             'DG_MEGAMOE_GIN_DISPATCH_OVERLAP': '0',
             'DG_MEGAMOE_GIN_COMBINE_OVERLAP': '0',
             'DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL': '0',
+            'DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES': '0',
             'DG_MEGAMOE_GIN_PRECONSENSUS_PACK': '0',
             'DG_MEGAMOE_GIN_COOP_DIRECT_PACK': '0',
             'DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE': '0',
@@ -555,6 +556,7 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
         self.assertEqual(gathered_config['single_combine_context'], '1')
         self.assertEqual(gathered_config['combine_experts_per_wave'], '0')
         self.assertEqual(gathered_config['combine_barrier_warps'], '1')
+        self.assertEqual(gathered_config['combine_owner_waves'], '0')
 
     def test_protocol_change_contract_is_documented_without_hot_path_collective(self):
         self.assertIn('caller-enforced rank agreement', SymmBuffer.enable_gin.__doc__)
@@ -658,6 +660,69 @@ class TestMegaMoeGinLifecycle(unittest.TestCase):
             symm_buffer._collective_validate_gin_config({'enabled': True}, 9, 64, 4, 8, 'gdaki')
         self.all_gather_object.assert_called_once()
         self.assertEqual(self.all_gather_object.call_args.args[1]['combine_overlap'], '1')
+
+    def test_combine_owner_waves_are_exact_collective_and_dependency_checked(self):
+        dependency_env = {
+            'DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT': '1',
+            'DG_MEGAMOE_GIN_DISPATCH_OVERLAP': '1',
+            'DG_MEGAMOE_GIN_COMBINE_OVERLAP': '1',
+            'DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL': '1',
+            'DG_MEGAMOE_GIN_PRECONSENSUS_PACK': '1',
+            'DG_MEGAMOE_GIN_COOP_DIRECT_PACK': '1',
+        }
+
+        def configured_buffer():
+            result = _uninitialized_symm_buffer()
+            result.group = _FakeGroup(size=8)
+            result.buffer_ptrs = [0x1000 + peer for peer in range(8)]
+            result.num_experts = 448
+            result.gin_active_fast_path = True
+            result.gin_bulk_combine = True
+            result.gin_direct_dispatch = True
+            result.gin_outbox_depth = 64
+            return result
+
+        for raw in ('0', '2', '4', '8'):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {
+                    **dependency_env,
+                    'DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES': raw}):
+                self.all_gather_object.reset_mock()
+                configured_buffer()._collective_validate_gin_config(
+                    {'enabled': True}, 9, 64, 4, 4, 'gdaki')
+                self.assertEqual(
+                    self.all_gather_object.call_args.args[1]
+                        ['combine_owner_waves'], raw)
+
+        for raw in ('1', '3', '6', '02', '8 ', ''):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {
+                    **dependency_env,
+                    'DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES': raw}):
+                self.all_gather_object.reset_mock()
+                with self.assertRaisesRegex(
+                        RuntimeError, 'must be exactly 0, 2, 4, or 8'):
+                    configured_buffer()._collective_validate_gin_config(
+                        {'enabled': True}, 9, 64, 4, 4, 'gdaki')
+                self.all_gather_object.assert_called_once()
+
+        with mock.patch.dict(os.environ, {
+                'DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES': '2'}):
+            with self.assertRaisesRegex(RuntimeError,
+                                        'combine_owner_waves requires'):
+                configured_buffer()._collective_validate_gin_config(
+                    {'enabled': True}, 9, 64, 4, 4, 'gdaki')
+
+        def skew(output, local, group):
+            _mirror_all_gather_object(output, local, group)
+            output[7]['combine_owner_waves'] = '8'
+
+        with mock.patch.dict(os.environ, {
+                **dependency_env,
+                'DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES': '4'}):
+            self.all_gather_object.side_effect = skew
+            with self.assertRaisesRegex(RuntimeError,
+                                        'configuration mismatch across ranks'):
+                configured_buffer()._collective_validate_gin_config(
+                    {'enabled': True}, 9, 64, 4, 4, 'gdaki')
 
     def test_dispatch_overlap_invalid_raw_values_fail_collectively_before_uid(self):
         for raw in ('', 'true', '01', '2', '-1', ' 1', '1 ', '1suffix'):

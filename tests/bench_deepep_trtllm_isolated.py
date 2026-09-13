@@ -923,8 +923,18 @@ def dispatch_candidate_metadata(flags):
     strongva_enabled = strongva_raw == "1"
     if strongva_enabled and not combine_enabled:
         raise ValueError("StrongVA combine terminal requires combine overlap1")
+    owner_waves_raw = flags.get(
+        "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES", "0")
+    if owner_waves_raw not in ("0", "2", "4", "8"):
+        raise ValueError(
+            "combine owner-wave metadata requires exactly 0, 2, 4, or 8")
+    owner_waves = int(owner_waves_raw)
+    if owner_waves and not strongva_enabled:
+        raise ValueError(
+            "combine owner waves require StrongVA combine terminal1")
     return {
-        "candidate_family": ("direct_control_first_dispatch_ready_coalesced_direct_reduce_strongva_terminal" if strongva_enabled else
+        "candidate_family": ("direct_control_first_dispatch_coarse_owner_waves_direct_reduce_strongva_terminal" if owner_waves else
+                             "direct_control_first_dispatch_ready_coalesced_direct_reduce_strongva_terminal" if strongva_enabled else
                              "direct_control_first_dispatch_ready_coalesced_direct_reduce_preload_late_flush" if combine_enabled else
                              "direct_control_first_dispatch" if enabled else
                              "clean_single_combine_context_only"),
@@ -932,17 +942,47 @@ def dispatch_candidate_metadata(flags):
             "requested_raw": combine_raw, "requested": combine_enabled,
             "strongva_terminal_requested_raw": strongva_raw,
             "strongva_terminal_requested": strongva_enabled,
+            "combine_owner_waves_requested_raw": owner_waves_raw,
+            "combine_owner_waves_requested": owner_waves,
+            "experts_per_owner_wave": 56 // owner_waves if owner_waves else None,
+            "owner_wave_ranges": (
+                [[wave * (56 // owner_waves),
+                  (wave + 1) * (56 // owner_waves)]
+                 for wave in range(owner_waves)]
+                if owner_waves else []
+            ),
             "readiness_unit": "complete expert output, using actual expert assignment counts",
             "producer_target": "ceil(actual expert assignments / actual BM) * (H / BN)",
             "combine_schedule": (
+                "peer_parallel_fixed_contiguous_owner_waves_with_actual_last_strongva_terminal"
+                if owner_waves else
                 "peer_parallel_ready_coalesced_spans_with_final_strongva_terminal"
                 if strongva_enabled else
                 "peer_parallel_ready_coalesced_spans_then_late_header"
             ),
-            "ready_selection_policy": "warp_parallel_readiness_peer_independent_bounded_ready_coalescing",
-            "early_payload_policy": "each peer independently selects at most eight already-ready adjacent expert spans; never waits for future readiness",
+            "ready_selection_policy": (
+                "warp_parallel_expert_discovery_with_peer_independent_ready_owner_ranges"
+                if owner_waves else
+                "warp_parallel_readiness_peer_independent_bounded_ready_coalescing"),
+            "early_payload_policy": (
+                "each peer submits a nonempty fixed range once every contributing expert is ready; ranges may issue out of address order"
+                if owner_waves else
+                "each peer independently selects at most eight already-ready adjacent expert spans; never waits for future readiness"),
             "readiness_tracking": "common monotonic discovered-ready experts; independent per-peer pending-ready selection",
-            "submission_granularity": "one nonaggregate PUT per bounded contiguous ready batch; fixed cap8",
+            "submission_granularity": (
+                "one nonaggregate PUT per nonempty fixed contiguous owner range"
+                if owner_waves else
+                "one nonaggregate PUT per bounded contiguous ready batch; fixed cap8"),
+            "owner_wave_protocol": {
+                "requested": bool(owner_waves),
+                "number_of_ranges": owner_waves,
+                "exact_count_header_changed": False,
+                "range_submission_order": "readiness order, not address order",
+                "terminal_attaches_to_actual_last_submitted_nonempty_range": bool(owner_waves),
+                "empty_pair_signal_changed": False,
+                "late_sender_completion_changed": False,
+                "receiver_reducer_packet_layout_math_tiling_sm_changed": False,
+            },
             "combine_payload_local_completion": {
                 "requested_by_combine_overlap": combine_enabled,
                 "eligibility": (
@@ -1042,6 +1082,7 @@ def main():
             "DG_MEGAMOE_GIN_DISPATCH_OVERLAP",
             "DG_MEGAMOE_GIN_COMBINE_OVERLAP",
             "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL",
+            "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES",
         )}
         rank_flags = [None] * dist.get_world_size()
         dist.all_gather_object(rank_flags, flags)

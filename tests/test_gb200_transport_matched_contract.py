@@ -64,6 +64,44 @@ class ParsingContracts(unittest.TestCase):
         with patch("sys.stderr"), self.assertRaises(SystemExit):
             self.parse("native_nvl", 8, "--profile-recipe")
 
+    def test_owner_wave_sweep_is_explicit_exact_and_forwarded(self):
+        for waves in (2, 4, 8):
+            with self.subTest(waves=waves):
+                options, args, comparison = self.parse(
+                    "gin_roce", 8, "--world-size", "8",
+                    "--gin-combine-owner-waves", str(waves))
+                self.assertEqual(options.gin_combine_owner_waves, waves)
+                self.assertEqual(args.gin_combine_owner_waves, waves)
+                env = runner.fixed_environment(options.mode, waves)
+                self.assertEqual(
+                    env[runner.accuracy.GIN_COMBINE_OWNER_WAVES_ENV],
+                    str(waves))
+                config = runner.configuration(
+                    options, args, comparison, {})["combine_owner_waves"]
+                self.assertEqual(config["requested"], waves)
+                self.assertEqual(config["expert_ranges"][0], [0, 56 // waves])
+                self.assertEqual(config["expert_ranges"][-1],
+                                 [56 - 56 // waves, 56])
+                metadata = runner.matched.dispatch_candidate_metadata(env)
+                contract = metadata["combine_overlap_contract"]
+                self.assertEqual(contract["combine_owner_waves_requested"], waves)
+                self.assertEqual(contract["owner_wave_ranges"],
+                                 config["expert_ranges"])
+        for invalid in ("1", "3", "6", "02"):
+            with self.subTest(invalid=invalid), patch("sys.stderr"), \
+                    self.assertRaises(SystemExit):
+                self.parse("gin_ib", 8,
+                           "--gin-combine-owner-waves", invalid)
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            self.parse("native_nvl", 8,
+                       "--gin-combine-owner-waves", "2")
+        source = Path(runner.__file__).read_text()
+        final_forward = source.split(
+            "record.update(matched.dispatch_candidate_metadata", 1)[1]
+        self.assertIn(
+            "options.mode, options.gin_combine_owner_waves",
+            final_forward[:300])
+
     def test_configuration_fixes_logical_not_physical_placement(self):
         options, args, comparison = self.parse()
         config = runner.configuration(options, args, comparison, {"source": "digest"})
@@ -81,6 +119,8 @@ class ParsingContracts(unittest.TestCase):
             self.assertEqual(env[runner.accuracy.GIN_ACTIVITY_GATE_OPT_ENV],
                              "1" if mode in runner.GIN_MODES else "0")
             self.assertEqual(env[runner.accuracy.GIN_LOCAL_ABLATION_ENV], "0")
+            self.assertEqual(
+                env[runner.accuracy.GIN_COMBINE_OWNER_WAVES_ENV], "0")
             self.assertEqual(env["DG_MEGAMOE_GIN_DIAGNOSTICS"], "0")
             self.assertFalse(any("NUM_SMS" in key or "BLOCK_M" in key for key in env))
         with self.assertRaises(ValueError):

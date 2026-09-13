@@ -140,6 +140,47 @@ class ComparisonContractTest(unittest.TestCase):
             comparison.dispatch_candidate_metadata({
                 **flags, "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "0"})
 
+    def test_coarse_owner_wave_metadata_is_exact(self):
+        base = {
+            "DG_MEGAMOE_GIN_DISPATCH_OVERLAP": "1",
+            "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
+            "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1",
+            "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL": "1",
+        }
+        for waves in (2, 4, 8):
+            with self.subTest(waves=waves):
+                metadata = comparison.dispatch_candidate_metadata({
+                    **base,
+                    "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES": str(waves),
+                })
+                self.assertIn("coarse_owner_waves",
+                              metadata["candidate_family"])
+                contract = metadata["combine_overlap_contract"]
+                self.assertEqual(
+                    contract["combine_owner_waves_requested"], waves)
+                self.assertEqual(contract["experts_per_owner_wave"],
+                                 56 // waves)
+                self.assertEqual(contract["owner_wave_ranges"][0],
+                                 [0, 56 // waves])
+                self.assertEqual(contract["owner_wave_ranges"][-1],
+                                 [56 - 56 // waves, 56])
+                self.assertTrue(contract["owner_wave_protocol"][
+                    "terminal_attaches_to_actual_last_submitted_nonempty_range"])
+        for invalid in ("1", "3", "6", "02", "8 ", 2):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    ValueError, "exactly 0, 2, 4, or 8"):
+                comparison.dispatch_candidate_metadata({
+                    **base,
+                    "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES": invalid,
+                })
+        with self.assertRaisesRegex(ValueError,
+                                    "require StrongVA combine terminal1"):
+            comparison.dispatch_candidate_metadata({
+                **base,
+                "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL": "0",
+                "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES": "2",
+            })
+
     def test_dispatch_metadata_distinguishes_control_first_without_claiming_measured_overlap(self):
         for raw, family in (("0", "clean_single_combine_context_only"),
                             ("1", "direct_control_first_dispatch")):

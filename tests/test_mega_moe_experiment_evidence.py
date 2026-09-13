@@ -33,13 +33,14 @@ def _args(*, direct_dispatch=False):
 
 def _records(*, warp="0", coop="0", prepack="0", single="0",
              dispatch="0", combine="0", strongva="0", direct=False,
-             world_size=16):
+             world_size=16, owner_waves="0"):
     return [
         {
             "rank": rank,
             "direct_dispatch": direct,
             "expert_width": "0",
             "barrier_warps": "1",
+            "owner_waves": owner_waves,
             "flags": {
                 accuracy.GIN_DISPATCH_WARP_SCAN_ENV: warp,
                 accuracy.GIN_COOP_DIRECT_PACK_ENV: coop,
@@ -123,6 +124,7 @@ class TestMegaMoeExperimentEvidence(unittest.TestCase):
                 "DG_MEGAMOE_GIN_DISPATCH_OVERLAP": False,
                 "DG_MEGAMOE_GIN_COMBINE_OVERLAP": False,
                 "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL": False,
+                "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES": 0,
             },
         )
 
@@ -151,6 +153,41 @@ class TestMegaMoeExperimentEvidence(unittest.TestCase):
             accuracy._collect_gin_experiment_flags(
                 _args(direct_dispatch=True), 0, 16,
                 _FakeDist(_records(strongva="1", direct=True)),
+            )
+
+    def test_owner_wave_count_is_exact_uniform_and_strongva_dependent(self):
+        name = accuracy.GIN_COMBINE_OWNER_WAVES_ENV
+        for waves in (2, 4, 8):
+            with self.subTest(waves=waves):
+                records = _records(
+                    single="1", dispatch="1", combine="1", strongva="1",
+                    direct=True, world_size=8, owner_waves=str(waves),
+                )
+                evidence = accuracy._collect_gin_experiment_flags(
+                    _args(direct_dispatch=True), 0, 8, _FakeDist(records))
+                self.assertEqual(evidence[name], waves)
+        for invalid in ("1", "3", "6", "02", "8 ", ""):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    RuntimeError, "must be exactly 0, 2, 4, or 8"):
+                accuracy._collect_gin_experiment_flags(
+                    _args(direct_dispatch=True), 0, 8,
+                    _FakeDist(_records(
+                        single="1", dispatch="1", combine="1", strongva="1",
+                        direct=True, world_size=8, owner_waves=invalid)),
+                )
+        skewed = _records(
+            single="1", dispatch="1", combine="1", strongva="1",
+            direct=True, world_size=8, owner_waves="4",
+        )
+        skewed[3]["owner_waves"] = "8"
+        with self.assertRaisesRegex(RuntimeError, "not uniform across ranks"):
+            accuracy._collect_gin_experiment_flags(
+                _args(direct_dispatch=True), 0, 8, _FakeDist(skewed))
+        with self.assertRaisesRegex(RuntimeError, "requires EP8 direct dispatch"):
+            accuracy._collect_gin_experiment_flags(
+                _args(direct_dispatch=True), 0, 8,
+                _FakeDist(_records(
+                    direct=True, world_size=8, owner_waves="2")),
             )
 
     def test_enabled_flags_are_collectively_emitted(self):

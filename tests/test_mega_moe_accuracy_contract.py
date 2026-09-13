@@ -26,6 +26,7 @@ def _args(**overrides):
         "gin_combine_chunk_bytes": 7168,
         "gin_outbox_depth": 8,
         "gin_combine_issue_wave": 8,
+        "gin_combine_owner_waves": 0,
         "gin_queue_depth": 64,
         "gin_active_fast_path": False,
         "gin_bulk_combine": False,
@@ -146,6 +147,45 @@ class _FakeEvidenceDist:
 
 
 class TestMegaMoeAccuracyGinContract(unittest.TestCase):
+    def test_owner_wave_cli_is_exact_and_default_off(self):
+        with mock.patch("sys.argv", ["test_mega_moe_accuracy.py"]):
+            self.assertEqual(accuracy._parse_args().gin_combine_owner_waves, 0)
+        for waves in (2, 4, 8):
+            with self.subTest(waves=waves), mock.patch(
+                    "sys.argv", ["test_mega_moe_accuracy.py",
+                                 "--gin-combine-owner-waves", str(waves)]):
+                self.assertEqual(
+                    accuracy._parse_args().gin_combine_owner_waves, waves)
+        for invalid in ("1", "3", "6", "02"):
+            with self.subTest(invalid=invalid), mock.patch(
+                    "sys.argv", ["test_mega_moe_accuracy.py",
+                                 "--gin-combine-owner-waves", invalid]), \
+                    mock.patch("sys.stderr"), self.assertRaises(SystemExit):
+                accuracy._parse_args()
+
+    def test_owner_wave_cli_validation_is_ep8_e448_bulk_direct_only(self):
+        valid = _args(
+            num_experts=448,
+            num_tokens=32,
+            gin_outbox_depth=64,
+            gin_active_fast_path=True,
+            gin_bulk_combine=True,
+            gin_direct_dispatch=True,
+            gin_combine_owner_waves=4,
+        )
+        accuracy._validate_args(valid, 8, gb200_world_size=8)
+        with self.assertRaisesRegex(ValueError, "requires EP8/E448"):
+            accuracy._validate_args(
+                _args(
+                    gin_outbox_depth=64,
+                    gin_active_fast_path=True,
+                    gin_bulk_combine=True,
+                    gin_direct_dispatch=True,
+                    gin_combine_owner_waves=4,
+                ),
+                16,
+            )
+
     def test_decode_mns_counts_target_plus_draft_tokens(self):
         with mock.patch(
             "sys.argv",
@@ -832,6 +872,7 @@ class TestMegaMoeAccuracyGinContract(unittest.TestCase):
                 accuracy.GIN_DISPATCH_OVERLAP_ENV: False,
                 accuracy.GIN_COMBINE_OVERLAP_ENV: False,
                 accuracy.GIN_STRONGVA_COMBINE_TERMINAL_ENV: False,
+                accuracy.GIN_COMBINE_OWNER_WAVES_ENV: 0,
             },
         )
         self.assertEqual(evidence["registered_buffer_bytes"], 4096)

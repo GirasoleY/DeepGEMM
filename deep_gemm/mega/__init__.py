@@ -239,6 +239,8 @@ class SymmBuffer:
                 'DG_MEGAMOE_GIN_COMBINE_OVERLAP', '0'),
             'strongva_combine_terminal': os.environ.get(
                 'DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL', '0'),
+            'combine_owner_waves': os.environ.get(
+                'DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES', '0'),
             'preconsensus_pack': os.environ.get(
                 'DG_MEGAMOE_GIN_PRECONSENSUS_PACK', '0'),
             'coop_direct_pack': os.environ.get(
@@ -308,6 +310,24 @@ class SymmBuffer:
                     'strongva_combine_terminal requires combine_overlap, '
                     'bulk_combine, direct_dispatch, SINGLE_COMBINE_CONTEXT=1 '
                     'and DISPATCH_OVERLAP=1')
+        if canonical['combine_owner_waves'] not in ('0', '2', '4', '8'):
+            errors.append(
+                'DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES must be exactly '
+                '0, 2, 4, or 8')
+        elif canonical['combine_owner_waves'] != '0':
+            if not (canonical['world_size'] == 8
+                    and canonical['num_experts'] == 448
+                    and canonical['strongva_combine_terminal'] == '1'
+                    and canonical['combine_overlap'] == '1'
+                    and canonical['single_combine_context'] == '1'
+                    and canonical['dispatch_overlap'] == '1'
+                    and canonical['bulk_combine']
+                    and canonical['direct_dispatch']):
+                errors.append(
+                    'combine_owner_waves requires EP8/E448, '
+                    'strongva_combine_terminal, combine_overlap, bulk_combine, '
+                    'direct_dispatch, SINGLE_COMBINE_CONTEXT=1 and '
+                    'DISPATCH_OVERLAP=1')
         if canonical['world_size'] not in (8, 16):
             errors.append('world_size must be exactly 8 or 16')
         if canonical['world_size'] == 8 and canonical['num_experts'] != 448:

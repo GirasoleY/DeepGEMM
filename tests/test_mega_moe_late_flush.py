@@ -263,7 +263,9 @@ class LateFlushSourceContracts(unittest.TestCase):
         body = braced_block(source, source.index(
             "if (use_gin_combine_overlap and sm_idx == 0 and warp_idx == 0)",
             source.index("DG_GIN_TRACE_IF(lane_idx == 0, 48u + warp_idx);")))
-        self.assertEqual(body.count("comm::mega_moe_gin_put_bulk_combine_span("), 2)
+        # The compile-time-exclusive owner-wave branch adds one ordinary
+        # non-final span call without adding a local completion.
+        self.assertEqual(body.count("comm::mega_moe_gin_put_bulk_combine_span("), 3)
         self.assertIn("mega_moe_gin_put_bulk_combine_terminal_span", body)
         self.assertIn("/*context_stripe=*/ 0u", body)
         self.assertIn("DG_GIN_TRACE_IF(lane_idx == 0, 100)", body)
