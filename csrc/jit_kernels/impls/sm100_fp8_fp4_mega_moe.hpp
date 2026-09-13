@@ -495,7 +495,9 @@ static void sm100_fp8_fp4_mega_moe(
                     gin_strongva_combine_terminal and gin_combine_overlap and
                     gin_single_combine_context and gin_dispatch_overlap and
                     gin_direct_dispatch and gin_bulk_combine and
-                    config.num_epilogue_threads == 256));
+                    config.num_epilogue_threads == 256 and
+                    num_sms >
+                        layout::kMegaMoeGinDirectDispatchMaxTokens));
 #else
     DG_HOST_ASSERT(gin_combine_overlap_value == "0");
     DG_HOST_ASSERT(gin_strongva_combine_terminal_value == "0");
