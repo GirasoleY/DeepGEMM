@@ -46,7 +46,7 @@ class Ep8DeviceTransportContract(unittest.TestCase):
                          "07ff056e2e3d9f120c571ecdcb1e033b14172af516528d0fee0119c3e7dc5f21")
         reducer = source.index("        // Combine: reduce top-k results and write back")
         self.assertEqual(hashlib.sha256(source[reducer:].encode()).hexdigest(),
-                         "17419234bf066681862e247424f15f14da883f9fc6ffc8ba1c43d4d219a59b79")
+                         "9e40ed81969405fec903aa6445a6d27e0d4c3bfa70e5be7c0c9bc4618318abde")
 
     def test_only_supported_two_team_shapes_and_capacity_remains_maximum(self):
         source = KERNEL.read_text()

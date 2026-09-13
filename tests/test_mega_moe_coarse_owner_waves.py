@@ -340,7 +340,7 @@ class CoarseOwnerWaveSourceContracts(unittest.TestCase):
         self.assertIn("move_mask_and_load", fallback)
         self.assertEqual(
             hashlib.sha256(reducer.encode()).hexdigest(),
-            "2a65d7f516feb9efc6ab51ea4418eedcdd387f9fe6e5da6a6931716ac359cfea",
+            "bab6c336f3832c3bef2a206328c6b44c9e29e53c44c21ff11662d2f3a0c649bc",
         )
 
 

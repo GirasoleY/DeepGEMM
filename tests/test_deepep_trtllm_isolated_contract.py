@@ -210,7 +210,7 @@ class ComparisonContractTest(unittest.TestCase):
         self.assertEqual(
             metadata["candidate_family"],
             "direct_control_first_dispatch_coarse_owner_waves_owner_slot_"
-            "ready_fixed_pair_reduce_strongva_terminal",
+            "ready_dual_stage_pair_load_fixed_pair_reduce_strongva_terminal",
         )
         contract = metadata["combine_overlap_contract"]
         self.assertEqual(contract["combine_owner_slot_ready_requested_raw"],
@@ -221,6 +221,18 @@ class ComparisonContractTest(unittest.TestCase):
         self.assertIn("one_cta_per_token", contract["receiver_schedule"])
         self.assertIn("slots_2w_and_2w_plus_1",
                       contract["receiver_schedule"])
+        self.assertIn("independently_issues_each_ready_assignment",
+                      contract["receiver_schedule"])
+
+        delta = contract["dual_stage_pair_load_delta"]
+        self.assertEqual(delta["baseline"],
+                         "owner_slot_ready_fixed_pair_reduce")
+        self.assertTrue(delta["receiver_load_schedule_changed"])
+        for field in (
+                "wire_bytes_changed", "registered_workspace_bytes_changed",
+                "network_operations_changed", "gemm_tiling_changed",
+                "launch_sm_count_changed", "arithmetic_association_changed"):
+            self.assertFalse(delta[field])
 
         protocol = contract["owner_wave_protocol"]
         self.assertNotIn(
@@ -247,14 +259,21 @@ class ComparisonContractTest(unittest.TestCase):
         self.assertNotIn("added_barriers", reducer)
         self.assertEqual(
             reducer["address_preparation"],
-            "lane0_fixed_pair_pointer_resolution_on_chunk0_before_assignment_TMA",
+            "lane0_dual_stage_fixed_pair_pointer_resolution_on_chunk0_"
+            "before_assignment_TMA",
         )
-        self.assertTrue(
+        self.assertFalse(
             reducer["lane0_pointer_broadcast_before_lane0_tma_issuer"])
+        self.assertTrue(reducer["lane0_pointer_resolution_and_tma_issuer"])
         self.assertEqual(reducer["assignment_pairs"],
                          [[2 * pair, 2 * pair + 1] for pair in range(8)])
-        self.assertEqual(reducer["within_pair_assignment_order"],
-                         "ascending_slot")
+        self.assertIn("first_observed_ready_owner",
+                      reducer["within_pair_assignment_issue_order"])
+        self.assertIn("ascending_slot_tie_break",
+                      reducer["within_pair_assignment_issue_order"])
+        self.assertEqual(
+            reducer["within_pair_assignment_accumulation_order"],
+            "ascending_slot_after_both_stage_waits")
         self.assertIn("ascending_pair_index", reducer["reduction_order"])
         self.assertNotIn("original_ascending_topk_slot",
                          reducer["reduction_order"])
@@ -263,6 +282,17 @@ class ComparisonContractTest(unittest.TestCase):
         self.assertIn("none_for_local_or_world_ineligible_fallback",
                       reducer["owner_ready_reads"])
         self.assertEqual(reducer["additional_barrier_objects"], 0)
+        self.assertIn("two_existing_independent_mbarriers",
+                      reducer["assignment_mbarriers"])
+        self.assertIn(
+            "alias_the_same_warp_FP32_pair_partial_only_after_both_load_waits",
+            reducer["shared_staging"])
+        self.assertEqual(reducer["shared_chunk_regions"], {
+            "assignment_stage_or_fp32_pair_partial": 16,
+            "output": 1,
+            "total": 17,
+            "existing_budget": 24,
+        })
         self.assertIn("two_existing_full_epilogue_barrier_sync_points",
                       reducer["cta_barrier_participation"])
 

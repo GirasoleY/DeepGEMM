@@ -4741,23 +4741,34 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (use_gin_owner_slot_pair_reduce) {
             // One CTA owns one token. Its eight epilogue warps preserve broad
             // slot-level parallelism: warp w reduces assignments {2w,2w+1}.
-            // One BF16 load chunk per warp plus one FP32 pair partial per warp
-            // consumes exactly the original three-chunk shared-memory budget.
+            // Two independent BF16 load stages per fixed assignment pair let
+            // either owner start its TMA as soon as it becomes ready. After
+            // both loads retire, those two chunks are reused as the pair's
+            // equally-sized FP32 partial. One separate output chunk makes 17
+            // chunks total, within the original 24-chunk shared-memory budget.
             DG_DEVICE_ASSERT(kNumEpilogueWarps == 8 and kNumTopk == 16);
             DG_DEVICE_ASSERT(
-                (1u + 2u) * kNumEpilogueWarps * kNumChunkBytes <=
+                (2u * kNumEpilogueWarps + 1u) * kNumChunkBytes <=
                 kNumReusableSmemBytes);
-            auto* pair_load_buffer = math::advance_ptr<uint4>(
-                smem_buffer, epilogue_warp_idx * kNumChunkBytes);
+            const auto pair_load_buffers = utils::PatternVisitor(
+                [&](const uint32_t& pair_slot) {
+                    return math::advance_ptr<uint4>(
+                        smem_buffer,
+                        (epilogue_warp_idx * 2u + pair_slot) *
+                            kNumChunkBytes);
+                });
             auto* pair_partial_buffer = math::advance_ptr<float2>(
                 smem_buffer,
-                kNumEpilogueWarps * kNumChunkBytes +
-                    epilogue_warp_idx * 2u * kNumChunkBytes);
-            auto* pair_output_buffer =
-                reinterpret_cast<uint4*>(smem_buffer);
-            auto* pair_load_barrier =
-                &shared_storage.combine_barriers[epilogue_warp_idx * 2u];
-            uint32_t pair_load_phase = 0;
+                epilogue_warp_idx * 2u * kNumChunkBytes);
+            auto* pair_output_buffer = math::advance_ptr<uint4>(
+                smem_buffer,
+                2u * kNumEpilogueWarps * kNumChunkBytes);
+            const auto pair_load_barriers = utils::PatternVisitor(
+                [&](const uint32_t& pair_slot) {
+                    return &shared_storage.combine_barriers[
+                        epilogue_warp_idx * 2u + pair_slot];
+                });
+            uint32_t pair_load_phases[2] = {};
 
             for (uint32_t token_idx = sm_idx;
                  token_idx < num_tokens; token_idx += kNumSMs) {
@@ -4782,113 +4793,190 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     const uint32_t chunk_byte_offset =
                         chunk * kNumChunkBytes;
                     if (epilogue_warp_idx == 0) {
-                        // Warp0's BF16 load buffer doubles as the output TMA
-                        // source. Retire the preceding chunk before reuse.
+                        // Retire the preceding store before reusing the
+                        // separate output stage for this chunk.
                         ptx::tma_store_wait<0>();
                         __syncwarp();
                     }
 
+                    if (lane_idx == 0) {
+                        if (chunk == 0) {
+                            // Poll both owners together. Same-LSA assignments
+                            // are immediately ready; if both remote owners are
+                            // ready in the same observation, the lower fixed
+                            // assignment slot wins the deterministic tie.
+                            uint32_t pending_mask =
+                                (pair_experts[0] >= 0 ? 1u : 0u) |
+                                (pair_experts[1] >= 0 ? 2u : 0u);
+                            while (pending_mask != 0) {
+                                int selected_pair_slot = -1;
+                                #pragma unroll
+                                for (uint32_t pair_slot = 0;
+                                     pair_slot < 2; ++pair_slot) {
+                                    if ((pending_mask &
+                                         (1u << pair_slot)) == 0)
+                                        continue;
+                                    DG_DEVICE_ASSERT(
+                                        pair_experts[pair_slot] <
+                                        kNumExperts);
+
+                                    bool assignment_ready = true;
+#ifdef DG_MEGAMOE_GIN
+                                    if (use_gin_direct_reduce) {
+                                        const uint32_t owner =
+                                            static_cast<uint32_t>(
+                                                pair_experts[pair_slot]) /
+                                            kNumExpertsPerRank;
+                                        if (not gin_transport
+                                                    .is_same_lsa_peer(owner) and
+                                            use_gin_combine_owner_slot_ready) {
+                                            const uint32_t owner_in_lsa =
+                                                owner %
+                                                static_cast<uint32_t>(
+                                                    gin_transport.dev_comm
+                                                        .lsaSize);
+                                            assignment_ready =
+                                                ptx::ld_acq(
+                                                    buffer.gin_workspace
+                                                        .get_combine_receiver_owner_ready_ptr(
+                                                            owner_in_lsa)) != 0;
+                                        }
+                                    }
+#endif
+                                    if (assignment_ready) {
+                                        selected_pair_slot =
+                                            static_cast<int>(pair_slot);
+                                        break;
+                                    }
+                                }
+                                if (selected_pair_slot < 0)
+                                    continue;
+
+                                const uint32_t pair_slot =
+                                    static_cast<uint32_t>(selected_pair_slot);
+                                const uint32_t slot_idx =
+                                    first_slot + pair_slot;
+                                const int expert = pair_experts[pair_slot];
+                                DG_DEVICE_ASSERT(expert < kNumExperts);
+                                pair_row_ptrs[pair_slot] =
+                                    reinterpret_cast<uint64_t>(
+                                        buffer.combine_token_buffer
+                                            .get_rank_buffer(slot_idx)
+                                            .get_data_buffer(token_idx)
+                                            .get_base_ptr());
+#ifdef DG_MEGAMOE_GIN
+                                if (use_gin_direct_reduce) {
+                                    const uint32_t owner =
+                                        static_cast<uint32_t>(expert) /
+                                        kNumExpertsPerRank;
+                                    if (not gin_transport
+                                                .is_same_lsa_peer(owner)) {
+                                        const uint32_t owner_in_lsa = owner %
+                                            static_cast<uint32_t>(
+                                                gin_transport.dev_comm.lsaSize);
+                                        // Owner readiness is the release/acquire
+                                        // handoff for the immutable packet
+                                        // metadata below. Never resolve it
+                                        // before that owner's terminal arrives.
+                                        asm volatile(
+                                            "fence.proxy.async.global;" :::
+                                            "memory");
+                                        const uint32_t token_topk_idx =
+                                            token_idx * kNumTopk + slot_idx;
+                                        const uint32_t ordinal =
+                                            *buffer.gin_workspace
+                                                 .get_combine_direct_reduce_ordinal_ptr(
+                                                     token_topk_idx);
+                                        const uint32_t received_count =
+                                            ptx::ld_acq_sys(
+                                                buffer.gin_workspace
+                                                    .get_bulk_combine_packet_count_ptr(
+                                                        /*send=*/ false,
+                                                        owner_in_lsa));
+                                        DG_DEVICE_ASSERT(
+                                            ordinal < received_count);
+                                        const uint32_t destination =
+                                            ptx::ld_acq_sys(
+                                                buffer.gin_workspace
+                                                    .get_bulk_combine_record_destination_ptr(
+                                                        /*send=*/ false,
+                                                        owner_in_lsa,
+                                                        ordinal));
+                                        DG_DEVICE_ASSERT(
+                                            destination == token_topk_idx);
+                                        pair_row_ptrs[pair_slot] =
+                                            reinterpret_cast<uint64_t>(
+                                                buffer.gin_workspace
+                                                    .get_bulk_combine_record_payload_ptr(
+                                                        /*send=*/ false,
+                                                        owner_in_lsa,
+                                                        ordinal));
+                                    } else {
+                                        // Bridge same-LSA direct-store
+                                        // visibility for this fixed TMA
+                                        // issuer too.
+                                        asm volatile(
+                                            "fence.proxy.async.global;" :::
+                                            "memory");
+                                    }
+                                }
+#endif
+                                auto* src_ptr =
+                                    math::advance_ptr<uint8_t>(
+                                        reinterpret_cast<void*>(
+                                            pair_row_ptrs[pair_slot]),
+                                        chunk_byte_offset);
+                                ptx::tma_load_1d(
+                                    pair_load_buffers[pair_slot], src_ptr,
+                                    pair_load_barriers[pair_slot],
+                                    kNumChunkBytes);
+                                ptx::mbarrier_arrive_and_set_tx(
+                                    pair_load_barriers[pair_slot],
+                                    kNumChunkBytes);
+                                pending_mask &= ~(1u << pair_slot);
+                            }
+                        } else {
+                            // Both immutable row pointers were cached during
+                            // chunk zero. Issue both independent stages without
+                            // serializing either TMA behind a completion wait.
+                            #pragma unroll
+                            for (uint32_t pair_slot = 0;
+                                 pair_slot < 2; ++pair_slot) {
+                                if (pair_experts[pair_slot] < 0)
+                                    continue;
+                                auto* src_ptr =
+                                    math::advance_ptr<uint8_t>(
+                                        reinterpret_cast<void*>(
+                                            pair_row_ptrs[pair_slot]),
+                                        chunk_byte_offset);
+                                ptx::tma_load_1d(
+                                    pair_load_buffers[pair_slot], src_ptr,
+                                    pair_load_barriers[pair_slot],
+                                    kNumChunkBytes);
+                                ptx::mbarrier_arrive_and_set_tx(
+                                    pair_load_barriers[pair_slot],
+                                    kNumChunkBytes);
+                            }
+                        }
+                    }
+                    __syncwarp();
+
                     float2 pair_reduced[
                         kNumUint4PerLane * kNumElemsPerUint4] = {};
+                    // TMA issue order is readiness-driven, but accumulation is
+                    // always fixed ascending assignment-slot order so the r11
+                    // FP32 pair association remains bitwise unchanged.
                     #pragma unroll
                     for (uint32_t pair_slot = 0; pair_slot < 2;
                          ++pair_slot) {
                         if (pair_experts[pair_slot] < 0)
                             continue;
-                        if (chunk == 0 and lane_idx == 0) {
-                            const uint32_t slot_idx =
-                                first_slot + pair_slot;
-                            const int expert = pair_experts[pair_slot];
-                            DG_DEVICE_ASSERT(expert < kNumExperts);
-                            pair_row_ptrs[pair_slot] =
-                                reinterpret_cast<uint64_t>(
-                                    buffer.combine_token_buffer
-                                        .get_rank_buffer(slot_idx)
-                                        .get_data_buffer(token_idx)
-                                        .get_base_ptr());
-#ifdef DG_MEGAMOE_GIN
-                            if (use_gin_direct_reduce) {
-                                const uint32_t owner =
-                                    static_cast<uint32_t>(expert) /
-                                    kNumExpertsPerRank;
-                                if (not gin_transport.is_same_lsa_peer(owner)) {
-                                    const uint32_t owner_in_lsa = owner %
-                                        static_cast<uint32_t>(
-                                            gin_transport.dev_comm.lsaSize);
-                                    if (use_gin_combine_owner_slot_ready) {
-                                        while (ptx::ld_acq(
-                                                   buffer.gin_workspace
-                                                       .get_combine_receiver_owner_ready_ptr(
-                                                           owner_in_lsa)) == 0) {
-                                        }
-                                    }
-                                    // Wait one assignment at a time. The first
-                                    // assignment's TMA and FP32 accumulation can
-                                    // run while the second owner's terminal is
-                                    // still in flight.
-                                    asm volatile(
-                                        "fence.proxy.async.global;" :::
-                                        "memory");
-                                    const uint32_t token_topk_idx =
-                                        token_idx * kNumTopk + slot_idx;
-                                    const uint32_t ordinal =
-                                        *buffer.gin_workspace
-                                             .get_combine_direct_reduce_ordinal_ptr(
-                                                 token_topk_idx);
-                                    const uint32_t received_count =
-                                        ptx::ld_acq_sys(
-                                            buffer.gin_workspace
-                                                .get_bulk_combine_packet_count_ptr(
-                                                    /*send=*/ false,
-                                                    owner_in_lsa));
-                                    DG_DEVICE_ASSERT(
-                                        ordinal < received_count);
-                                    const uint32_t destination =
-                                        ptx::ld_acq_sys(
-                                            buffer.gin_workspace
-                                                .get_bulk_combine_record_destination_ptr(
-                                                    /*send=*/ false,
-                                                    owner_in_lsa, ordinal));
-                                    DG_DEVICE_ASSERT(
-                                        destination == token_topk_idx);
-                                    pair_row_ptrs[pair_slot] =
-                                        reinterpret_cast<uint64_t>(
-                                            buffer.gin_workspace
-                                                .get_bulk_combine_record_payload_ptr(
-                                                    /*send=*/ false,
-                                                    owner_in_lsa, ordinal));
-                                } else {
-                                    // The candidate skipped the old global
-                                    // proxy fence. Bridge same-LSA direct-store
-                                    // visibility for this fixed TMA issuer too.
-                                    asm volatile(
-                                        "fence.proxy.async.global;" :::
-                                        "memory");
-                                }
-                            }
-#endif
-                        }
-                        pair_row_ptrs[pair_slot] = __shfl_sync(
-                            0xffffffffu,
-                            static_cast<unsigned long long>(
-                                pair_row_ptrs[pair_slot]), 0);
-                        if (lane_idx == 0) {
-                            auto* src_ptr = math::advance_ptr<uint8_t>(
-                                reinterpret_cast<void*>(
-                                    pair_row_ptrs[pair_slot]),
-                                chunk_byte_offset);
-                            ptx::tma_load_1d(
-                                pair_load_buffer, src_ptr,
-                                pair_load_barrier, kNumChunkBytes);
-                            ptx::mbarrier_arrive_and_set_tx(
-                                pair_load_barrier, kNumChunkBytes);
-                        }
-                        __syncwarp();
-                        pair_load_barrier->wait(pair_load_phase);
-                        pair_load_phase ^= 1u;
+                        pair_load_barriers[pair_slot]->wait(
+                            pair_load_phases[pair_slot]);
+                        pair_load_phases[pair_slot] ^= 1u;
                         #pragma unroll
                         for (uint32_t j = 0; j < kNumUint4PerLane; ++j) {
-                            const auto uint4_values = pair_load_buffer[
+                            const auto uint4_values = pair_load_buffers[pair_slot][
                                 j * 32u + lane_idx];
                             const auto* bf16_values =
                                 reinterpret_cast<const nv_bfloat162*>(
@@ -4903,6 +4991,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             }
                         }
                     }
+                    __syncwarp();
 
                     #pragma unroll
                     for (uint32_t value = 0;
@@ -4936,8 +5025,6 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                     const auto* partial =
                                         math::advance_ptr<float2>(
                                             smem_buffer,
-                                            kNumEpilogueWarps *
-                                                    kNumChunkBytes +
                                                 pair * 2u *
                                                     kNumChunkBytes);
                                     const float2 next = ptx::ld_shared(
@@ -4968,9 +5055,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         __syncwarp();
                     }
 
-                    // Do not reuse either the BF16 load region or the FP32
-                    // pair-partial region until warp0 has consumed all pairs
-                    // in ascending assignment order and queued the output.
+                    // Do not reuse the aliased BF16 stage / FP32 pair-partial
+                    // region until warp0 has consumed all fixed pairs in
+                    // ascending assignment order and queued the output.
                     ptx::sync_aligned(
                         kNumEpilogueThreads, kEpilogueFullBarrierIdx);
                 }

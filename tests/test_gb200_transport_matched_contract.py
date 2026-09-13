@@ -132,6 +132,17 @@ class ParsingContracts(unittest.TestCase):
         self.assertFalse(config["gemm_tiling_changed"])
         self.assertFalse(config["launch_sm_count_changed"])
         self.assertIn("four_tail_progress_warps", config["receiver_schedule"])
+        self.assertIn("independent_assignment_stages_issue_ready_first",
+                      config["receiver_schedule"])
+        self.assertIn("ascending_slot_order", config["receiver_schedule"])
+        delta = config["dual_stage_pair_load_delta"]
+        self.assertEqual(delta["baseline"],
+                         "owner_slot_ready_fixed_pair_reduce")
+        for field in (
+                "wire_bytes_changed", "registered_workspace_bytes_changed",
+                "network_operations_changed", "gemm_tiling_changed",
+                "launch_sm_count_changed", "arithmetic_association_changed"):
+            self.assertFalse(delta[field])
 
         metadata = runner.matched.dispatch_candidate_metadata(env)
         self.assertTrue(metadata["combine_overlap_contract"]

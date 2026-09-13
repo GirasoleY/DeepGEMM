@@ -251,7 +251,18 @@ def configuration(options, args, comparison, sources):
             "launch_sm_count_changed": False,
             "receiver_schedule": (
                 "four_tail_progress_warps_publish_whole_owner_readiness;_one_"
-                "cta_per_token;_warp_w_owns_slots_2w_and_2w_plus_1"),
+                "cta_per_token;_warp_w_owns_slots_2w_and_2w_plus_1;_two_"
+                "independent_assignment_stages_issue_ready_first_then_"
+                "accumulate_in_ascending_slot_order"),
+            "dual_stage_pair_load_delta": {
+                "baseline": "owner_slot_ready_fixed_pair_reduce",
+                "wire_bytes_changed": False,
+                "registered_workspace_bytes_changed": False,
+                "network_operations_changed": False,
+                "gemm_tiling_changed": False,
+                "launch_sm_count_changed": False,
+                "arithmetic_association_changed": False,
+            },
         })
     return {
         "mode": options.mode, "world_size": options.world_size,

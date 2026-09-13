@@ -1070,7 +1070,8 @@ def dispatch_candidate_metadata(flags):
     if owner_slot_enabled:
         metadata["candidate_family"] = (
             "direct_control_first_dispatch_coarse_owner_waves_"
-            "owner_slot_ready_fixed_pair_reduce_strongva_terminal")
+            "owner_slot_ready_dual_stage_pair_load_fixed_pair_reduce_"
+            "strongva_terminal")
         contract = metadata["combine_overlap_contract"]
         sender_schedule = (
             "peer_parallel_fixed_contiguous_owner_waves_with_actual_last_"
@@ -1081,17 +1082,20 @@ def dispatch_candidate_metadata(flags):
             "sender_schedule": sender_schedule,
             "combine_schedule": (
                 "sender_owner_waves_concurrent_with_receiver_owner_slot_ready_"
-                "fixed_pair_reduce"),
+                "dual_stage_pair_load_fixed_pair_reduce"),
             "receiver_schedule": (
                 "four_tail_progress_warps_publish_independent_whole_owner_"
                 "readiness_concurrently_with_one_cta_per_token;_warp_w_owns_"
-                "slots_2w_and_2w_plus_1"),
+                "slots_2w_and_2w_plus_1_and_independently_issues_each_ready_"
+                "assignment_to_its_dedicated_stage_then_accumulates_fixed_"
+                "slots_in_ascending_order"),
             "sent_entry_role": (
                 "sender_completion_bookkeeping_then_reset_and_rank_local_reuse_"
                 "of_sent_0_through_3_as_receiver_owner_ready_flags"),
             "eligibility": (
                 "owner_ready_requires_world_uniform_StrongVA_direct_bulk_W4;_"
-                "fixed_pair_reduce_requires_exact_EP8_E448_topk16_H3584_I3072_"
+                "dual_stage_fixed_pair_reduce_requires_exact_EP8_E448_topk16_"
+                "H3584_I3072_"
                 "epilogue8_SM_gt_48_and_tokens_le_48"),
             "local_and_t64_paths": (
                 "tokens_le_48_local_or_world_ineligible_fallback_uses_fixed_"
@@ -1104,6 +1108,16 @@ def dispatch_candidate_metadata(flags):
             "gemm_tiling_changed": False,
             "launch_sm_count_changed": False,
             "combine_reducer_math_association_changed": True,
+            "dual_stage_pair_load_delta": {
+                "baseline": "owner_slot_ready_fixed_pair_reduce",
+                "receiver_load_schedule_changed": True,
+                "wire_bytes_changed": False,
+                "registered_workspace_bytes_changed": False,
+                "network_operations_changed": False,
+                "gemm_tiling_changed": False,
+                "launch_sm_count_changed": False,
+                "arithmetic_association_changed": False,
+            },
             "basis": (
                 "selected owner-slot flag and source policy, not device branch "
                 "or physical-overlap measurement"),
@@ -1138,12 +1152,16 @@ def dispatch_candidate_metadata(flags):
         reducer.pop("added_barriers")
         reducer.update({
             "address_preparation": (
-                "lane0_fixed_pair_pointer_resolution_on_chunk0_before_"
-                "assignment_TMA"),
-            "lane0_pointer_broadcast_before_lane0_tma_issuer": True,
+                "lane0_dual_stage_fixed_pair_pointer_resolution_on_chunk0_"
+                "before_assignment_TMA"),
+            "lane0_pointer_broadcast_before_lane0_tma_issuer": False,
+            "lane0_pointer_resolution_and_tma_issuer": True,
             "assignment_pairs": [[2 * pair, 2 * pair + 1]
                                  for pair in range(8)],
-            "within_pair_assignment_order": "ascending_slot",
+            "within_pair_assignment_issue_order": (
+                "first_observed_ready_owner_with_ascending_slot_tie_break"),
+            "within_pair_assignment_accumulation_order": (
+                "ascending_slot_after_both_stage_waits"),
             "reduction_order": (
                 "fixed_slot_pair_FP32_partials_then_FP32_fold_in_ascending_"
                 "pair_index_then_final_BF16"),
@@ -1159,6 +1177,19 @@ def dispatch_candidate_metadata(flags):
                 "exact_shape_epilogue8_SM_gt_48_and_tokens_le_48_across_route_"
                 "placements_and_world_ineligible_fallback"),
             "additional_barrier_objects": 0,
+            "assignment_mbarriers": (
+                "two_existing_independent_mbarriers_per_producer_warp;_one_"
+                "per_fixed_assignment_slot_with_independent_phase"),
+            "shared_staging": (
+                "two_dedicated_BF16_assignment_stages_per_warp_alias_the_"
+                "same_warp_FP32_pair_partial_only_after_both_load_waits;_one_"
+                "disjoint_BF16_output_stage"),
+            "shared_chunk_regions": {
+                "assignment_stage_or_fp32_pair_partial": 16,
+                "output": 1,
+                "total": 17,
+                "existing_budget": 24,
+            },
             "cta_barrier_participation": (
                 "two_existing_full_epilogue_barrier_sync_points_per_output_"
                 "chunk"),
