@@ -77,14 +77,17 @@ class OwnerSlotReadySourceTests(unittest.TestCase):
         self.assertIn("kMegaMoeGinCombineOwnerWaves == 4", self.kernel)
         self.assertIn("kMegaMoeGinStrongVACombineTerminal", self.kernel)
 
-    def test_host_rejects_devices_without_tail_progress_sms(self):
+    def test_host_allows_fallback_config_but_guards_tail_progress_sms(self):
         begin = self.jit.index(
             "const bool gin_combine_owner_slot_ready =")
         end = self.jit.index("#else", begin)
         body = self.jit[begin:end]
         self.assertIn(
-            "num_sms >\n"
-            "                        layout::kMegaMoeGinDirectDispatchMaxTokens",
+            "(num_tokens >\n"
+            "                         layout::kMegaMoeGinDirectDispatchMaxTokens or\n"
+            "                     (config.num_epilogue_threads == 256 and\n"
+            "                      num_sms >\n"
+            "                          layout::kMegaMoeGinDirectDispatchMaxTokens))",
             body,
         )
 
