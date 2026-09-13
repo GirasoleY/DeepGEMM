@@ -33,7 +33,7 @@ def _args(*, direct_dispatch=False):
 
 def _records(*, warp="0", coop="0", prepack="0", single="0",
              dispatch="0", combine="0", strongva="0", direct=False,
-             world_size=16, owner_waves="0"):
+             world_size=16, owner_waves="0", owner_slot_ready="0"):
     return [
         {
             "rank": rank,
@@ -41,6 +41,7 @@ def _records(*, warp="0", coop="0", prepack="0", single="0",
             "expert_width": "0",
             "barrier_warps": "1",
             "owner_waves": owner_waves,
+            "owner_slot_ready": owner_slot_ready,
             "flags": {
                 accuracy.GIN_DISPATCH_WARP_SCAN_ENV: warp,
                 accuracy.GIN_COOP_DIRECT_PACK_ENV: coop,
@@ -125,6 +126,7 @@ class TestMegaMoeExperimentEvidence(unittest.TestCase):
                 "DG_MEGAMOE_GIN_COMBINE_OVERLAP": False,
                 "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL": False,
                 "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES": 0,
+                "DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY": False,
             },
         )
 

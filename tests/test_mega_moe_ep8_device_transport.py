@@ -36,7 +36,7 @@ class Ep8DeviceTransportContract(unittest.TestCase):
         self.assertIn("896, 0, 16,", original)
         self.assertIn("148, 16,", original)
 
-    def test_compute_and_ordered_reducer_source_match_frozen_ep16(self):
+    def test_compute_and_gated_reducer_source_are_pinned(self):
         source = KERNEL.read_text()
         start = source.index("        // GEMM TMA load warp for tokens with SFA")
         end = source.index("        // Deallocate tensor memory", start)
@@ -46,7 +46,7 @@ class Ep8DeviceTransportContract(unittest.TestCase):
                          "07ff056e2e3d9f120c571ecdcb1e033b14172af516528d0fee0119c3e7dc5f21")
         reducer = source.index("        // Combine: reduce top-k results and write back")
         self.assertEqual(hashlib.sha256(source[reducer:].encode()).hexdigest(),
-                         "7acd8cc615165b7183b4510d53e8f4e42d1cfd7ecc37aa8f69dc7a5265a71a17")
+                         "17419234bf066681862e247424f15f14da883f9fc6ffc8ba1c43d4d219a59b79")
 
     def test_only_supported_two_team_shapes_and_capacity_remains_maximum(self):
         source = KERNEL.read_text()
