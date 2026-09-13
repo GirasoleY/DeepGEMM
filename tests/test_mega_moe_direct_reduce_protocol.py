@@ -497,7 +497,10 @@ int main() {
         self.assertLess(grid2, audit)
         self.assertLess(audit, fence)
         self.assertLess(fence, reducer)
-        self.assertIn("if (use_gin_direct_reduce)", source[audit:fence])
+        self.assertIn(
+            "if (use_gin_direct_reduce and\n"
+            "                not use_gin_combine_owner_slot_ready)",
+            source[audit:fence])
         self.assertNotIn("fence.proxy.async.global", source[reducer:])
 
     def test_deferred_existing_handoff_after_all_input_waits_not_new_barrier(self):

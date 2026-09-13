@@ -84,6 +84,10 @@
 #define DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES 0
 #endif
 
+#ifndef DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY
+#define DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY 0
+#endif
+
 // Retired experiment switches must not silently select an unsupported path.
 #if defined(DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE) && DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE != 0
 #error "Expert-wave combine is not part of the clean single-context candidate"
@@ -209,6 +213,17 @@ static_assert(kMegaMoeGinCombineOwnerWaves == 0 or
 static_assert(kMegaMoeGinCombineOwnerWaves == 0 or
               kMegaMoeGinStrongVACombineTerminal,
               "GIN combine owner waves require the StrongVA terminal protocol");
+static constexpr bool kMegaMoeGinCombineOwnerSlotReady =
+    DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY != 0;
+static_assert(DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY == 0 or
+              DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY == 1,
+              "Invalid MegaMoE GIN combine owner-slot-ready flag");
+static_assert(not kMegaMoeGinCombineOwnerSlotReady or
+              kMegaMoeGinCombineOwnerWaves == 4,
+              "GIN owner-slot readiness requires the W4 sender");
+static_assert(not kMegaMoeGinCombineOwnerSlotReady or
+              kMegaMoeGinStrongVACombineTerminal,
+              "GIN owner-slot readiness requires StrongVA terminals");
 
 template <
     uint32_t kNumMaxTokensPerRank,
@@ -277,6 +292,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     // Actual peers in each of the two GIN LSA teams. The wire/storage layout
     // still reserves eight peer slots and nine registered contexts.
     constexpr uint32_t kGinPeerCount = kNumRanks / 2u;
+    constexpr bool kGinOwnerSlotShape =
+        kUseGin and kMegaMoeGinCombineOwnerSlotReady and
+        kNumRanks == 8 and kNumExperts == 448 and
+        kNumExpertsPerRank == 56 and kNumTopk == 16 and
+        kHidden == 3584 and kIntermediateHidden == 3072 and
+        not kHasShared and kNumEpilogueWarps == 8 and
+        kNumSMs > layout::kMegaMoeGinDirectDispatchMaxTokens;
 
     // Template checks
     DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
@@ -436,6 +458,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     .get_num_bytes() ==
                 kGinPeerCount *
                     layout::kMegaMoeGinCombineTerminalSignalStride);
+        if constexpr (kGinOwnerSlotShape) {
+            DG_DEVICE_ASSERT(
+                buffer.gin_workspace.combine_direct_reduce_alias_fits());
+        }
     }
     const auto workspace = buffer.workspace;
     const auto use_gin_bulk_combine_this_launch = [&]() {
@@ -480,6 +506,14 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // branch after this protocol removes the world Put barrier.
             return use_gin_bulk_combine_this_launch() and
                    use_gin_direct_dispatch_this_launch();
+        }
+        return false;
+    };
+    const auto use_gin_combine_owner_slot_ready_this_launch = [&]() {
+        if constexpr (kGinOwnerSlotShape) {
+            return use_gin_strongva_combine_terminal_this_launch() and
+                   num_tokens <=
+                       layout::kMegaMoeGinDirectDispatchMaxTokens;
         }
         return false;
     };
@@ -1050,6 +1084,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             use_gin_combine_overlap_this_launch();
         const bool use_gin_strongva_combine_terminal =
             use_gin_strongva_combine_terminal_this_launch();
+        const bool use_gin_combine_owner_slot_ready =
+            use_gin_combine_owner_slot_ready_this_launch();
 
         if constexpr (kUseGin and kMegaMoeGinStrongVACombineTerminal) {
 #ifdef DG_MEGAMOE_GIN
@@ -2934,11 +2970,13 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // queued (vacuously true for local/empty experts), not that
                 // computation or remote visibility has completed. They are
                 // bookkeeping only, never a producer/receiver readiness flag.
-                #pragma unroll
-                for (uint32_t group = 0; group < kNumExpertGroups; ++group) {
-                    const uint32_t expert = group * 32u + lane_idx;
-                    if (expert < kNumExpertsPerRank)
-                        *buffer.gin_workspace.get_combine_overlap_sent_ptr(expert) = 1;
+                if (not use_gin_combine_owner_slot_ready_this_launch()) {
+                    #pragma unroll
+                    for (uint32_t group = 0; group < kNumExpertGroups; ++group) {
+                        const uint32_t expert = group * 32u + lane_idx;
+                        if (expert < kNumExpertsPerRank)
+                            *buffer.gin_workspace.get_combine_overlap_sent_ptr(expert) = 1;
+                    }
                 }
                 if (peer_lane) {
                     if constexpr (not kMegaMoeGinStrongVACombineTerminal) {
@@ -4224,6 +4262,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
 
         const bool use_gin_strongva_combine_terminal =
             use_gin_strongva_combine_terminal_this_launch();
+        const bool use_gin_combine_owner_slot_ready =
+            use_gin_combine_owner_slot_ready_this_launch();
+        const bool use_gin_owner_slot_pair_reduce =
+            kGinOwnerSlotShape and
+            num_tokens <= layout::kMegaMoeGinDirectDispatchMaxTokens;
+        if constexpr (kGinOwnerSlotShape) {
+            if (use_gin_combine_owner_slot_ready) {
+                DG_DEVICE_ASSERT(
+                    use_gin_direct_reduce and
+                    prepare_gin_direct_reduce_ordinals);
+            }
+        }
 
         if constexpr (kUseGin and kMegaMoeGinLocalAblationStage < 3) {
 #ifdef DG_MEGAMOE_GIN
@@ -4362,7 +4412,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             /* Existing grid1 is the prologue */ false,
                             /* Existing grid2 is the epilogue */ false);
 
-                    if (sm_idx == 0 and epilogue_warp_idx == 0) {
+                    if (use_gin_combine_owner_slot_ready) {
+                        // Finish the existing LSA handoff before independent
+                        // token CTAs consume same-LSA results. Cross-LSA owner
+                        // terminals remain asynchronous after this point.
+                        comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                            workspace, sm_idx, epilogue_thread_idx,
+                            [&]() {
+                                ptx::sync_aligned(
+                                    kNumEpilogueThreads,
+                                    kEpilogueFullBarrierIdx);
+                            });
+                    }
+
+                    if (not use_gin_combine_owner_slot_ready and
+                        sm_idx == 0 and epilogue_warp_idx == 0) {
                         // Lane0 may still be polling the LSA barrier arrival;
                         // reconverge before lanes independently wait for all
                         // remote owner terminals on shared data context 0.
@@ -4384,14 +4448,79 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     }
                 }
             }
-            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
-                workspace, sm_idx, epilogue_thread_idx,
-                [&]() {
-                    ptx::sync_aligned(
-                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
-                });
+            if (not use_gin_combine_owner_slot_ready) {
+                comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                    workspace, sm_idx, epilogue_thread_idx,
+                    [&]() {
+                        ptx::sync_aligned(
+                            kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    });
+            }
 
             DG_GIN_TRACE_IF(epilogue_warp_idx == 0 and lane_idx == 0, 58);
+
+            if constexpr (kGinOwnerSlotShape) {
+                constexpr uint32_t kNumOwnerProgressWarps = kGinPeerCount;
+                constexpr uint32_t kNumGlobalEpilogueWarps =
+                    kNumSMs * kNumEpilogueWarps;
+                constexpr uint32_t kOwnerProgressWarpBase =
+                    kNumGlobalEpilogueWarps - kNumOwnerProgressWarps;
+                const uint32_t global_epilogue_warp =
+                    sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
+                if (use_gin_combine_owner_slot_ready and
+                    global_epilogue_warp >= kOwnerProgressWarpBase) {
+                    // Four tail warps independently acquire the existing four
+                    // whole-owner terminals. No additional network action or
+                    // registered storage is introduced by this experiment.
+                    const uint32_t owner_in_lsa =
+                        global_epilogue_warp - kOwnerProgressWarpBase;
+                    if (lane_idx == 0) {
+                        comm::mega_moe_gin_wait_bulk_combine_terminal(
+                            gin_transport, /*context_stripe=*/ 0u,
+                            sym_buffer.get_base_ptr(),
+                            buffer.gin_workspace
+                                .get_combine_terminal_signal_ptr(owner_in_lsa),
+                            *workspace.get_gin_combine_terminal_epoch_ptr());
+                        // The StrongVA acquire precedes both the proxy bridge
+                        // and rank-local release publication. Token-pair warps
+                        // perform a matching acquire before resolving packet
+                        // metadata or issuing a payload TMA load.
+                        asm volatile(
+                            "fence.proxy.async.global;" ::: "memory");
+                        ptx::red_add_rel(
+                            buffer.gin_workspace
+                                .get_combine_receiver_owner_ready_ptr(
+                                    owner_in_lsa),
+                            1u);
+
+                        // Keep the exact packet-count audit, but move it off
+                        // the token critical path and after acquired visibility.
+                        const uint32_t lsa_size = static_cast<uint32_t>(
+                            gin_transport.dev_comm.lsaSize);
+                        const uint32_t remote_lsa_base =
+                            (1u - sym_buffer.rank_idx / lsa_size) * lsa_size;
+                        const uint32_t remote_owner =
+                            remote_lsa_base + owner_in_lsa;
+                        const auto* expected_counts =
+                            buffer.gin_workspace.count_staging_buffer
+                                .get_rank_buffer(remote_owner)
+                                .template get_base_ptr<uint64_t>();
+                        uint32_t expected_count = 0;
+                        #pragma unroll
+                        for (uint32_t expert = 0;
+                             expert < kNumExpertsPerRank; ++expert) {
+                            expected_count += static_cast<uint32_t>(
+                                expected_counts[expert]);
+                        }
+                        const uint32_t received_count = ptx::ld_acq_sys(
+                            buffer.gin_workspace
+                                .get_bulk_combine_packet_count_ptr(
+                                    /*send=*/ false, owner_in_lsa));
+                        DG_DEVICE_ASSERT(received_count == expected_count);
+                    }
+                    __syncwarp();
+                }
+            }
 
             if constexpr (kMegaMoeGinBulkCombine) {
                 if (use_gin_bulk_combine) {
@@ -4414,7 +4543,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                     // source rank's preserved outbound count vector.  Only
                     // active peer lanes perform the check, so it does not inflate
                     // the per-record scatter loop.
-                    if (sm_idx == 0 and epilogue_warp_idx == 0 and
+                    if (not use_gin_combine_owner_slot_ready and
+                        sm_idx == 0 and epilogue_warp_idx == 0 and
                         lane_idx < lsa_size) {
                         const uint32_t remote_lsa_base =
                             (1u - sym_buffer.rank_idx / lsa_size) * lsa_size;
@@ -4557,7 +4687,8 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         }
 
         if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {
-            if (use_gin_direct_reduce) {
+            if (use_gin_direct_reduce and
+                not use_gin_combine_owner_slot_ready) {
                 // The selected world Put fence or StrongVA waits plus grid2
                 // establish target visibility. Bridge that acquired global
                 // memory into TMA's async proxy once on every potential issuer,
@@ -4607,6 +4738,244 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         // Iterate over all tokens
         DG_GIN_TRACE_IF(lane_idx == 0, 120u + epilogue_warp_idx);
         DG_GIN_TRACE_IF(epilogue_warp_idx == 0 and lane_idx == 0, 61);
+        if (use_gin_owner_slot_pair_reduce) {
+            // One CTA owns one token. Its eight epilogue warps preserve broad
+            // slot-level parallelism: warp w reduces assignments {2w,2w+1}.
+            // One BF16 load chunk per warp plus one FP32 pair partial per warp
+            // consumes exactly the original three-chunk shared-memory budget.
+            DG_DEVICE_ASSERT(kNumEpilogueWarps == 8 and kNumTopk == 16);
+            DG_DEVICE_ASSERT(
+                (1u + 2u) * kNumEpilogueWarps * kNumChunkBytes <=
+                kNumReusableSmemBytes);
+            auto* pair_load_buffer = math::advance_ptr<uint4>(
+                smem_buffer, epilogue_warp_idx * kNumChunkBytes);
+            auto* pair_partial_buffer = math::advance_ptr<float2>(
+                smem_buffer,
+                kNumEpilogueWarps * kNumChunkBytes +
+                    epilogue_warp_idx * 2u * kNumChunkBytes);
+            auto* pair_output_buffer =
+                reinterpret_cast<uint4*>(smem_buffer);
+            auto* pair_load_barrier =
+                &shared_storage.combine_barriers[epilogue_warp_idx * 2u];
+            uint32_t pair_load_phase = 0;
+
+            for (uint32_t token_idx = sm_idx;
+                 token_idx < num_tokens; token_idx += kNumSMs) {
+                const uint32_t first_slot = epilogue_warp_idx * 2u;
+                int pair_experts[2] = {-1, -1};
+                if (lane_idx == 0) {
+                    pair_experts[0] = static_cast<int>(__ldg(
+                        buffer.input_topk_idx_buffer.get_base_ptr<int64_t>() +
+                        token_idx * kNumTopk + first_slot));
+                    pair_experts[1] = static_cast<int>(__ldg(
+                        buffer.input_topk_idx_buffer.get_base_ptr<int64_t>() +
+                        token_idx * kNumTopk + first_slot + 1u));
+                }
+                pair_experts[0] = __shfl_sync(
+                    0xffffffffu, pair_experts[0], 0);
+                pair_experts[1] = __shfl_sync(
+                    0xffffffffu, pair_experts[1], 0);
+
+                uint64_t pair_row_ptrs[2] = {};
+
+                for (uint32_t chunk = 0; chunk < kNumChunks; ++chunk) {
+                    const uint32_t chunk_byte_offset =
+                        chunk * kNumChunkBytes;
+                    if (epilogue_warp_idx == 0) {
+                        // Warp0's BF16 load buffer doubles as the output TMA
+                        // source. Retire the preceding chunk before reuse.
+                        ptx::tma_store_wait<0>();
+                        __syncwarp();
+                    }
+
+                    float2 pair_reduced[
+                        kNumUint4PerLane * kNumElemsPerUint4] = {};
+                    #pragma unroll
+                    for (uint32_t pair_slot = 0; pair_slot < 2;
+                         ++pair_slot) {
+                        if (pair_experts[pair_slot] < 0)
+                            continue;
+                        if (chunk == 0 and lane_idx == 0) {
+                            const uint32_t slot_idx =
+                                first_slot + pair_slot;
+                            const int expert = pair_experts[pair_slot];
+                            DG_DEVICE_ASSERT(expert < kNumExperts);
+                            pair_row_ptrs[pair_slot] =
+                                reinterpret_cast<uint64_t>(
+                                    buffer.combine_token_buffer
+                                        .get_rank_buffer(slot_idx)
+                                        .get_data_buffer(token_idx)
+                                        .get_base_ptr());
+#ifdef DG_MEGAMOE_GIN
+                            if (use_gin_direct_reduce) {
+                                const uint32_t owner =
+                                    static_cast<uint32_t>(expert) /
+                                    kNumExpertsPerRank;
+                                if (not gin_transport.is_same_lsa_peer(owner)) {
+                                    const uint32_t owner_in_lsa = owner %
+                                        static_cast<uint32_t>(
+                                            gin_transport.dev_comm.lsaSize);
+                                    if (use_gin_combine_owner_slot_ready) {
+                                        while (ptx::ld_acq(
+                                                   buffer.gin_workspace
+                                                       .get_combine_receiver_owner_ready_ptr(
+                                                           owner_in_lsa)) == 0) {
+                                        }
+                                    }
+                                    // Wait one assignment at a time. The first
+                                    // assignment's TMA and FP32 accumulation can
+                                    // run while the second owner's terminal is
+                                    // still in flight.
+                                    asm volatile(
+                                        "fence.proxy.async.global;" :::
+                                        "memory");
+                                    const uint32_t token_topk_idx =
+                                        token_idx * kNumTopk + slot_idx;
+                                    const uint32_t ordinal =
+                                        *buffer.gin_workspace
+                                             .get_combine_direct_reduce_ordinal_ptr(
+                                                 token_topk_idx);
+                                    const uint32_t received_count =
+                                        ptx::ld_acq_sys(
+                                            buffer.gin_workspace
+                                                .get_bulk_combine_packet_count_ptr(
+                                                    /*send=*/ false,
+                                                    owner_in_lsa));
+                                    DG_DEVICE_ASSERT(
+                                        ordinal < received_count);
+                                    const uint32_t destination =
+                                        ptx::ld_acq_sys(
+                                            buffer.gin_workspace
+                                                .get_bulk_combine_record_destination_ptr(
+                                                    /*send=*/ false,
+                                                    owner_in_lsa, ordinal));
+                                    DG_DEVICE_ASSERT(
+                                        destination == token_topk_idx);
+                                    pair_row_ptrs[pair_slot] =
+                                        reinterpret_cast<uint64_t>(
+                                            buffer.gin_workspace
+                                                .get_bulk_combine_record_payload_ptr(
+                                                    /*send=*/ false,
+                                                    owner_in_lsa, ordinal));
+                                } else {
+                                    // The candidate skipped the old global
+                                    // proxy fence. Bridge same-LSA direct-store
+                                    // visibility for this fixed TMA issuer too.
+                                    asm volatile(
+                                        "fence.proxy.async.global;" :::
+                                        "memory");
+                                }
+                            }
+#endif
+                        }
+                        pair_row_ptrs[pair_slot] = __shfl_sync(
+                            0xffffffffu,
+                            static_cast<unsigned long long>(
+                                pair_row_ptrs[pair_slot]), 0);
+                        if (lane_idx == 0) {
+                            auto* src_ptr = math::advance_ptr<uint8_t>(
+                                reinterpret_cast<void*>(
+                                    pair_row_ptrs[pair_slot]),
+                                chunk_byte_offset);
+                            ptx::tma_load_1d(
+                                pair_load_buffer, src_ptr,
+                                pair_load_barrier, kNumChunkBytes);
+                            ptx::mbarrier_arrive_and_set_tx(
+                                pair_load_barrier, kNumChunkBytes);
+                        }
+                        __syncwarp();
+                        pair_load_barrier->wait(pair_load_phase);
+                        pair_load_phase ^= 1u;
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++j) {
+                            const auto uint4_values = pair_load_buffer[
+                                j * 32u + lane_idx];
+                            const auto* bf16_values =
+                                reinterpret_cast<const nv_bfloat162*>(
+                                    &uint4_values);
+                            #pragma unroll
+                            for (uint32_t l = 0;
+                                 l < kNumElemsPerUint4; ++l) {
+                                ptx::accumulate(
+                                    pair_reduced[
+                                        j * kNumElemsPerUint4 + l],
+                                    bf16_values[l]);
+                            }
+                        }
+                    }
+
+                    #pragma unroll
+                    for (uint32_t value = 0;
+                         value <
+                             kNumUint4PerLane * kNumElemsPerUint4;
+                         ++value) {
+                        ptx::st_shared(
+                            pair_partial_buffer +
+                                value * 32u + lane_idx,
+                            pair_reduced[value]);
+                    }
+                    __syncwarp();
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+
+                    if (epilogue_warp_idx == 0) {
+                        #pragma unroll
+                        for (uint32_t j = 0; j < kNumUint4PerLane; ++j) {
+                            uint4 casted;
+                            auto* casted_bf16 =
+                                reinterpret_cast<nv_bfloat162*>(&casted);
+                            #pragma unroll
+                            for (uint32_t l = 0;
+                                 l < kNumElemsPerUint4; ++l) {
+                                const uint32_t value =
+                                    j * kNumElemsPerUint4 + l;
+                                float2 reduced = {};
+                                #pragma unroll
+                                for (uint32_t pair = 0; pair < 8;
+                                     ++pair) {
+                                    const auto* partial =
+                                        math::advance_ptr<float2>(
+                                            smem_buffer,
+                                            kNumEpilogueWarps *
+                                                    kNumChunkBytes +
+                                                pair * 2u *
+                                                    kNumChunkBytes);
+                                    const float2 next = ptx::ld_shared(
+                                        partial + value * 32u + lane_idx);
+                                    reduced.x += next.x;
+                                    reduced.y += next.y;
+                                }
+                                casted_bf16[l] =
+                                    __float22bfloat162_rn(reduced);
+                            }
+                            ptx::st_shared(
+                                pair_output_buffer + j * 32u + lane_idx,
+                                casted.x, casted.y,
+                                casted.z, casted.w);
+                        }
+                        __syncwarp();
+                        if (lane_idx == 0) {
+                            cute::tma_store_fence();
+                            ptx::tma_store_1d(
+                                math::advance_ptr(
+                                    y,
+                                    static_cast<uint64_t>(token_idx) *
+                                            kNumHiddenBytes +
+                                        chunk_byte_offset),
+                                pair_output_buffer, kNumChunkBytes);
+                            cute::tma_store_arrive();
+                        }
+                        __syncwarp();
+                    }
+
+                    // Do not reuse either the BF16 load region or the FP32
+                    // pair-partial region until warp0 has consumed all pairs
+                    // in ascending assignment order and queued the output.
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
+            }
+        } else {
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
         for (uint32_t token_idx = sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
@@ -4760,6 +5129,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 }
                 __syncwarp();
             }
+        }
         }
         DG_GIN_TRACE_IF(lane_idx == 0, 88u + epilogue_warp_idx);
         if constexpr (kUseGin and kMegaMoeGinCombineOverlap) {

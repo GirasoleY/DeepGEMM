@@ -759,6 +759,17 @@ struct MegaMoeGinWorkspace {
             kMegaMoeGinCombineOverlapNumExperts;
     }
 
+    // The owner-slot reducer reuses four already-reset bookkeeping cells after
+    // the W4 sender has finished.  These are rank-local handoff flags, not new
+    // registered-window signals and not part of the wire protocol.
+    CUTLASS_HOST_DEVICE
+    uint32_t* get_combine_receiver_owner_ready_ptr(
+            const uint32_t owner_in_lsa) const {
+        DG_UNIFIED_ASSERT(
+            owner_in_lsa < kMegaMoeGinDirectDispatchNumPeers);
+        return get_combine_overlap_sent_ptr(owner_in_lsa);
+    }
+
     CUTLASS_HOST_DEVICE
     uint32_t* get_combine_overlap_prefix_ptr(
             const uint32_t source_lane, const uint32_t local_expert) const {

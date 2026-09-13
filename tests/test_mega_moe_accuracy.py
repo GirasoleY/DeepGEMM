@@ -105,6 +105,9 @@ GIN_STRONGVA_COMBINE_TERMINAL_ENV = (
     "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL"
 )
 GIN_COMBINE_OWNER_WAVES_ENV = "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES"
+GIN_COMBINE_OWNER_SLOT_READY_ENV = (
+    "DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY"
+)
 GIN_EXPERIMENT_FLAG_ENVS: Tuple[str, ...] = (
     GIN_DISPATCH_WARP_SCAN_ENV,
     GIN_COOP_DIRECT_PACK_ENV,
@@ -2779,6 +2782,14 @@ def _validate_args(args: argparse.Namespace, world_size: int, *,
             raise ValueError(
                 "--gin-combine-owner-waves requires EP8/E448 GIN "
                 "bulk/direct mode")
+    if getattr(args, "gin_combine_owner_slot_ready", False) and not (
+            combine_owner_waves == 4 and world_size == 8 and
+            args.num_experts == 448 and args.num_topk == 16 and
+            args.require_gin and args.gin_bulk_combine and
+            args.gin_direct_dispatch and experts_per_rank == 56):
+        raise ValueError(
+            "--gin-combine-owner-slot-ready requires EP8/E448/topk16 W4 "
+            "GIN bulk/direct mode")
 
 
 def _validate_gin_host_placement(
@@ -2825,13 +2836,15 @@ def _collect_gin_experiment_flags(
         "expert_width": os.getenv("DG_MEGAMOE_GIN_COMBINE_EXPERTS_PER_WAVE", "0"),
         "barrier_warps": os.getenv("DG_MEGAMOE_GIN_COMBINE_BARRIER_WARPS", "1"),
         "owner_waves": os.getenv(GIN_COMBINE_OWNER_WAVES_ENV, "0"),
+        "owner_slot_ready": os.getenv(
+            GIN_COMBINE_OWNER_SLOT_READY_ENV, "0"),
     }
     gathered: List[Optional[Dict[str, Any]]] = [None] * world_size
     dist.all_gather_object(gathered, local_record)
 
     expected_record_keys = {
         "rank", "direct_dispatch", "flags", "expert_width",
-        "barrier_warps", "owner_waves",
+        "barrier_warps", "owner_waves", "owner_slot_ready",
     }
     expected_flag_keys = set(GIN_VALIDATED_FLAG_ENVS)
     for expected_rank, record in enumerate(gathered):
@@ -2954,6 +2967,28 @@ def _collect_gin_experiment_flags(
             "DISPATCH_OVERLAP=1 on every rank"
         )
     result[GIN_COMBINE_OWNER_WAVES_ENV] = combine_owner_waves
+    owner_slot_ready_values = [
+        record["owner_slot_ready"] for record in gathered
+    ]
+    if any(value not in ("0", "1") for value in owner_slot_ready_values):
+        raise RuntimeError(
+            f"{GIN_COMBINE_OWNER_SLOT_READY_ENV} must be exactly 0 or 1 "
+            "on every rank")
+    if len(set(owner_slot_ready_values)) != 1:
+        raise RuntimeError(
+            f"{GIN_COMBINE_OWNER_SLOT_READY_ENV} is not uniform across ranks")
+    combine_owner_slot_ready = owner_slot_ready_values[0] == "1"
+    if combine_owner_slot_ready and not (
+            combine_owner_waves == 4 and direct_dispatch and world_size == 8 and
+            result[GIN_STRONGVA_COMBINE_TERMINAL_ENV] and
+            result[GIN_COMBINE_OVERLAP_ENV] and
+            result[GIN_SINGLE_COMBINE_CONTEXT_ENV] and
+            result[GIN_DISPATCH_OVERLAP_ENV]):
+        raise RuntimeError(
+            f"{GIN_COMBINE_OWNER_SLOT_READY_ENV}=1 requires EP8 W4 direct "
+            "dispatch, STRONGVA_COMBINE_TERMINAL=1, COMBINE_OVERLAP=1, "
+            "SINGLE_COMBINE_CONTEXT=1 and DISPATCH_OVERLAP=1 on every rank")
+    result[GIN_COMBINE_OWNER_SLOT_READY_ENV] = combine_owner_slot_ready
     incompatible = [
         record["rank"] for record in gathered
         if record["expert_width"] != "0" or record["barrier_warps"] != "1"
@@ -3221,6 +3256,9 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace,
     os.environ[GIN_LOCAL_ABLATION_ENV] = "0"
     os.environ[GIN_COMBINE_OWNER_WAVES_ENV] = str(
         getattr(args, "gin_combine_owner_waves", 0))
+    os.environ[GIN_COMBINE_OWNER_SLOT_READY_ENV] = (
+        "1" if getattr(args, "gin_combine_owner_slot_ready", False) else "0"
+    )
     torch, dist, deep_gemm = _load_runtime()
     buffer = None
     symmetric_memory_registration = None
@@ -3538,6 +3576,8 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace,
                         "outbox_depth": args.gin_outbox_depth,
                         "combine_issue_wave": args.gin_combine_issue_wave,
                         "combine_owner_waves": args.gin_combine_owner_waves,
+                        "combine_owner_slot_ready": (
+                            args.gin_combine_owner_slot_ready),
                         "queue_depth": args.gin_queue_depth,
                         "active_fast_path": args.gin_active_fast_path,
                         "bulk_combine": args.gin_bulk_combine,
@@ -3578,6 +3618,7 @@ def _worker(local_rank: int, local_world_size: int, args: argparse.Namespace,
     finally:
         os.environ[GIN_LOCAL_ABLATION_ENV] = "0"
         os.environ[GIN_COMBINE_OWNER_WAVES_ENV] = "0"
+        os.environ[GIN_COMBINE_OWNER_SLOT_READY_ENV] = "0"
         # Also retire graphs on a failed validation/benchmark before the
         # symmetric allocation and its GIN registration are destroyed.
         benchmark_graph = None
@@ -3699,6 +3740,15 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Compile the StrongVA combine sender with 2, 4, or 8 fixed "
             "contiguous owner-expert readiness ranges; 0 preserves r4"
+        ),
+    )
+    parser.add_argument(
+        "--gin-combine-owner-slot-ready",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use four existing whole-owner terminals to release fixed "
+            "top-k assignment-pair reducer warps independently"
         ),
     )
     parser.add_argument(

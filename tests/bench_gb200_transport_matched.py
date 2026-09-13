@@ -88,6 +88,12 @@ def parse_args(argv=None):
             "ranges; 0 preserves the r4 sender"
         ),
     )
+    parser.add_argument(
+        "--gin-combine-owner-slot-ready",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable fixed top-k assignment-pair owner-ready reduction",
+    )
     options = parser.parse_args(argv)
     if options.comparison_replays < 2:
         parser.error("at least two timed replays are required for split summaries")
@@ -101,6 +107,11 @@ def parse_args(argv=None):
     if options.gin_combine_owner_waves and (
             options.mode not in GIN_MODES or options.world_size != 8):
         parser.error("--gin-combine-owner-waves requires an EP8 GIN mode")
+    if options.gin_combine_owner_slot_ready and (
+            options.mode not in GIN_MODES or options.world_size != 8 or
+            options.gin_combine_owner_waves != 4):
+        parser.error(
+            "--gin-combine-owner-slot-ready requires EP8 GIN with W4")
     common = ["--k3", "--decode-mns", str(options.decode_mns),
               "--num-experts", str(56 * options.world_size),
               "--eager-iterations", str(options.eager_iterations),
@@ -113,6 +124,8 @@ def parse_args(argv=None):
     if options.mode in GIN_MODES:
         common += ["--require-gin", "--gin-active-fast-path", "--gin-bulk-combine",
                    "--gin-direct-dispatch"]
+    if options.gin_combine_owner_slot_ready:
+        common += ["--gin-combine-owner-slot-ready"]
     with patch.object(sys, "argv", [sys.argv[0], *common]):
         args = accuracy._parse_args()
     comparison = SimpleNamespace(
@@ -128,17 +141,25 @@ def parse_args(argv=None):
     return options, args, comparison
 
 
-def fixed_environment(mode, combine_owner_waves=0):
+def fixed_environment(
+        mode, combine_owner_waves=0, combine_owner_slot_ready=False):
     if mode not in MODES:
         raise ValueError("mode must be native_nvl, gin_ib or gin_roce")
     if type(combine_owner_waves) is not int or combine_owner_waves not in (0, 2, 4, 8):
         raise ValueError("combine_owner_waves must be exactly 0, 2, 4, or 8")
     if combine_owner_waves and mode not in GIN_MODES:
         raise ValueError("combine_owner_waves requires a GIN mode")
+    if type(combine_owner_slot_ready) is not bool:
+        raise ValueError("combine_owner_slot_ready must be boolean")
+    if combine_owner_slot_ready and (
+            mode not in GIN_MODES or combine_owner_waves != 4):
+        raise ValueError("combine_owner_slot_ready requires GIN W4")
     enabled = "1" if mode in GIN_MODES else "0"
     return {
         **{name: enabled for name in accuracy.GIN_VALIDATED_FLAG_ENVS},
         accuracy.GIN_COMBINE_OWNER_WAVES_ENV: str(combine_owner_waves),
+        accuracy.GIN_COMBINE_OWNER_SLOT_READY_ENV: (
+            "1" if combine_owner_slot_ready else "0"),
         accuracy.GIN_ACTIVITY_GATE_OPT_ENV: enabled,
         "DG_MEGAMOE_GIN_DIAGNOSTICS": "0",
         accuracy.GIN_LOCAL_ABLATION_ENV: "0",
@@ -215,7 +236,8 @@ def configuration(options, args, comparison, sources):
         "deepep": {"num_sms": 16, "num_qps": 9, "capacity": 384,
                    **comparison.dispatch_bucket_evidence},
         "megamoe_environment": fixed_environment(
-            options.mode, options.gin_combine_owner_waves),
+            options.mode, options.gin_combine_owner_waves,
+            options.gin_combine_owner_slot_ready),
         "combine_owner_waves": {
             "requested": options.gin_combine_owner_waves,
             "expert_ranges": (
@@ -419,7 +441,8 @@ def main():
         raise RuntimeError("use a fresh torchrun job with four workers/host and the selected EP8/EP16 world")
     matched.validate_clean_experiment_environment()
     os.environ.update(fixed_environment(
-        options.mode, options.gin_combine_owner_waves))
+        options.mode, options.gin_combine_owner_waves,
+        options.gin_combine_owner_slot_ready))
     from mega_moe_gb200_topology import GB200Topology
     sources = source_manifest()
     config = configuration(options, args, comparison, sources)
@@ -500,7 +523,8 @@ def main():
     }
     if options.mode in GIN_MODES:
         record.update(matched.dispatch_candidate_metadata(fixed_environment(
-            options.mode, options.gin_combine_owner_waves)))
+            options.mode, options.gin_combine_owner_waves,
+            options.gin_combine_owner_slot_ready)))
         record["quantization_boundary"] = {
             "intermediate_quantizers_identical": False,
             "trtllm_intermediate_scale": "2**(floor(log2(amax))-8), per32 UE8M0 with saturating FP8 RNE",

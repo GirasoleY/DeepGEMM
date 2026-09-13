@@ -241,6 +241,8 @@ class SymmBuffer:
                 'DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL', '0'),
             'combine_owner_waves': os.environ.get(
                 'DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES', '0'),
+            'combine_owner_slot_ready': os.environ.get(
+                'DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY', '0'),
             'preconsensus_pack': os.environ.get(
                 'DG_MEGAMOE_GIN_PRECONSENSUS_PACK', '0'),
             'coop_direct_pack': os.environ.get(
@@ -328,6 +330,28 @@ class SymmBuffer:
                     'strongva_combine_terminal, combine_overlap, bulk_combine, '
                     'direct_dispatch, SINGLE_COMBINE_CONTEXT=1 and '
                     'DISPATCH_OVERLAP=1')
+        if canonical['combine_owner_slot_ready'] not in ('0', '1'):
+            errors.append(
+                'DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY must be exactly 0 or 1')
+        elif canonical['combine_owner_slot_ready'] == '1':
+            if not (canonical['combine_owner_waves'] == '4'
+                    and canonical['world_size'] == 8
+                    and canonical['num_experts'] == 448
+                    and canonical['num_topk'] == 16
+                    and canonical['hidden'] == 3584
+                    and canonical['intermediate_hidden'] == 3072
+                    and canonical['num_shared_experts'] == 0
+                    and canonical['strongva_combine_terminal'] == '1'
+                    and canonical['combine_overlap'] == '1'
+                    and canonical['single_combine_context'] == '1'
+                    and canonical['dispatch_overlap'] == '1'
+                    and canonical['bulk_combine']
+                    and canonical['direct_dispatch']):
+                errors.append(
+                    'combine_owner_slot_ready requires the EP8/E448/topk16 '
+                    'decode shape, W4, strongva_combine_terminal, '
+                    'combine_overlap, bulk_combine, direct_dispatch, '
+                    'SINGLE_COMBINE_CONTEXT=1 and DISPATCH_OVERLAP=1')
         if canonical['world_size'] not in (8, 16):
             errors.append('world_size must be exactly 8 or 16')
         if canonical['world_size'] == 8 and canonical['num_experts'] != 448:

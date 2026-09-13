@@ -327,15 +327,20 @@ class CoarseOwnerWaveSourceContracts(unittest.TestCase):
             "options.mode, options.gin_combine_owner_waves",
             final_forward[:300])
 
-    def test_direct_reducer_is_byte_frozen_to_safe_r4(self):
+    def test_default_reducer_fallback_and_gated_candidate_are_pinned(self):
         start = self.kernel.index(
             "        // Combine: reduce top-k results and write back")
         end = self.kernel.index("\n    }\n#else", start)
         reducer = self.kernel[start:end]
-        self.assertNotIn("OwnerWave", reducer)
+        self.assertIn("if (use_gin_owner_slot_pair_reduce)", reducer)
+        fallback = reducer.split(
+            "if (use_gin_owner_slot_pair_reduce)", 1)[1].split(
+                "} else {", 1)[1]
+        self.assertIn("uint32_t combine_phase = 0", fallback)
+        self.assertIn("move_mask_and_load", fallback)
         self.assertEqual(
             hashlib.sha256(reducer.encode()).hexdigest(),
-            "78c68e626c046ded31eab1c174b49c87ab1b59df0f224353db7b7d62822f370c",
+            "2a65d7f516feb9efc6ab51ea4418eedcdd387f9fe6e5da6a6931716ac359cfea",
         )
 
 
