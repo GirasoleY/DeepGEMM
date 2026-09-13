@@ -464,7 +464,7 @@ static void sm100_fp8_fp4_mega_moe(
     DG_HOST_ASSERT(not gin_strongva_combine_terminal or
                    (gin_combine_overlap and gin_single_combine_context and
                     gin_dispatch_overlap and gin_direct_dispatch and
-                    gin_bulk_combine));
+                    gin_bulk_combine and gin_activity_gate_opt));
     // Removing a world collective cannot depend on the kernel's rank-local
     // alias fallback. Fail closed on the conservative completion-batch=1
     // scratch bound, then let runtime eligibility use only world consensus.

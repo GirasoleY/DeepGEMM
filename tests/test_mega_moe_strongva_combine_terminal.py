@@ -223,6 +223,7 @@ class StrongVASourceContracts(unittest.TestCase):
         self.assertIn("kMegaMoeGinStrongVACombineTerminal", self.kernel)
         self.assertIn("kMegaMoeGinCombineOverlap", self.kernel)
         self.assertIn("strongva_combine_terminal", self.public)
+        self.assertIn("activity_gate_opt", self.public)
         self.assertIn("configuration mismatch across ranks", self.public)
 
     def test_strongva_sender_and_receiver_share_world_only_eligibility(self):
@@ -318,9 +319,9 @@ class StrongVASourceContracts(unittest.TestCase):
         self.assertIn("get_combine_terminal_signal_ptr(owner_lane)", drainer)
         self.assertIn("DG_DEVICE_ASSERT(sent_records == expected_records)", drainer)
 
-    def test_sender_completion_moves_after_cleanup_grid_before_world_rendezvous(self):
+    def test_sender_completion_precedes_fallback_or_deferred_rendezvous(self):
         cleanup_begin = self.kernel.index(
-            "// Wait for all ranks to finish cleaning")
+            "// Finish workspace cleanup.")
         cleanup_end = self.kernel.index(
             "} else if (warp_idx == kNumDispatchWarps)", cleanup_begin)
         cleanup = self.kernel[cleanup_begin:cleanup_end]
@@ -331,13 +332,21 @@ class StrongVASourceContracts(unittest.TestCase):
         wait = cleanup.index("mega_moe_gin_wait_data_peer(", flush)
         marker = cleanup.index("DG_GIN_TRACE_IF(true, 80u + lane_idx)", wait)
         warp_join = cleanup.index("__syncwarp();", marker)
-        world = cleanup.index("comm::mega_moe_gin_world_barrier(", warp_join)
+        fallback = cleanup.index(
+            "if (not use_gin_strongva_combine_terminal)", warp_join)
+        world = cleanup.index("comm::mega_moe_gin_world_barrier(", fallback)
+        deferred = cleanup.index(
+            "if (use_gin_strongva_combine_terminal)", world)
+        lsa = cleanup.index("comm::nvlink_lsa_barrier<", deferred)
         self.assertLess(grid, strongva)
         self.assertLess(strongva, flush)
         self.assertLess(flush, wait)
         self.assertLess(wait, marker)
         self.assertLess(marker, warp_join)
-        self.assertLess(warp_join, world)
+        self.assertLess(warp_join, fallback)
+        self.assertLess(fallback, world)
+        self.assertLess(world, deferred)
+        self.assertLess(deferred, lsa)
         self.assertIn("/*context_stripe=*/ 0u", cleanup[flush:wait])
         self.assertIn("if (use_gin_strongva_combine_terminal)",
                       cleanup[strongva:flush])
@@ -392,7 +401,7 @@ class StrongVASourceContracts(unittest.TestCase):
                          "                     .get_combine_terminal_signal_ptr",
                          self.kernel)
         cleanup_begin = self.kernel.index(
-            "// Wait for all ranks to finish cleaning")
+            "// Finish workspace cleanup.")
         cleanup_end = self.kernel.index(
             "} else if (warp_idx == kNumDispatchWarps)", cleanup_begin)
         cleanup = self.kernel[cleanup_begin:cleanup_end]

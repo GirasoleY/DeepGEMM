@@ -55,6 +55,38 @@ def braced_block(source, start):
     return source[start:end]
 
 
+class DeferredPairRendezvous:
+    """CPU ordering model for next-launch receiver retirement."""
+
+    def __init__(self, lsa_size):
+        self.lsa_size = lsa_size
+        self.world_size = 2 * lsa_size
+        self.completed = [-1] * self.world_size
+        self.entered = [-1] * self.world_size
+        self.acquired = set()
+
+    def finish(self, rank, generation):
+        self.completed[rank] = generation
+
+    def enter(self, rank, generation):
+        if self.completed[rank] != generation - 1:
+            raise ProtocolError("rank entered before completing its prior launch")
+        self.entered[rank] = generation
+
+    def acquire_pair(self, rank, generation):
+        paired = (rank + self.lsa_size) % self.world_size
+        if self.entered[paired] != generation:
+            raise ProtocolError("paired mailbox generation is not ready")
+        self.acquired.add((rank, generation))
+
+    def can_publish_cross_lsa(self, rank, generation):
+        lsa_base = rank // self.lsa_size * self.lsa_size
+        return all(
+            (local_rank, generation) in self.acquired
+            for local_rank in range(lsa_base, lsa_base + self.lsa_size)
+        )
+
+
 class LateFlushModelTests(unittest.TestCase):
     def generation(self, counts=((2, 0, 3), (0, 1, 2)), **kwargs):
         model = LateFlushGeneration(range(len(counts)), n_fragments=2, **kwargs)
@@ -250,6 +282,39 @@ class LateFlushModelTests(unittest.TestCase):
                 model.publish_headers(generation)
             target_and_consumers_complete(model)
 
+    def test_next_launch_pair_exchange_composes_into_world_retirement(self):
+        model = DeferredPairRendezvous(lsa_size=4)
+        for rank in range(model.world_size):
+            model.finish(rank, 0)
+            model.enter(rank, 1)
+
+        # Three pair acquires cannot retire the fourth opposite-LSA consumer.
+        for rank in range(3):
+            model.acquire_pair(rank, 1)
+        self.assertFalse(model.can_publish_cross_lsa(0, 1))
+        model.acquire_pair(3, 1)
+        self.assertTrue(model.can_publish_cross_lsa(0, 1))
+
+    def test_every_transition_advances_exact_pair_generation(self):
+        model = DeferredPairRendezvous(lsa_size=4)
+        for generation, mode in enumerate(
+                ("strongva", "local_only", "t64_fallback", "strongva"), 1):
+            for rank in range(model.world_size):
+                model.finish(rank, generation - 1)
+                model.enter(rank, generation)
+            for rank in range(model.world_size):
+                model.acquire_pair(rank, generation)
+            for rank in range(model.world_size):
+                self.assertTrue(
+                    model.can_publish_cross_lsa(rank, generation), mode)
+
+            # A stale mailbox from the retained graph's preceding replay cannot
+            # satisfy the next replay's exact generation.
+            paired = model.lsa_size
+            model.entered[paired] = generation
+            with self.assertRaisesRegex(ProtocolError, "generation"):
+                model.acquire_pair(0, generation + 1)
+
 
 class LateFlushSourceContracts(unittest.TestCase):
     @classmethod
@@ -257,6 +322,7 @@ class LateFlushSourceContracts(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         cls.kernel = (root / "deep_gemm/include/deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh").read_text()
         cls.helper = (root / "deep_gemm/include/deep_gemm/comm/mega_moe_gin.cuh").read_text()
+        cls.jit = (root / "csrc/jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp").read_text()
 
     def test_drainer_retains_count_audit_but_defers_strongva_completion(self):
         source = self.kernel
@@ -278,7 +344,7 @@ class LateFlushSourceContracts(unittest.TestCase):
         self.assertLess(body.index("DG_DEVICE_ASSERT(sent_records == expected_records)"),
                         body.rindex("__syncwarp();"))
 
-        cleanup_begin = source.index("// Wait for all ranks to finish cleaning")
+        cleanup_begin = source.index("// Finish workspace cleanup.")
         cleanup_end = source.index(
             "} else if (warp_idx == kNumDispatchWarps)", cleanup_begin)
         cleanup = source[cleanup_begin:cleanup_end]
@@ -286,11 +352,65 @@ class LateFlushSourceContracts(unittest.TestCase):
         flush = cleanup.index("mega_moe_gin_flush_data_peer_async(", grid)
         wait = cleanup.index("mega_moe_gin_wait_data_peer(", flush)
         marker = cleanup.index("DG_GIN_TRACE_IF(true, 80u + lane_idx)", wait)
-        world = cleanup.index("comm::mega_moe_gin_world_barrier(", marker)
+        fallback = cleanup.index(
+            "if (not use_gin_strongva_combine_terminal)", marker)
+        world = cleanup.index("comm::mega_moe_gin_world_barrier(", fallback)
+        deferred = cleanup.index(
+            "if (use_gin_strongva_combine_terminal)", world)
+        lsa = cleanup.index("comm::nvlink_lsa_barrier<", deferred)
         self.assertLess(grid, flush)
         self.assertLess(flush, wait)
         self.assertLess(wait, marker)
-        self.assertLess(marker, world)
+        self.assertLess(marker, fallback)
+        self.assertLess(fallback, world)
+        self.assertLess(world, deferred)
+        self.assertLess(deferred, lsa)
+        leader = braced_block(
+            cleanup, cleanup.index("if (sm_idx == 0 and warp_idx == 0)"))
+        self.assertNotIn(
+            "comm::nvlink_lsa_barrier<", leader,
+            "all dispatch threads must enter the same-LSA cleanup barrier")
+        fallback_block = braced_block(cleanup, fallback)
+        self.assertIn("mega_moe_gin_world_barrier(", fallback_block)
+        deferred_block = braced_block(cleanup, deferred)
+        self.assertNotIn("mega_moe_gin_world_barrier(", deferred_block)
+        self.assertIn("/* Cleanup grid is the prologue */ false", deferred_block)
+        self.assertIn("/* No work follows in dispatch warps */ false", deferred_block)
+
+        self.assertIn(
+            "(kMegaMoeGinActiveFastPath and kMegaMoeGinActivityGateOpt)",
+            source)
+        host_gate = self.jit.index(
+            "DG_HOST_ASSERT(not gin_strongva_combine_terminal or")
+        strongva_host = self.jit[
+            host_gate:self.jit.index(");", host_gate) + 2]
+        self.assertIn("gin_activity_gate_opt", strongva_host)
+
+    def test_next_launch_rendezvous_precedes_every_payload_publication(self):
+        source = self.kernel
+        consensus = source.index(
+            "if constexpr (kUseGin and kMegaMoeGinActiveFastPath)")
+        pair = source.index("mega_moe_gin_exchange_pair_flags(", consensus)
+        lsa = source.index("comm::nvlink_lsa_barrier<", pair)
+        decision_grid = source.index(
+            "comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(", lsa)
+        direct = source.index(
+            "mega_moe_gin_publish_direct_dispatch_ordered<", decision_grid)
+        fallback = source.index("mega_moe_gin_publish_inputs(", decision_grid)
+        self.assertLess(pair, lsa)
+        self.assertLess(lsa, decision_grid)
+        self.assertLess(decision_grid, direct)
+        self.assertLess(decision_grid, fallback)
+
+        prepack = source[source.index("// Packet construction depends only"):
+                         consensus]
+        self.assertIn(
+            "No GIN payload is issued until the final decision", prepack)
+        helper = braced_block(
+            self.helper,
+            self.helper.index("uint32_t mega_moe_gin_exchange_pair_flags("))
+        self.assertIn("received_generation == generation", helper)
+        self.assertIn("Concurrent streams sharing a workspace", self.helper)
 
     def test_late_header_same_context_peer_flush_stays_after_handoff_grid(self):
         source = self.kernel

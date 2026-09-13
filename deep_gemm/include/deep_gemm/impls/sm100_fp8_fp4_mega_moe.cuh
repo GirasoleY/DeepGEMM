@@ -203,6 +203,9 @@ static_assert(DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL == 0 or
 static_assert(not kMegaMoeGinStrongVACombineTerminal or
               kMegaMoeGinCombineOverlap,
               "GIN StrongVA combine terminal requires combine overlap");
+static_assert(not kMegaMoeGinStrongVACombineTerminal or
+              (kMegaMoeGinActiveFastPath and kMegaMoeGinActivityGateOpt),
+              "GIN deferred cleanup requires the optimized activity rendezvous");
 static constexpr uint32_t kMegaMoeGinCombineOwnerWaves =
     DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES;
 static_assert(kMegaMoeGinCombineOwnerWaves == 0 or
@@ -939,7 +942,10 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             // barrier and a world collective.  The same consensus also carries
             // a small-decode ineligibility bit, because num_tokens may differ
             // by rank.  Both LSAs consequently select direct dispatch and/or
-            // bulk combine, or their original r75 paths, uniformly.
+            // bulk combine, or their original r75 paths, uniformly. This
+            // mandatory next-launch pair exchange plus LSA rendezvous also
+            // retires every opposite-LSA consumer from the preceding launch
+            // before any new cross-LSA payload can overwrite its receive slab.
             if (sm_idx == 0 and warp_idx == 0) {
                 bool lane_has_remote = false;
                 for (uint32_t expert = lane_idx;
@@ -3356,9 +3362,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 
-        // Wait for all ranks to finish cleaning.  Reset the cumulative outbox
-        // generations only after every slot has been drained so graph replay
-        // begins from the same all-zero state as the first launch.
+        // Finish workspace cleanup. Reset the cumulative outbox generations
+        // only after every slot has been drained so graph replay begins from
+        // the same all-zero state as the first launch. StrongVA launches retain
+        // a same-LSA cleanup rendezvous here; their opposite-LSA receiver reuse
+        // is deferred to the mandatory pair exchange at the next launch.
         if constexpr (kUseGin and kMegaMoeGinLocalAblationStage < 3) {
 #ifdef DG_MEGAMOE_GIN
             const bool run_remote_path =
@@ -3387,8 +3395,7 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                         // The earlier dispatch/epilogue handoff retired every
                         // local packet reader; this grid proves all dispatch
                         // CTAs finished workspace cleanup. Retire each sender
-                        // chain now, immediately before the cleanup world
-                        // rendezvous permits kernel/replay source reuse.
+                        // chain before this launch can release its source slabs.
                         const uint32_t lsa_size = static_cast<uint32_t>(
                             gin_transport.dev_comm.lsaSize);
                         DG_DEVICE_ASSERT(lsa_size == kGinPeerCount);
@@ -3406,16 +3413,37 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                                 request);
                             DG_GIN_TRACE_IF(true, 80u + lane_idx);
                         }
-                        // The world barrier below is warp-cooperative. Do not
-                        // let inactive peer lanes enter it before all active
-                        // LSA-peer completions have returned.
+                        // Reconverge before the full dispatch group enters the
+                        // same-LSA cleanup rendezvous below.
                         __syncwarp();
                     }
                 }
-                comm::mega_moe_gin_world_barrier(
-                    gin_transport, kGinCleanupBarrierIdx,
-                    ncclGinFenceLevel::None);
-                DG_GIN_TRACE_IF(lane_idx == 0, 63);
+                if (not use_gin_strongva_combine_terminal) {
+                    comm::mega_moe_gin_world_barrier(
+                        gin_transport, kGinCleanupBarrierIdx,
+                        ncclGinFenceLevel::None);
+                    DG_GIN_TRACE_IF(lane_idx == 0, 63);
+                }
+            }
+            if (use_gin_strongva_combine_terminal) {
+                // The cleanup grid above is the prologue. Same-LSA peers may
+                // touch one another's workspace before the next activity
+                // exchange, so they still retire together. Opposite-LSA receive
+                // slabs cannot be overwritten until that next exchange has
+                // acquired every paired rank and aggregated them across this
+                // LSA; concurrent streams sharing a workspace remain unsupported.
+                comm::nvlink_lsa_barrier<
+                    kNumRanks, kGinPeerCount, kNumSMs, kNumDispatchThreads,
+                    kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+                        workspace, sym_buffer, sm_idx, thread_idx,
+                        [=]() {
+                            ptx::sync_aligned(
+                                kNumDispatchThreads, kDispatchBarrierIdx);
+                        },
+                        /* Cleanup grid is the prologue */ false,
+                        /* No work follows in dispatch warps */ false);
+                DG_GIN_TRACE_IF(
+                    sm_idx == 0 and warp_idx == 0 and lane_idx == 0, 63);
             }
             } else {
                 comm::nvlink_lsa_barrier<

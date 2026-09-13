@@ -237,6 +237,8 @@ class SymmBuffer:
                 'DG_MEGAMOE_GIN_DISPATCH_OVERLAP', '0'),
             'combine_overlap': os.environ.get(
                 'DG_MEGAMOE_GIN_COMBINE_OVERLAP', '0'),
+            'activity_gate_opt': os.environ.get(
+                'DG_MEGAMOE_GIN_ACTIVITY_GATE_OPT', '0'),
             'strongva_combine_terminal': os.environ.get(
                 'DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL', '0'),
             'combine_owner_waves': os.environ.get(
@@ -299,6 +301,9 @@ class SymmBuffer:
                 errors.append(
                     'combine_overlap requires bulk_combine, direct_dispatch, '
                     'SINGLE_COMBINE_CONTEXT=1 and DISPATCH_OVERLAP=1')
+        if canonical['activity_gate_opt'] not in ('0', '1'):
+            errors.append(
+                'DG_MEGAMOE_GIN_ACTIVITY_GATE_OPT must be exactly 0 or 1')
         if canonical['strongva_combine_terminal'] not in ('0', '1'):
             errors.append(
                 'DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL must be exactly 0 or 1')
@@ -306,12 +311,13 @@ class SymmBuffer:
             if not (canonical['combine_overlap'] == '1'
                     and canonical['single_combine_context'] == '1'
                     and canonical['dispatch_overlap'] == '1'
+                    and canonical['activity_gate_opt'] == '1'
                     and canonical['bulk_combine']
                     and canonical['direct_dispatch']):
                 errors.append(
                     'strongva_combine_terminal requires combine_overlap, '
                     'bulk_combine, direct_dispatch, SINGLE_COMBINE_CONTEXT=1 '
-                    'and DISPATCH_OVERLAP=1')
+                    'DISPATCH_OVERLAP=1 and ACTIVITY_GATE_OPT=1')
         if canonical['combine_owner_waves'] not in ('0', '2', '4', '8'):
             errors.append(
                 'DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES must be exactly '

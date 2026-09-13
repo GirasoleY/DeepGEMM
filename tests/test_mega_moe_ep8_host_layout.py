@@ -127,9 +127,16 @@ class EP8PublicContract(unittest.TestCase):
         }
         os.environ.update(flags)
         value = self.buffer(8)
+        with self.assertRaisesRegex(RuntimeError, 'ACTIVITY_GATE_OPT=1'):
+            value.enable_gin()
+        value._collective_get_gin_unique_id.assert_not_called()
+
+        os.environ['DG_MEGAMOE_GIN_ACTIVITY_GATE_OPT'] = '1'
+        value = self.buffer(8)
         with self.assertRaises(ReachedUID):
             value.enable_gin()
         self.assertEqual(self.configs[-1]['strongva_combine_terminal'], '1')
+        self.assertEqual(self.configs[-1]['activity_gate_opt'], '1')
 
         def skew(output, local):
             if isinstance(local, dict):

@@ -33,7 +33,7 @@ namespace deep_gemm::comm {
 // 48:52 dispatch-warp pull done; 52 first epilogue task, 53 epilogue loop exit,
 // 54 TMEM free, 55 combine grid1, 56:58 world barrier begin/end,
 // 58 combine grid2, 59 scatter leader done, 60 scatter grid, 61 reduction begin,
-// 62 cleanup begins, 63 cleanup world barrier done;
+// 62 cleanup begins, 63 cleanup rendezvous done;
 // 64:72 combine issue, 72:80 combine queued, 80:88 combine local completion
 // (StrongVA terminal mode records this only at late dispatch cleanup);
 // 88:96 reduction-loop exit per warp (last TMA STORE ISSUED, not settled);
@@ -938,8 +938,8 @@ NCCL_DEVICE_INLINE void mega_moe_gin_world_barrier_single_combine_context(
 
 // Use a context-zero rendezvous when a preceding target-local fence has
 // discharged payload visibility and ranks only need to exchange a milestone,
-// as in ingress-ready handoff and final cleanup.  Callers choose the required
-// fence level explicitly.
+// as in ingress-ready handoff and fallback final cleanup. Callers choose the
+// required fence level explicitly.
 NCCL_DEVICE_INLINE void mega_moe_gin_world_barrier(
     const MegaMoeGinTransport& transport,
     const uint32_t barrier_index,
