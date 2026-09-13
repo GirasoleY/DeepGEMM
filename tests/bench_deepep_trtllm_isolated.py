@@ -932,7 +932,16 @@ def dispatch_candidate_metadata(flags):
     if owner_waves and not strongva_enabled:
         raise ValueError(
             "combine owner waves require StrongVA combine terminal1")
-    return {
+    owner_slot_raw = flags.get(
+        "DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY", "0")
+    if owner_slot_raw not in ("0", "1"):
+        raise ValueError(
+            "combine owner-slot readiness metadata requires a canonical0/1 flag")
+    owner_slot_enabled = owner_slot_raw == "1"
+    if owner_slot_enabled and (owner_waves != 4 or not strongva_enabled):
+        raise ValueError(
+            "combine owner-slot readiness requires W4 StrongVA combine terminal1")
+    metadata = {
         "candidate_family": ("direct_control_first_dispatch_coarse_owner_waves_direct_reduce_strongva_terminal" if owner_waves else
                              "direct_control_first_dispatch_ready_coalesced_direct_reduce_strongva_terminal" if strongva_enabled else
                              "direct_control_first_dispatch_ready_coalesced_direct_reduce_preload_late_flush" if combine_enabled else
@@ -1058,6 +1067,111 @@ def dispatch_candidate_metadata(flags):
             "basis": "selected transport flag and source contract, not a measured-overlap observation",
         },
     }
+    if owner_slot_enabled:
+        metadata["candidate_family"] = (
+            "direct_control_first_dispatch_coarse_owner_waves_"
+            "owner_slot_ready_fixed_pair_reduce_strongva_terminal")
+        contract = metadata["combine_overlap_contract"]
+        sender_schedule = (
+            "peer_parallel_fixed_contiguous_owner_waves_with_actual_last_"
+            "strongva_terminal")
+        contract.update({
+            "combine_owner_slot_ready_requested_raw": owner_slot_raw,
+            "combine_owner_slot_ready_requested": True,
+            "sender_schedule": sender_schedule,
+            "combine_schedule": (
+                "sender_owner_waves_concurrent_with_receiver_owner_slot_ready_"
+                "fixed_pair_reduce"),
+            "receiver_schedule": (
+                "four_tail_progress_warps_publish_independent_whole_owner_"
+                "readiness_concurrently_with_one_cta_per_token;_warp_w_owns_"
+                "slots_2w_and_2w_plus_1"),
+            "sent_entry_role": (
+                "sender_completion_bookkeeping_then_reset_and_rank_local_reuse_"
+                "of_sent_0_through_3_as_receiver_owner_ready_flags"),
+            "eligibility": (
+                "owner_ready_requires_world_uniform_StrongVA_direct_bulk_W4;_"
+                "fixed_pair_reduce_requires_exact_EP8_E448_topk16_H3584_I3072_"
+                "epilogue8_SM_gt_48_and_tokens_le_48"),
+            "local_and_t64_paths": (
+                "tokens_le_48_local_or_world_ineligible_fallback_uses_fixed_"
+                "pair_reduce_without_owner_ready_reads;_T64_uses_original_r75"),
+            "count_headers": "late_and_unchanged",
+            "final_world_put_barrier": (
+                "replaced_by_per_owner_StrongVA_terminals;_sender_local_flush_"
+                "deferred_to_cleanup"),
+            "compute_hints_changed": False,
+            "gemm_tiling_changed": False,
+            "launch_sm_count_changed": False,
+            "combine_reducer_math_association_changed": True,
+            "basis": (
+                "selected owner-slot flag and source policy, not device branch "
+                "or physical-overlap measurement"),
+        })
+        contract.pop("count_headers_and_final_put_barrier")
+        contract.pop("compute_hints_tiling_sm_count_and_math_changed")
+
+        owner_protocol = contract["owner_wave_protocol"]
+        owner_protocol.pop(
+            "receiver_reducer_packet_layout_math_tiling_sm_changed")
+        owner_protocol.update({
+            "sender_wire_protocol_changed": False,
+            "packet_layout_changed": False,
+            "receiver_reducer_schedule_changed": True,
+            "receiver_reducer_math_association_changed": True,
+            "gemm_tiling_changed": False,
+            "launch_sm_count_changed": False,
+            "receiver_owner_ready_publication": (
+                "StrongVA_acquire_then_async_proxy_fence_then_rank_local_"
+                "release_by_four_tail_progress_warps"),
+        })
+
+        completion = contract["combine_payload_local_completion"]
+        completion.pop("original_handoff_and_grid_order_retained")
+        completion.update({
+            "local_handoff_and_grid_count_retained": True,
+            "final_grid_moved_before_remote_owner_progress": True,
+        })
+
+        reducer = contract["direct_reducer"]
+        reducer.pop("full_warp_pointer_gather_before_elected_issuer")
+        reducer.pop("added_barriers")
+        reducer.update({
+            "address_preparation": (
+                "lane0_fixed_pair_pointer_resolution_on_chunk0_before_"
+                "assignment_TMA"),
+            "lane0_pointer_broadcast_before_lane0_tma_issuer": True,
+            "assignment_pairs": [[2 * pair, 2 * pair + 1]
+                                 for pair in range(8)],
+            "within_pair_assignment_order": "ascending_slot",
+            "reduction_order": (
+                "fixed_slot_pair_FP32_partials_then_FP32_fold_in_ascending_"
+                "pair_index_then_final_BF16"),
+            "target_visibility_to_tma_proxy": (
+                "tail_progress_StrongVA_acquire_then_async_proxy_fence_then_"
+                "release_owner_ready;_consumer_owner_ready_acquire_then_async_"
+                "proxy_fence_before_metadata_and_payload_TMA;_same_LSA_"
+                "consumer_proxy_bridge_before_TMA"),
+            "owner_ready_reads": (
+                "only_exact_world_eligible_owner_slot_path;_none_for_local_or_"
+                "world_ineligible_fallback"),
+            "pair_reducer_eligibility": (
+                "exact_shape_epilogue8_SM_gt_48_and_tokens_le_48_across_route_"
+                "placements_and_world_ineligible_fallback"),
+            "additional_barrier_objects": 0,
+            "cta_barrier_participation": (
+                "two_existing_full_epilogue_barrier_sync_points_per_output_"
+                "chunk"),
+        })
+
+        scratch = contract["scratch_layout"]
+        scratch.update({
+            "receiver_owner_ready_uint32": 4,
+            "receiver_owner_ready_alias": "sent_uint32_0_through_3",
+            "additional_registered_bytes": 0,
+            "alias_phase": "after_W4_sender_completion_cells_are_reset",
+        })
+    return metadata
 
 
 def main():
@@ -1083,6 +1197,7 @@ def main():
             "DG_MEGAMOE_GIN_COMBINE_OVERLAP",
             "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL",
             "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES",
+            "DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY",
         )}
         rank_flags = [None] * dist.get_world_size()
         dist.all_gather_object(rank_flags, flags)

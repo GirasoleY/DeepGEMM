@@ -102,6 +102,64 @@ class ParsingContracts(unittest.TestCase):
             "options.mode, options.gin_combine_owner_waves",
             final_forward[:300])
 
+    def test_owner_slot_metadata_is_forwarded_and_decomposed(self):
+        options, args, comparison = self.parse(
+            "gin_roce", 8, "--world-size", "8",
+            "--gin-combine-owner-waves", "4",
+            "--gin-combine-owner-slot-ready",
+        )
+        self.assertTrue(options.gin_combine_owner_slot_ready)
+        self.assertTrue(args.gin_combine_owner_slot_ready)
+        env = runner.fixed_environment(
+            options.mode, options.gin_combine_owner_waves,
+            options.gin_combine_owner_slot_ready)
+        self.assertEqual(
+            env[runner.accuracy.GIN_COMBINE_OWNER_SLOT_READY_ENV], "1")
+
+        config = runner.configuration(
+            options, args, comparison, {})["combine_owner_waves"]
+        self.assertTrue(config["combine_owner_slot_ready_requested"])
+        self.assertNotIn(
+            "header_late_completion_receiver_reducer_layout_math_tiling_sm_changed",
+            config,
+        )
+        self.assertFalse(config["count_header_changed"])
+        self.assertFalse(config["late_sender_completion_changed"])
+        self.assertFalse(config["sender_wire_protocol_changed"])
+        self.assertFalse(config["packet_layout_changed"])
+        self.assertTrue(config["receiver_reducer_schedule_changed"])
+        self.assertTrue(config["receiver_reducer_math_association_changed"])
+        self.assertFalse(config["gemm_tiling_changed"])
+        self.assertFalse(config["launch_sm_count_changed"])
+        self.assertIn("four_tail_progress_warps", config["receiver_schedule"])
+
+        metadata = runner.matched.dispatch_candidate_metadata(env)
+        self.assertTrue(metadata["combine_overlap_contract"]
+                        ["combine_owner_slot_ready_requested"])
+        default_options, default_args, default_comparison = self.parse(
+            "gin_roce", 8, "--world-size", "8",
+            "--gin-combine-owner-waves", "4",
+        )
+        default_config = runner.configuration(
+            default_options, default_args, default_comparison,
+            {})["combine_owner_waves"]
+        self.assertIn(
+            "header_late_completion_receiver_reducer_layout_math_tiling_sm_changed",
+            default_config,
+        )
+        self.assertNotIn("combine_owner_slot_ready_requested", default_config)
+
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            self.parse("gin_roce", 8, "--world-size", "8",
+                       "--gin-combine-owner-slot-ready")
+        with patch("sys.stderr"), self.assertRaises(SystemExit):
+            self.parse("native_nvl", 8, "--world-size", "8",
+                       "--gin-combine-owner-waves", "4",
+                       "--gin-combine-owner-slot-ready")
+        with self.assertRaisesRegex(ValueError,
+                                    "combine_owner_slot_ready must be boolean"):
+            runner.fixed_environment("gin_roce", 4, 1)
+
     def test_configuration_fixes_logical_not_physical_placement(self):
         options, args, comparison = self.parse()
         config = runner.configuration(options, args, comparison, {"source": "digest"})

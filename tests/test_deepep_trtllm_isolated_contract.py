@@ -181,6 +181,125 @@ class ComparisonContractTest(unittest.TestCase):
                 "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES": "2",
             })
 
+    def test_owner_slot_metadata_is_exact_and_default_off(self):
+        base = {
+            "DG_MEGAMOE_GIN_DISPATCH_OVERLAP": "1",
+            "DG_MEGAMOE_GIN_SINGLE_COMBINE_CONTEXT": "1",
+            "DG_MEGAMOE_GIN_COMBINE_OVERLAP": "1",
+            "DG_MEGAMOE_GIN_STRONGVA_COMBINE_TERMINAL": "1",
+            "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES": "4",
+        }
+        implicit_r9 = comparison.dispatch_candidate_metadata(base)
+        explicit_r9 = comparison.dispatch_candidate_metadata({
+            **base, "DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY": "0",
+        })
+        self.assertEqual(implicit_r9, explicit_r9)
+        self.assertEqual(
+            implicit_r9["candidate_family"],
+            "direct_control_first_dispatch_coarse_owner_waves_direct_reduce_"
+            "strongva_terminal",
+        )
+        self.assertNotIn(
+            "combine_owner_slot_ready_requested",
+            implicit_r9["combine_overlap_contract"],
+        )
+
+        metadata = comparison.dispatch_candidate_metadata({
+            **base, "DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY": "1",
+        })
+        self.assertEqual(
+            metadata["candidate_family"],
+            "direct_control_first_dispatch_coarse_owner_waves_owner_slot_"
+            "ready_fixed_pair_reduce_strongva_terminal",
+        )
+        contract = metadata["combine_overlap_contract"]
+        self.assertEqual(contract["combine_owner_slot_ready_requested_raw"],
+                         "1")
+        self.assertTrue(contract["combine_owner_slot_ready_requested"])
+        self.assertIn("four_tail_progress_warps",
+                      contract["receiver_schedule"])
+        self.assertIn("one_cta_per_token", contract["receiver_schedule"])
+        self.assertIn("slots_2w_and_2w_plus_1",
+                      contract["receiver_schedule"])
+
+        protocol = contract["owner_wave_protocol"]
+        self.assertNotIn(
+            "receiver_reducer_packet_layout_math_tiling_sm_changed", protocol)
+        self.assertFalse(protocol["sender_wire_protocol_changed"])
+        self.assertFalse(protocol["packet_layout_changed"])
+        self.assertTrue(protocol["receiver_reducer_schedule_changed"])
+        self.assertTrue(protocol["receiver_reducer_math_association_changed"])
+        self.assertFalse(protocol["gemm_tiling_changed"])
+        self.assertFalse(protocol["launch_sm_count_changed"])
+        self.assertIn("StrongVA_acquire_then_async_proxy_fence_then_rank_local_release",
+                      protocol["receiver_owner_ready_publication"])
+
+        completion = contract["combine_payload_local_completion"]
+        self.assertNotIn("original_handoff_and_grid_order_retained",
+                         completion)
+        self.assertTrue(completion["local_handoff_and_grid_count_retained"])
+        self.assertTrue(
+            completion["final_grid_moved_before_remote_owner_progress"])
+
+        reducer = contract["direct_reducer"]
+        self.assertNotIn("full_warp_pointer_gather_before_elected_issuer",
+                         reducer)
+        self.assertNotIn("added_barriers", reducer)
+        self.assertEqual(
+            reducer["address_preparation"],
+            "lane0_fixed_pair_pointer_resolution_on_chunk0_before_assignment_TMA",
+        )
+        self.assertTrue(
+            reducer["lane0_pointer_broadcast_before_lane0_tma_issuer"])
+        self.assertEqual(reducer["assignment_pairs"],
+                         [[2 * pair, 2 * pair + 1] for pair in range(8)])
+        self.assertEqual(reducer["within_pair_assignment_order"],
+                         "ascending_slot")
+        self.assertIn("ascending_pair_index", reducer["reduction_order"])
+        self.assertNotIn("original_ascending_topk_slot",
+                         reducer["reduction_order"])
+        self.assertIn("consumer_owner_ready_acquire_then_async_proxy_fence",
+                      reducer["target_visibility_to_tma_proxy"])
+        self.assertIn("none_for_local_or_world_ineligible_fallback",
+                      reducer["owner_ready_reads"])
+        self.assertEqual(reducer["additional_barrier_objects"], 0)
+        self.assertIn("two_existing_full_epilogue_barrier_sync_points",
+                      reducer["cta_barrier_participation"])
+
+        scratch = contract["scratch_layout"]
+        self.assertEqual(scratch["receiver_owner_ready_uint32"], 4)
+        self.assertEqual(scratch["receiver_owner_ready_alias"],
+                         "sent_uint32_0_through_3")
+        self.assertEqual(scratch["additional_registered_bytes"], 0)
+        self.assertIn("tokens_le_48_local_or_world_ineligible_fallback",
+                      contract["local_and_t64_paths"])
+        self.assertIn("T64_uses_original_r75",
+                      contract["local_and_t64_paths"])
+        self.assertNotIn("count_headers_and_final_put_barrier", contract)
+        self.assertEqual(contract["count_headers"], "late_and_unchanged")
+        self.assertIn("per_owner_StrongVA_terminals",
+                      contract["final_world_put_barrier"])
+        self.assertNotIn(
+            "compute_hints_tiling_sm_count_and_math_changed", contract)
+        self.assertFalse(contract["compute_hints_changed"])
+        self.assertFalse(contract["gemm_tiling_changed"])
+        self.assertFalse(contract["launch_sm_count_changed"])
+        self.assertTrue(contract["combine_reducer_math_association_changed"])
+
+        for invalid in ("01", "2", 1, True):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    ValueError, "canonical0/1"):
+                comparison.dispatch_candidate_metadata({
+                    **base,
+                    "DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY": invalid,
+                })
+        with self.assertRaisesRegex(ValueError, "requires W4 StrongVA"):
+            comparison.dispatch_candidate_metadata({
+                **base,
+                "DG_MEGAMOE_GIN_COMBINE_OWNER_WAVES": "2",
+                "DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY": "1",
+            })
+
     def test_dispatch_metadata_distinguishes_control_first_without_claiming_measured_overlap(self):
         for raw, family in (("0", "clean_single_combine_context_only"),
                             ("1", "direct_control_first_dispatch")):
@@ -203,6 +322,10 @@ class ComparisonContractTest(unittest.TestCase):
         source = inspect.getsource(comparison.main)
         self.assertLess(source.index('"DG_MEGAMOE_GIN_DISPATCH_OVERLAP"'),
                         source.index("dist.all_gather_object(rank_flags, flags)"))
+        self.assertLess(
+            source.index('"DG_MEGAMOE_GIN_COMBINE_OWNER_SLOT_READY"'),
+            source.index("dist.all_gather_object(rank_flags, flags)"),
+        )
         self.assertLess(source.index("dist.all_gather_object(rank_flags, flags)"),
                         source.index("comparator = DeepEPTRTLLM"))
         self.assertIn('"megamoe_flags": flags', source)

@@ -218,6 +218,41 @@ def _load_runtime_for_gb200(local_rank):
 
 def configuration(options, args, comparison, sources):
     """CPU-only, all-rank equality checked by topology.prepare before compute."""
+    owner_waves = {
+        "requested": options.gin_combine_owner_waves,
+        "expert_ranges": (
+            [
+                [wave * (56 // options.gin_combine_owner_waves),
+                 (wave + 1) * (56 // options.gin_combine_owner_waves)]
+                for wave in range(options.gin_combine_owner_waves)
+            ]
+            if options.gin_combine_owner_waves else []
+        ),
+        "readiness": "all contributing expert assignments in each peer/range",
+        "nonempty_submission": "one dense payload span per ready range",
+        "range_submission_order": "readiness order, not address order",
+        "terminal": "actual last submitted nonempty range carries StrongVA",
+        "empty_pair_terminal": "unchanged signal-only terminal",
+        "header_late_completion_receiver_reducer_layout_math_tiling_sm_changed": False,
+        "basis": "explicit option and source contract, not device observation",
+    }
+    if options.gin_combine_owner_slot_ready:
+        owner_waves.pop(
+            "header_late_completion_receiver_reducer_layout_math_tiling_sm_changed")
+        owner_waves.update({
+            "combine_owner_slot_ready_requested": True,
+            "count_header_changed": False,
+            "late_sender_completion_changed": False,
+            "sender_wire_protocol_changed": False,
+            "packet_layout_changed": False,
+            "receiver_reducer_schedule_changed": True,
+            "receiver_reducer_math_association_changed": True,
+            "gemm_tiling_changed": False,
+            "launch_sm_count_changed": False,
+            "receiver_schedule": (
+                "four_tail_progress_warps_publish_whole_owner_readiness;_one_"
+                "cta_per_token;_warp_w_owns_slots_2w_and_2w_plus_1"),
+        })
     return {
         "mode": options.mode, "world_size": options.world_size,
         "physical_hosts": options.world_size // 4,
@@ -238,26 +273,7 @@ def configuration(options, args, comparison, sources):
         "megamoe_environment": fixed_environment(
             options.mode, options.gin_combine_owner_waves,
             options.gin_combine_owner_slot_ready),
-        "combine_owner_waves": {
-            "requested": options.gin_combine_owner_waves,
-            "expert_ranges": (
-                [
-                    [wave * (56 // options.gin_combine_owner_waves),
-                     (wave + 1) * (56 // options.gin_combine_owner_waves)]
-                    for wave in range(options.gin_combine_owner_waves)
-                ]
-                if options.gin_combine_owner_waves else []
-            ),
-            "readiness": (
-                "all contributing expert assignments in each peer/range"
-            ),
-            "nonempty_submission": "one dense payload span per ready range",
-            "range_submission_order": "readiness order, not address order",
-            "terminal": "actual last submitted nonempty range carries StrongVA",
-            "empty_pair_terminal": "unchanged signal-only terminal",
-            "header_late_completion_receiver_reducer_layout_math_tiling_sm_changed": False,
-            "basis": "explicit option and source contract, not device observation",
-        },
+        "combine_owner_waves": owner_waves,
         "math": {"fast_math": False, "activation_clamp": 10.0,
                  "compute_hint": None, "compute_configuration_override": None},
         "source_sha256": sources,
