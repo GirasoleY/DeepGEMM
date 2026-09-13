@@ -124,15 +124,23 @@ class ExpertReadySourceContracts(unittest.TestCase):
         self.assertNotIn("mega_moe_gin_flush_data_peer_async(", body)
         self.assertNotIn("mega_moe_gin_wait_data_peer(", body)
         self.assertNotIn("DG_GIN_TRACE_IF(true, 80u + lane_idx)", body)
-        cleanup = source[source.index("// Wait for all ranks to finish cleaning"):]
+        cleanup = source[source.index("// Finish workspace cleanup."):]
         cleanup_grid = cleanup.index(
             "comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(")
         late_flush = cleanup.index("mega_moe_gin_flush_data_peer_async(", cleanup_grid)
         late_wait = cleanup.index("mega_moe_gin_wait_data_peer(", late_flush)
-        cleanup_world = cleanup.index("comm::mega_moe_gin_world_barrier(", late_wait)
+        fallback = cleanup.index(
+            "if (not use_gin_strongva_combine_terminal)", late_wait)
+        cleanup_world = cleanup.index("comm::mega_moe_gin_world_barrier(", fallback)
+        deferred = cleanup.index(
+            "if (use_gin_strongva_combine_terminal)", cleanup_world)
+        cleanup_lsa = cleanup.index("comm::nvlink_lsa_barrier<", deferred)
         self.assertLess(cleanup_grid, late_flush)
         self.assertLess(late_flush, late_wait)
-        self.assertLess(late_wait, cleanup_world)
+        self.assertLess(late_wait, fallback)
+        self.assertLess(fallback, cleanup_world)
+        self.assertLess(cleanup_world, deferred)
+        self.assertLess(deferred, cleanup_lsa)
         self.assertNotRegex(source, r"DG_GIN_TRACE(?:_IF)?\([^;]*\b101\b")
 
     def test_all_dispatch_unpack_variants_save_existing_prefix_before_publication(self):

@@ -61,10 +61,9 @@ class Ep8DeviceTransportContract(unittest.TestCase):
     def test_all_lsa_barriers_use_actual_team_width(self):
         source = KERNEL.read_text()
         calls = re.findall(r"comm::nvlink_lsa_barrier<\s*([^>]+)>", source)
-        # The default-off StrongVA specialization moves the existing combine
-        # LSA rendezvous ahead of its per-owner signal waits. Both compile-time
-        # branches remain in source, although exactly one executes.
-        self.assertEqual(len(calls), 10)
+        # The StrongVA specialization adds a deferred-cleanup LSA rendezvous;
+        # mutually exclusive fallback branches remain visible in source.
+        self.assertEqual(len(calls), 11)
         for call in calls:
             self.assertTrue(call.startswith("kNumRanks, kGinPeerCount,"), call)
 
