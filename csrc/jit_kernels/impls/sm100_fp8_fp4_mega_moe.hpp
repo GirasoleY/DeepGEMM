@@ -5,6 +5,9 @@
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
+#ifdef DG_MEGAMOE_GIN
+#include <deep_gemm/comm/mega_moe_gin.cuh>
+#endif
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
@@ -32,6 +35,9 @@ static void sm100_fp8_fp4_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math
+#ifdef DG_MEGAMOE_GIN
+    , const comm::MegaMoeEp8GinTransport* ep8_gin_transport = nullptr
+#endif
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -161,7 +167,15 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_sms = runtime->get_num_sms();
 
     // Compile
-    const auto kernel = jit->compile("sm100_fp8_fp4_mega_moe", std::format(R"(
+    const bool use_ep8_gin =
+#ifdef DG_MEGAMOE_GIN
+        ep8_gin_transport != nullptr;
+#else
+        false;
+#endif
+    const auto kernel = jit->compile(
+        use_ep8_gin ? "sm100_fp8_fp4_mega_moe_gin_ep8" : "sm100_fp8_fp4_mega_moe",
+        std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -183,6 +197,7 @@ static void __instantiate_kernel() {{
         {}, {},
         {},
         {},
+        {},
         {}
     >);
 }};
@@ -201,7 +216,8 @@ static void __instantiate_kernel() {{
         num_sms, num_ranks,
         to_string(activation_clamp),
         fast_math ? "true" : "false",
-        to_string(l1_weights.scalar_type())));
+        to_string(l1_weights.scalar_type()),
+        use_ep8_gin ? "true" : "false"));
 
     // Launch
     jit->launch(
@@ -215,6 +231,10 @@ static void __instantiate_kernel() {{
         cumulative_local_expert_recv_stats_ptr,
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+#ifdef DG_MEGAMOE_GIN
+        ep8_gin_transport != nullptr ? *ep8_gin_transport :
+                                       comm::MegaMoeEp8GinTransport{},
+#endif
         tensor_map_l1_acts,
         tensor_map_l1_acts_sf,
         tensor_map_l1_weights,

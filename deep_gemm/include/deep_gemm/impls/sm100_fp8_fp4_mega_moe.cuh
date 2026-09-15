@@ -10,6 +10,10 @@
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
+#ifdef DG_MEGAMOE_GIN
+#include <deep_gemm/comm/mega_moe_gin.cuh>
+#include <deep_gemm/layout/mega_moe_gin.cuh>
+#endif
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
@@ -36,6 +40,7 @@ template <
     float kActivationClamp,
     bool kFastMath,
     typename weight_dtype_t,
+    bool kUseEp8Gin = false,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -58,6 +63,9 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             int* cumulative_local_expert_recv_stats,
                             const uint32_t num_tokens,
                             const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+#ifdef DG_MEGAMOE_GIN
+                            const __grid_constant__ comm::MegaMoeEp8GinTransport gin_transport,
+#endif
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts_sf,
                             const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
@@ -85,6 +93,21 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+#ifndef DG_MEGAMOE_GIN
+    DG_STATIC_ASSERT(not kUseEp8Gin, "EP8 GIN kernel instantiated without DG_MEGAMOE_GIN");
+#else
+    if constexpr (kUseEp8Gin) {
+        DG_STATIC_ASSERT(kNumRanks == 8, "GIN MegaMoE requires EP8");
+        DG_STATIC_ASSERT(kNumExperts == 448 and kNumExpertsPerRank == 56,
+                         "GIN MegaMoE requires 448 experts over EP8");
+        DG_STATIC_ASSERT(kNumTopk == 16, "GIN MegaMoE requires top-k 16");
+        DG_STATIC_ASSERT(kHidden == 3584 and kIntermediateHidden == 3072,
+                         "GIN MegaMoE requires H3584/I3072");
+        DG_STATIC_ASSERT(not kHasShared, "GIN MegaMoE does not support shared experts");
+        DG_STATIC_ASSERT(kNumDispatchWarps == 4, "GIN MegaMoE requires four dispatch warps");
+        DG_DEVICE_ASSERT(num_tokens <= layout::kMegaMoEEp8GinMaxTokens);
+    }
+#endif
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -126,6 +149,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
+#ifdef DG_MEGAMOE_GIN
+    layout::MegaMoeEp8GinWorkspace gin_workspace;
+    if constexpr (kUseEp8Gin)
+        gin_workspace = layout::MegaMoeEp8GinWorkspace::from_native(buffer);
+#endif
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
 
@@ -314,6 +342,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
     constexpr uint32_t kBeforeDispatchPullBarrierTag = 1;
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 2;
 
+    // GIN world barrier slots. The caller provisions at least two slots and
+    // all ranks execute these in this order on the serialized workspace.
+    constexpr uint32_t kGinCombinePutBarrierIndex = 0;
+    constexpr uint32_t kGinCleanupBarrierIndex = 1;
+
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
@@ -375,9 +408,29 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            DG_DEVICE_ASSERT(dst_slot_idx < kNumMaxTokensPerRank);
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseEp8Gin) {
+                if (gin_transport.is_same_lsa_peer(dst_rank_idx)) {
+                    const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
+                        expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+                    *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+                } else {
+                    const auto remote_owner_lane = dst_rank_idx % layout::kMegaMoEEp8GinLsaSize;
+                    // As in the native layout, one token may assign a given
+                    // expert at most once. Duplicate expert IDs are invalid.
+                    DG_DEVICE_ASSERT(
+                        dst_slot_idx < layout::kMegaMoEEp8GinMaxTokens);
+                    *gin_workspace.get_staged_expert_assignment_ptr(
+                        remote_owner_lane, expert_idx % kNumExpertsPerRank, dst_slot_idx) = token_topk_idx;
+                }
+            } else
+#endif
+            {
+                const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
+                    expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+                *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            }
         });
 
         // Grid sync
@@ -390,8 +443,17 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
             DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
-            if (thread_idx < kNumRanks)
-                *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+            if (thread_idx < kNumRanks) {
+#ifdef DG_MEGAMOE_GIN
+                if constexpr (kUseEp8Gin) {
+                    if (gin_transport.is_same_lsa_peer(thread_idx))
+                        *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+                } else
+#endif
+                {
+                    *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+                }
+            }
             __syncwarp();
 
             #pragma unroll
@@ -399,27 +461,263 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                *sym_buffer.map(
-                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+#ifdef DG_MEGAMOE_GIN
+                if constexpr (kUseEp8Gin) {
+                    if (gin_transport.is_same_lsa_peer(dst_rank_idx)) {
+                        *sym_buffer.map(
+                            workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                            dst_rank_idx) = expert_status & 0xffffffff;
+                    }
+                } else
+#endif
+                {
+                    *sym_buffer.map(
+                        workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                        dst_rank_idx) = expert_status & 0xffffffff;
+                    ptx::atomic_add_sys(
+                        sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+                        expert_status);
+                }
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseEp8Gin) {
+            // Each SM0 dispatch warp owns one destination in the opposite LSA.
+            // Publish compact scheduling control before the chained-SoA
+            // payload. Both publications stay in one ordered peer queue, but
+            // local completion is deferred until after this CTA's pull work.
+            if (sm_idx == 0 and warp_idx < layout::kMegaMoEEp8GinNumRemotePeers and
+                lane_idx == 0) {
+                const uint32_t remote_owner_lane = warp_idx;
+                const uint32_t remote_owner_rank =
+                    gin_transport.other_lsa_rank(remote_owner_lane);
+                auto* packed_counts =
+                    gin_workspace.get_dispatch_send_expert_count_ptr(remote_owner_lane);
+                auto* packed_assignments =
+                    gin_workspace.get_dispatch_send_expert_assignment_ptr(remote_owner_lane);
+                uint32_t num_expert_assignments = 0;
+                #pragma unroll
+                for (uint32_t local_expert = 0;
+                     local_expert < kNumExpertsPerRank; ++local_expert) {
+                    const uint32_t global_expert =
+                        remote_owner_rank * kNumExpertsPerRank + local_expert;
+                    const uint64_t expert_status =
+                        *workspace.get_expert_send_count_ptr(global_expert);
+                    const uint32_t count = static_cast<uint32_t>(expert_status);
+                    packed_counts[local_expert] = count;
+                    DG_DEVICE_ASSERT(count <= layout::kMegaMoEEp8GinMaxTokens);
+                    DG_DEVICE_ASSERT(
+                        num_expert_assignments + count <=
+                        layout::kMegaMoEEp8GinMaxExpertAssignments);
+                    for (uint32_t assignment_idx = 0;
+                         assignment_idx < count; ++assignment_idx) {
+                        packed_assignments[num_expert_assignments + assignment_idx] =
+                            *gin_workspace.get_staged_expert_assignment_ptr(
+                                remote_owner_lane, local_expert, assignment_idx);
+                    }
+                    num_expert_assignments += count;
+                }
+                *gin_workspace.get_dispatch_send_total_assignment_count_ptr(
+                    remote_owner_lane) = num_expert_assignments;
+                __threadfence_system();
+
+                const uint32_t source_lane = gin_transport.local_lsa_lane();
+                comm::mega_moe_ep8_gin_publish_dispatch_control_async(
+                    gin_transport,
+                    remote_owner_lane,
+                    num_expert_assignments,
+                    packed_counts,
+                    gin_workspace.get_dispatch_receive_expert_count_ptr(
+                        source_lane),
+                    gin_workspace.get_dispatch_receive_control_epoch_ptr(
+                        source_lane));
+                comm::mega_moe_ep8_gin_publish_dispatch_payload_async(
+                    gin_transport,
+                    remote_owner_lane,
+                    num_tokens, num_expert_assignments,
+                    buffer.input_token_buffer.get_base_ptr(),
+                    gin_workspace.get_remote_input_activation_ptr(source_lane),
+                    buffer.input_sf_buffer.get_base_ptr(),
+                    gin_workspace.get_remote_input_scale_ptr(source_lane),
+                    buffer.input_topk_weights_buffer.get_base_ptr(),
+                    gin_workspace.get_remote_topk_weight_ptr(source_lane),
+                    gin_workspace.get_dispatch_receive_payload_epoch_ptr(
+                        source_lane));
+            }
+
+            if (sm_idx == 0 and warp_idx == 0 and lane_idx == 0) {
+                auto* epoch = gin_workspace.get_dispatch_epoch_ptr();
+                DG_DEVICE_ASSERT(*epoch < static_cast<uint64_t>(-1));
+                *epoch += 1;
+                __threadfence();
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        }
+#endif
+
         // Barrier before pulling
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
-            /* After the NVLink barrier, there is a grid sync */ true
-        );
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseEp8Gin) {
+            // Publish all direct same-LSA assignment/count stores before the
+            // local-domain rendezvous observes them on peer GPUs.
+            __threadfence_system();
+            comm::nvlink_barrier<
+                kNumRanks, kNumSMs, kNumDispatchThreads,
+                kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag,
+                layout::kMegaMoEEp8GinLsaSize>(
+                    workspace, sym_buffer, sm_idx, thread_idx,
+                    [=]() {
+                        ptx::sync_aligned(
+                            kNumDispatchThreads, kDispatchBarrierIdx);
+                    },
+                    /* Include count/control writers from SM0 */ true,
+                    /* Publish same-LSA counts before remote unpack */ true);
+
+            // Four warps acquire and restore one remote source packet each.
+            // The scheduler and pull loop continue to consume the native
+            // per-source/per-expert representation unchanged.
+            if (sm_idx == 0) {
+                const uint32_t remote_source_lane = warp_idx;
+                const uint32_t remote_source_rank =
+                    gin_transport.other_lsa_rank(remote_source_lane);
+                if (lane_idx == 0) {
+                    comm::mega_moe_ep8_gin_wait_dispatch(
+                        gin_transport,
+                        gin_workspace.get_dispatch_receive_control_epoch_ptr(
+                            remote_source_lane),
+                        *gin_workspace.get_dispatch_epoch_ptr());
+                }
+                __syncwarp();
+
+                const auto* packed_counts =
+                    gin_workspace.get_dispatch_receive_expert_count_ptr(
+                        remote_source_lane);
+                const auto* packed_assignments =
+                    gin_workspace.get_dispatch_receive_expert_assignment_ptr(
+                        remote_source_lane);
+                const uint32_t first_expert = lane_idx;
+                const uint32_t first_count = packed_counts[first_expert];
+                const uint32_t first_inclusive =
+                    math::warp_inclusive_sum(first_count, lane_idx);
+                const uint32_t first_prefix = first_inclusive - first_count;
+                const uint32_t first_total =
+                    __shfl_sync(0xffffffffu, first_inclusive, 31);
+
+                const uint32_t second_expert = lane_idx + 32;
+                const uint32_t second_count = second_expert < kNumExpertsPerRank ?
+                    packed_counts[second_expert] : 0u;
+                const uint32_t second_inclusive =
+                    math::warp_inclusive_sum(second_count, lane_idx);
+                const uint32_t second_prefix =
+                    first_total + second_inclusive - second_count;
+
+                DG_DEVICE_ASSERT(first_count <= layout::kMegaMoEEp8GinMaxTokens);
+                DG_DEVICE_ASSERT(
+                    first_prefix + first_count <=
+                    layout::kMegaMoEEp8GinMaxExpertAssignments);
+                *workspace.get_expert_recv_count_ptr(
+                    remote_source_rank, first_expert) = first_count;
+                *gin_workspace.get_combine_record_prefix_ptr(
+                    remote_source_lane, first_expert) = first_prefix;
+                auto* first_dst = workspace.get_src_token_topk_idx_ptr(
+                    first_expert, remote_source_rank, 0);
+                for (uint32_t assignment_idx = 0;
+                     assignment_idx < first_count; ++assignment_idx)
+                    first_dst[assignment_idx] =
+                        packed_assignments[first_prefix + assignment_idx];
+
+                if (second_expert < kNumExpertsPerRank) {
+                    DG_DEVICE_ASSERT(
+                        second_count <= layout::kMegaMoEEp8GinMaxTokens);
+                    DG_DEVICE_ASSERT(
+                        second_prefix + second_count <=
+                        layout::kMegaMoEEp8GinMaxExpertAssignments);
+                    *workspace.get_expert_recv_count_ptr(
+                        remote_source_rank, second_expert) = second_count;
+                    *gin_workspace.get_combine_record_prefix_ptr(
+                        remote_source_lane, second_expert) = second_prefix;
+                    auto* second_dst = workspace.get_src_token_topk_idx_ptr(
+                        second_expert, remote_source_rank, 0);
+                    for (uint32_t assignment_idx = 0;
+                         assignment_idx < second_count; ++assignment_idx)
+                        second_dst[assignment_idx] =
+                            packed_assignments[second_prefix + assignment_idx];
+                }
+                __threadfence();
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+            if (sm_idx == 0) {
+                for (uint32_t local_expert = thread_idx;
+                     local_expert < kNumExpertsPerRank;
+                     local_expert += kNumDispatchThreads) {
+                    uint32_t total = 0;
+                    #pragma unroll
+                    for (uint32_t source_rank = 0;
+                         source_rank < kNumRanks; ++source_rank) {
+                        total += static_cast<uint32_t>(
+                            *workspace.get_expert_recv_count_ptr(
+                                source_rank, local_expert));
+                    }
+                    const uint64_t tagged =
+                        (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) |
+                        total;
+                    auto* total_ptr =
+                        workspace.get_expert_recv_count_sum_ptr(local_expert);
+                    asm volatile("st.release.gpu.global.u64 [%0], %1;"
+                                 :: "l"(total_ptr), "l"(tagged) : "memory");
+                }
+            }
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() {
+                    ptx::sync_aligned(
+                        kNumDispatchThreads, kDispatchBarrierIdx);
+                });
+        } else
+#endif
+        {
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
+                /* After the NVLink barrier, there is a grid sync */ true
+            );
+        }
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseEp8Gin) {
+            // Control has made the scheduler runnable. After releasing the
+            // dispatch/epilogue phase barrier, only SM0 waits for the four
+            // payload terminals. Every other CTA can begin useful pull work
+            // and waits on a cheap device-local bridge only when it first
+            // encounters that remote source.
+            if (sm_idx == 0) {
+                const uint32_t remote_source_lane = warp_idx;
+                if (lane_idx == 0) {
+                    const uint64_t expected_epoch =
+                        *gin_workspace.get_dispatch_epoch_ptr();
+                    comm::mega_moe_ep8_gin_wait_dispatch(
+                        gin_transport,
+                        gin_workspace.get_dispatch_receive_payload_epoch_ptr(
+                            remote_source_lane),
+                        expected_epoch);
+                    ptx::st_rel(
+                        gin_workspace
+                            .get_dispatch_payload_acquired_epoch_ptr(
+                                remote_source_lane),
+                        expected_epoch);
+                }
+                __syncwarp();
+            }
+        }
+#endif
 
         // Pull token data and SF from remote ranks into local L1 buffer
         uint32_t pull_mbarrier_phase = 0;
@@ -432,6 +730,11 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t stored_rank_count[kNumRanksPerLane] = {};
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
+#ifdef DG_MEGAMOE_GIN
+        // Cache payload visibility per remote source for this pull warp. The
+        // source mirrors are immutable until the end-of-launch cleanup.
+        uint32_t gin_payload_acquired_source_mask = 0;
+#endif
 
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
@@ -540,8 +843,61 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
-            const auto src_base_ptr = sym_buffer.map(
-                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+            void* src_base_ptr;
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseEp8Gin) {
+                if (not gin_transport.is_same_lsa_peer(
+                        current_rank_in_expert_idx)) {
+                    const uint32_t remote_source_lane =
+                        current_rank_in_expert_idx %
+                        layout::kMegaMoEEp8GinLsaSize;
+                    const uint32_t source_bit = 1u << remote_source_lane;
+                    if ((gin_payload_acquired_source_mask & source_bit) == 0) {
+                        if (cute::elect_one_sync()) {
+                            const uint64_t expected_epoch =
+                                *gin_workspace.get_dispatch_epoch_ptr();
+                            const auto* acquired_epoch = gin_workspace
+                                .get_dispatch_payload_acquired_epoch_ptr(
+                                    remote_source_lane);
+                            comm::wait_until(
+                                [&]() {
+                                    return ptx::ld_acq_gpu(acquired_epoch) ==
+                                           expected_epoch;
+                                },
+                                [&]() {
+                                    printf(
+                                        "DeepGEMM GIN payload bridge timeout: rank=%u, source_lane=%u, expected=%llu, current=%llu\n",
+                                        sym_buffer.rank_idx,
+                                        remote_source_lane,
+                                        static_cast<unsigned long long>(
+                                            expected_epoch),
+                                        static_cast<unsigned long long>(
+                                            ptx::ld_acq_gpu(
+                                                acquired_epoch)));
+                                });
+                        }
+                        __syncwarp();
+                        gin_payload_acquired_source_mask |= source_bit;
+                    }
+                }
+                src_base_ptr = gin_transport.is_same_lsa_peer(
+                    current_rank_in_expert_idx) ?
+                    sym_buffer.map(
+                        buffer.input_token_buffer
+                            .get_data_buffer(src_token_idx).get_base_ptr(),
+                        current_rank_in_expert_idx) :
+                    gin_workspace.get_remote_input_activation_ptr(
+                        current_rank_in_expert_idx %
+                            layout::kMegaMoEEp8GinLsaSize,
+                        src_token_idx);
+            } else
+#endif
+            {
+                src_base_ptr = sym_buffer.map(
+                    buffer.input_token_buffer
+                        .get_data_buffer(src_token_idx).get_base_ptr(),
+                    current_rank_in_expert_idx);
+            }
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
@@ -567,16 +923,55 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
 
             // Load the weight first, so that its remote latency overlaps with the SF copy below
-            const auto weight = *sym_buffer.map(
-                buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                current_rank_in_expert_idx);
+            const float* weight_ptr;
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseEp8Gin) {
+                weight_ptr = gin_transport.is_same_lsa_peer(
+                    current_rank_in_expert_idx) ?
+                    sym_buffer.map(
+                        buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                            src_token_topk_idx,
+                        current_rank_in_expert_idx) :
+                    static_cast<const float*>(
+                        gin_workspace.get_remote_topk_weight_ptr(
+                            current_rank_in_expert_idx %
+                                layout::kMegaMoEEp8GinLsaSize,
+                            src_token_idx)) + src_topk_idx;
+            } else
+#endif
+            {
+                weight_ptr = sym_buffer.map(
+                    buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                        src_token_topk_idx,
+                    current_rank_in_expert_idx);
+            }
+            const auto weight = *weight_ptr;
 
             // Load and store SF (overlaps with last chunk's TMA load from remote)
             constexpr uint32_t kNumSFUint32 = kHidden / 128;
             DG_STATIC_ASSERT(kNumSFUint32 > 0 and kHidden % 128 == 0, "Invalid SF");
-            const auto remote_sf_ptr = sym_buffer.map(
-                buffer.input_sf_buffer.get_data_buffer(src_token_idx).get_base_ptr<uint32_t>(),
-                current_rank_in_expert_idx);
+            const uint32_t* remote_sf_ptr;
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseEp8Gin) {
+                remote_sf_ptr = gin_transport.is_same_lsa_peer(
+                    current_rank_in_expert_idx) ?
+                    sym_buffer.map(
+                        buffer.input_sf_buffer.get_data_buffer(src_token_idx)
+                            .get_base_ptr<uint32_t>(),
+                        current_rank_in_expert_idx) :
+                    static_cast<const uint32_t*>(
+                        gin_workspace.get_remote_input_scale_ptr(
+                            current_rank_in_expert_idx %
+                                layout::kMegaMoEEp8GinLsaSize,
+                            src_token_idx));
+            } else
+#endif
+            {
+                remote_sf_ptr = sym_buffer.map(
+                    buffer.input_sf_buffer.get_data_buffer(src_token_idx)
+                        .get_base_ptr<uint32_t>(),
+                    current_rank_in_expert_idx);
+            }
             const auto local_sf_ptr = buffer.l1_sf_buffer.get_base_ptr<uint32_t>();
             const uint32_t ring_block_idx = pool_block_idx % kNumRingBlocks;
             const uint32_t token_idx_in_block = token_idx_in_expert % BLOCK_M;
@@ -597,6 +992,25 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                 // Write source metadata for combine write-back (logical pool token)
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
+#ifdef DG_MEGAMOE_GIN
+                if constexpr (kUseEp8Gin) {
+                    if (not gin_transport.is_same_lsa_peer(
+                            current_rank_in_expert_idx)) {
+                        const uint32_t remote_source_lane =
+                            current_rank_in_expert_idx %
+                            layout::kMegaMoEEp8GinLsaSize;
+                        const uint32_t record_ordinal =
+                            *gin_workspace.get_combine_record_prefix_ptr(
+                                remote_source_lane, current_expert_idx) +
+                            token_idx_in_rank;
+                        DG_DEVICE_ASSERT(
+                            record_ordinal <
+                            layout::kMegaMoEEp8GinMaxExpertAssignments);
+                        *gin_workspace.get_combine_return_ordinal_ptr(
+                            pool_token_idx) = record_ordinal;
+                    }
+                }
+#endif
 
                 // Complete last chunk's store
                 issue_and_wait_pull_store(kNumChunks - 1);
@@ -609,6 +1023,202 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             __syncwarp();
         }
 
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseEp8Gin) {
+            // Retire each outbound control+payload queue only after useful
+            // dispatch work has had a chance to cover its completion latency.
+            // The dedicated combine context permits these four waits to run
+            // without sharing a QP with the epilogue's traffic.
+            if (sm_idx == 0 and
+                warp_idx < layout::kMegaMoEEp8GinNumRemotePeers and
+                lane_idx == 0) {
+                const uint32_t remote_owner_lane = warp_idx;
+                comm::mega_moe_ep8_gin_flush_wait_dispatch_peer(
+                    gin_transport, remote_owner_lane);
+            }
+            __syncwarp();
+        }
+#endif
+
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseEp8Gin) {
+            // Reuse one dispatch warp after its pulls to make progress while
+            // the persistent epilogue warps still compute other experts. Each
+            // active lane owns one source peer in the opposite LSA.
+            if (sm_idx == 0 and warp_idx == 0) {
+                constexpr uint32_t kNumL2Fragments =
+                    L2_SHAPE_N / BLOCK_N;
+                DG_STATIC_ASSERT(
+                    L2_SHAPE_N % BLOCK_N == 0,
+                    "L2 output must contain complete N fragments");
+                DG_STATIC_ASSERT(
+                    kNumExpertsPerRank ==
+                        layout::kMegaMoEEp8GinNumExpertsPerRank,
+                    "Owner-wave combine requires 56 local experts");
+
+                const bool is_remote_source_lane =
+                    lane_idx < layout::kMegaMoEEp8GinNumRemotePeers;
+                const uint32_t remote_source_lane =
+                    is_remote_source_lane ? lane_idx : 0u;
+                const uint32_t remote_source_rank =
+                    gin_transport.other_lsa_rank(remote_source_lane);
+                const uint32_t local_owner_lane =
+                    gin_transport.local_lsa_lane();
+                uint32_t pending_owner_waves = 0;
+                uint32_t total_expert_assignments = 0;
+
+                if (is_remote_source_lane) {
+                    #pragma unroll
+                    for (uint32_t owner_wave = 0;
+                         owner_wave <
+                             layout::kMegaMoEEp8GinCombineOwnerWaves;
+                         ++owner_wave) {
+                        uint32_t wave_expert_assignments = 0;
+                        #pragma unroll
+                        for (uint32_t wave_expert = 0;
+                             wave_expert <
+                                 layout::kMegaMoEEp8GinExpertsPerOwnerWave;
+                             ++wave_expert) {
+                            const uint32_t local_expert =
+                                owner_wave *
+                                    layout::kMegaMoEEp8GinExpertsPerOwnerWave +
+                                wave_expert;
+                            wave_expert_assignments += static_cast<uint32_t>(
+                                *workspace.get_expert_recv_count_ptr(
+                                    remote_source_rank, local_expert));
+                        }
+                        if (wave_expert_assignments != 0)
+                            pending_owner_waves |= 1u << owner_wave;
+                        total_expert_assignments += wave_expert_assignments;
+                    }
+                    DG_DEVICE_ASSERT(
+                        total_expert_assignments <=
+                        layout::kMegaMoEEp8GinMaxExpertAssignments);
+                }
+                __syncwarp();
+
+                // Different peer lanes may discover and submit different
+                // owner waves in the same iteration. A wave is eligible only
+                // after this issuer has acquired every contributing expert's
+                // complete M-block x N-fragment target.
+                while (__any_sync(
+                        0xffffffffu, pending_owner_waves != 0)) {
+                    uint32_t ready_owner_waves = 0;
+                    if (is_remote_source_lane) {
+                        #pragma unroll
+                        for (uint32_t owner_wave = 0;
+                             owner_wave <
+                                 layout::kMegaMoEEp8GinCombineOwnerWaves;
+                             ++owner_wave) {
+                            const uint32_t owner_wave_bit = 1u << owner_wave;
+                            if ((pending_owner_waves & owner_wave_bit) == 0)
+                                continue;
+                            bool wave_ready = true;
+                            #pragma unroll
+                            for (uint32_t wave_expert = 0;
+                                 wave_expert <
+                                     layout::kMegaMoEEp8GinExpertsPerOwnerWave;
+                                 ++wave_expert) {
+                                const uint32_t local_expert =
+                                    owner_wave *
+                                        layout::kMegaMoEEp8GinExpertsPerOwnerWave +
+                                    wave_expert;
+                                const uint32_t source_assignments =
+                                    static_cast<uint32_t>(
+                                        *workspace
+                                             .get_expert_recv_count_ptr(
+                                                 remote_source_rank,
+                                                 local_expert));
+                                if (source_assignments == 0)
+                                    continue;
+                                const uint32_t total_assignments =
+                                    static_cast<uint32_t>(
+                                        *workspace
+                                             .get_expert_recv_count_sum_ptr(
+                                                 local_expert));
+                                const uint32_t expected_fragments =
+                                    math::ceil_div(
+                                        total_assignments, BLOCK_M) *
+                                    kNumL2Fragments;
+                                const uint32_t completed_fragments =
+                                    comm::mega_moe_ep8_gin_combine_completion_acquire(
+                                        gin_workspace
+                                            .get_combine_expert_completion_ptr(
+                                                local_expert));
+                                DG_DEVICE_ASSERT(
+                                    completed_fragments <= expected_fragments);
+                                wave_ready &=
+                                    completed_fragments == expected_fragments;
+                            }
+                            if (wave_ready)
+                                ready_owner_waves |= owner_wave_bit;
+                        }
+                    }
+
+                    if (ready_owner_waves != 0) {
+                        const uint32_t owner_wave =
+                            static_cast<uint32_t>(
+                                __ffs(ready_owner_waves) - 1);
+                        const uint32_t owner_wave_bit = 1u << owner_wave;
+                        uint32_t span_record_ordinal = 0;
+                        uint32_t span_records = 0;
+                        #pragma unroll
+                        for (uint32_t wave_expert = 0;
+                             wave_expert <
+                                 layout::kMegaMoEEp8GinExpertsPerOwnerWave;
+                             ++wave_expert) {
+                            const uint32_t local_expert =
+                                owner_wave *
+                                    layout::kMegaMoEEp8GinExpertsPerOwnerWave +
+                                wave_expert;
+                            const uint32_t count = static_cast<uint32_t>(
+                                *workspace.get_expert_recv_count_ptr(
+                                    remote_source_rank, local_expert));
+                            if (count == 0)
+                                continue;
+                            const uint32_t prefix =
+                                *gin_workspace.get_combine_record_prefix_ptr(
+                                    remote_source_lane, local_expert);
+                            if (span_records == 0) {
+                                span_record_ordinal = prefix;
+                            } else {
+                                DG_DEVICE_ASSERT(
+                                    prefix ==
+                                    span_record_ordinal + span_records);
+                            }
+                            span_records += count;
+                        }
+                        DG_DEVICE_ASSERT(span_records != 0);
+                        DG_DEVICE_ASSERT(
+                            span_record_ordinal + span_records <=
+                            total_expert_assignments);
+
+                        auto* local_span =
+                            gin_workspace.get_combine_send_record_ptr(
+                                remote_source_lane,
+                                span_record_ordinal);
+                        auto* remote_span =
+                            gin_workspace.get_combine_receive_record_ptr(
+                                local_owner_lane,
+                                span_record_ordinal);
+                        comm::mega_moe_ep8_gin_publish_combine_span_async(
+                            gin_transport, remote_source_lane,
+                            local_span, remote_span, span_records);
+                        pending_owner_waves &= ~owner_wave_bit;
+                    }
+                    __syncwarp();
+                }
+
+                if (is_remote_source_lane and
+                    total_expert_assignments != 0) {
+                    comm::mega_moe_ep8_gin_flush_wait_combine_peer(
+                        gin_transport, remote_source_lane);
+                }
+                __syncwarp();
+            }
+        }
+#endif
+
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
@@ -619,6 +1229,18 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             #pragma unroll
             for (uint32_t i = thread_idx; i < kNumExperts; i += kNumDispatchThreads)
                 *workspace.get_expert_send_count_ptr(i) = 0;
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseEp8Gin) {
+                // The phase barrier above joins the final epilogue grid sync,
+                // so no L2 producer can increment these counters after reset.
+                for (uint32_t local_expert = thread_idx;
+                     local_expert < kNumExpertsPerRank;
+                     local_expert += kNumDispatchThreads) {
+                    *gin_workspace.get_combine_expert_completion_ptr(
+                        local_expert) = 0;
+                }
+            }
+#endif
             if (warp_idx == 0 and cute::elect_one_sync()) {
                 *workspace.get_l1_task_count_ptr() = 0;
                 *workspace.get_l2_task_count_ptr() = 0;
@@ -669,14 +1291,33 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
         }
 
-        // Wait for all ranks to finish cleaning
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* Before the NVLink barrier, there is a grid sync */ true,
-            /* At the end of kernel does not need to sync */ false
-        );
+        // Wait for the peers that share mapped symmetric memory to finish
+        // cleaning. Cross-LSA packet lifetime is retired by the GIN cleanup
+        // rendezvous after combine has consumed every receive slab.
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseEp8Gin) {
+            comm::nvlink_barrier<
+                kNumRanks, kNumSMs, kNumDispatchThreads,
+                kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag,
+                layout::kMegaMoEEp8GinLsaSize>(
+                    workspace, sym_buffer, sm_idx, thread_idx,
+                    [=]() {
+                        ptx::sync_aligned(
+                            kNumDispatchThreads, kDispatchBarrierIdx);
+                    },
+                    /* Before the LSA barrier, there is a grid sync */ true,
+                    /* At the end of dispatch does not need to sync */ false);
+        } else
+#endif
+        {
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* Before the NVLink barrier, there is a grid sync */ true,
+                /* At the end of kernel does not need to sync */ false
+            );
+        }
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1298,18 +1939,87 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
                             (bank_group_idx ^ row_in_atom) * kNumBankGroupBytes;
                         const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
 
-                        // Write into remote
-                        const auto dst_token = buffer.combine_token_buffer.get_rank_buffer(dst_topk_idx)
-                                               .get_data_buffer(dst_token_idx);
-                        const auto dst_ptr = math::advance_ptr<float4>(
-                            dst_token.get_base_ptr(),
-                            n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        // Same-LSA results retain the native mapped store. A
+                        // cross-LSA result is written into its deterministic
+                        // source packet record and published after all L2 tiles
+                        // have completed.
+#ifdef DG_MEGAMOE_GIN
+                        if constexpr (kUseEp8Gin) {
+                            if (not gin_transport.is_same_lsa_peer(
+                                    dst_rank_idx)) {
+                                const uint32_t remote_source_lane =
+                                    dst_rank_idx %
+                                    layout::kMegaMoEEp8GinLsaSize;
+                                const uint32_t record_ordinal =
+                                    *gin_workspace
+                                         .get_combine_return_ordinal_ptr(
+                                             pool_m_idx + m_idx_in_block);
+                                DG_DEVICE_ASSERT(
+                                    record_ordinal <
+                                    layout::kMegaMoEEp8GinMaxExpertAssignments);
+                                auto* dst_ptr = math::advance_ptr<float4>(
+                                    gin_workspace
+                                        .get_combine_send_record_ptr(
+                                            remote_source_lane,
+                                            record_ordinal),
+                                    n_idx * static_cast<uint32_t>(
+                                                sizeof(nv_bfloat16)) +
+                                        (lane_idx % 16) *
+                                            static_cast<uint32_t>(
+                                                sizeof(float4)));
+                                *dst_ptr = packed;
+                            } else {
+                                const auto dst_token =
+                                    buffer.combine_token_buffer
+                                        .get_rank_buffer(dst_topk_idx)
+                                        .get_data_buffer(dst_token_idx);
+                                const auto dst_ptr = math::advance_ptr<float4>(
+                                    dst_token.get_base_ptr(),
+                                    n_idx * static_cast<uint32_t>(
+                                                sizeof(nv_bfloat16)) +
+                                        (lane_idx % 16) *
+                                            static_cast<uint32_t>(
+                                                sizeof(float4)));
+                                *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                            }
+                        } else
+#endif
+                        {
+                            const auto dst_token = buffer.combine_token_buffer
+                                .get_rank_buffer(dst_topk_idx)
+                                .get_data_buffer(dst_token_idx);
+                            const auto dst_ptr = math::advance_ptr<float4>(
+                                dst_token.get_base_ptr(),
+                                n_idx * static_cast<uint32_t>(
+                                            sizeof(nv_bfloat16)) +
+                                    (lane_idx % 16) *
+                                        static_cast<uint32_t>(sizeof(float4)));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        }
                     }
                 }
 
-                // Ensure the next epilogue safe to use shared memory
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                // Ensure the next epilogue is safe to reuse shared memory. In
+                // the GIN specialization, the same CTA-wide barrier orders all
+                // record stores before one release increment for this expert's
+                // completed N fragment.
+#ifdef DG_MEGAMOE_GIN
+                if constexpr (kUseEp8Gin) {
+                    comm::mega_moe_ep8_gin_combine_producer_barrier(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (not task_info.is_shared() and
+                        epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        comm::mega_moe_ep8_gin_combine_completion_release(
+                            gin_workspace.get_combine_expert_completion_ptr(
+                                task_info.local_expert_idx));
+                    }
+                    __syncwarp();
+                } else
+#endif
+                {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
             }
         }
 
@@ -1358,11 +2068,31 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
 
+        const auto grid_idx = ptx::get_grid_idx() + 1;
+
         // Peers' grid indices for tagging their combine readiness; the load overlaps with the grid sync
         DG_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
         uint64_t peer_grid_idx = 0;
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
+        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseEp8Gin) {
+                if (gin_transport.is_same_lsa_peer(epilogue_thread_idx))
+                    peer_grid_idx = *workspace.get_peer_grid_idx_ptr(
+                        epilogue_thread_idx);
+            } else
+#endif
+            {
+                peer_grid_idx = *workspace.get_peer_grid_idx_ptr(
+                    epilogue_thread_idx);
+            }
+        }
+
+        // Close mapped same-LSA stores and the already released packet-record
+        // stores before the final local/grid visibility handoffs.
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseEp8Gin)
+            __threadfence_system();
+#endif
 
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
@@ -1370,15 +2100,131 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
 
-        // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+        // Notify mapped peers. Cross-LSA readiness is published locally after
+        // their received packets have been scattered below.
+        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseEp8Gin) {
+                if (gin_transport.is_same_lsa_peer(epilogue_thread_idx)) {
+                    ptx::st_rel_sys(
+                        sym_buffer.map(
+                            workspace.get_combine_ready_grid_idx_ptr(
+                                sym_buffer.rank_idx),
+                            epilogue_thread_idx),
+                        peer_grid_idx);
+                }
+            } else
+#endif
+            {
+                ptx::st_rel_sys(
+                    sym_buffer.map(
+                        workspace.get_combine_ready_grid_idx_ptr(
+                            sym_buffer.rank_idx),
+                        epilogue_thread_idx),
+                    peer_grid_idx);
+            }
+        }
+
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseEp8Gin) {
+            // On SM0 this local phase joins the dispatch-warp issuer after its
+            // four peer queues, including their late completions, are
+            // submitted. Other CTAs wait at the following epilogue grid
+            // sync while one warp executes the existing world visibility fence.
+            ptx::sync_unaligned(
+                kNumDispatchThreads + kNumEpilogueThreads,
+                kDispatchWithEpilogueBarrierIdx);
+            if (sm_idx == 0 and epilogue_warp_idx == 0) {
+                comm::mega_moe_ep8_gin_world_put_barrier(
+                    gin_transport, kGinCombinePutBarrierIndex);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+                __threadfence_system();
+            }
+
+            // Make the converged GIN acquire visible to every local CTA before
+            // they distribute packet records into the native combine layout.
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+
+            constexpr uint32_t kCombineRecordUint4 =
+                kNumHiddenBytes / sizeof(uint4);
+            constexpr uint32_t kNumGlobalEpilogueWarps =
+                kNumSMs * kNumEpilogueWarps;
+            const uint32_t global_epilogue_warp =
+                sm_idx * kNumEpilogueWarps + epilogue_warp_idx;
+            #pragma unroll
+            for (uint32_t remote_owner_lane = 0;
+                 remote_owner_lane < layout::kMegaMoEEp8GinNumRemotePeers;
+                 ++remote_owner_lane) {
+                // The remote owner returns records in the expert-major order
+                // of this immutable dispatch-send packet. It therefore needs
+                // neither a count header nor per-record destination metadata.
+                const uint32_t received_count = ptx::ld_acq_sys(
+                    gin_workspace.get_dispatch_send_total_assignment_count_ptr(
+                        remote_owner_lane));
+                DG_DEVICE_ASSERT(
+                    received_count <=
+                    layout::kMegaMoEEp8GinMaxExpertAssignments);
+                for (uint32_t record_ordinal = global_epilogue_warp;
+                     record_ordinal < received_count;
+                     record_ordinal += kNumGlobalEpilogueWarps) {
+                    const uint32_t destination = ptx::ld_acq_sys(
+                        gin_workspace.get_dispatch_send_expert_assignment_ptr(
+                            remote_owner_lane, record_ordinal));
+                    DG_DEVICE_ASSERT(destination < num_tokens * kNumTopk);
+                    const uint32_t dst_token_idx = destination / kNumTopk;
+                    const uint32_t dst_topk_idx = destination % kNumTopk;
+                    const auto* src = static_cast<const uint4*>(
+                        gin_workspace.get_combine_receive_record_ptr(
+                            remote_owner_lane, record_ordinal));
+                    auto* dst = buffer.combine_token_buffer
+                        .get_rank_buffer(dst_topk_idx)
+                        .get_data_buffer(dst_token_idx)
+                        .template get_base_ptr<uint4>();
+                    #pragma unroll
+                    for (uint32_t element = lane_idx;
+                         element < kCombineRecordUint4;
+                         element += 32)
+                        dst[element] = src[element];
+                    __syncwarp();
+                }
+            }
+            __threadfence();
+
+            // The reduction can be assigned to a different CTA, so close the
+            // scatter locally before marking opposite-LSA owners ready.
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+            if (sm_idx == 0 and
+                epilogue_thread_idx <
+                    layout::kMegaMoEEp8GinNumRemotePeers) {
+                const uint32_t remote_owner_rank =
+                    gin_transport.other_lsa_rank(epilogue_thread_idx);
+                ptx::st_rel(
+                    workspace.get_combine_ready_grid_idx_ptr(
+                        remote_owner_rank),
+                    grid_idx);
+            }
+        }
+#endif
 
         // Barrier with dispatch warps, so that they can do clean workspace
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (not kUseEp8Gin)
+#endif
+            ptx::sync_unaligned(
+                kNumDispatchThreads + kNumEpilogueThreads,
+                kDispatchWithEpilogueBarrierIdx);
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
-        const auto grid_idx = ptx::get_grid_idx() + 1;
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
@@ -1474,6 +2320,32 @@ sm100_fp8_fp4_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseEp8Gin) {
+            // Commit 1 uses an explicit end-of-launch retirement point. Every
+            // rank has stopped reading both dispatch mirrors and combine
+            // receive packets before the registered slabs can be reused.
+            ptx::tma_store_wait<0>();
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+            if (sm_idx == 0 and epilogue_warp_idx == 0) {
+                comm::mega_moe_ep8_gin_world_cleanup_barrier(
+                    gin_transport, kGinCleanupBarrierIndex);
+                __threadfence_system();
+            }
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+        }
+#endif
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)
