@@ -17,15 +17,24 @@ from pathlib import Path
 from torch.utils.cpp_extension import CUDAExtension, CUDA_HOME
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 from scripts.generate_pyi import generate_pyi_file
+from scripts.gin_build_config import resolve_gin_nccl_config
 
 
 DG_SKIP_CUDA_BUILD = int(os.getenv('DG_SKIP_CUDA_BUILD', '0')) == 1
 DG_FORCE_BUILD = int(os.getenv('DG_FORCE_BUILD', '0')) == 1
 DG_USE_LOCAL_VERSION = int(os.getenv('DG_USE_LOCAL_VERSION', '1')) == 1
+DG_MEGAMOE_GIN = int(os.getenv('DG_MEGAMOE_GIN', '0')) == 1
+gin_nccl_config = resolve_gin_nccl_config(DG_MEGAMOE_GIN)
 
 # Compiler flags
 cxx_flags = ['-std=c++20', '-O3', '-fPIC', '-Wno-psabi', '-Wno-deprecated-declarations',
              f'-D_GLIBCXX_USE_CXX11_ABI={int(torch.compiled_with_cxx11_abi())}']
+if gin_nccl_config is not None:
+    cxx_flags.extend(f'-D{definition}' for definition in gin_nccl_config.compile_definitions)
+    # Installed wheels use the private header copy below. This fallback keeps
+    # source-tree development builds usable without modifying tracked files.
+    cxx_flags.append(
+        f'-DDG_NCCL_BUILD_INCLUDE_DIR=\\"{gin_nccl_config.include_dir}\\"')
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
@@ -43,6 +52,10 @@ third_party_include_dirs = [
     'third-party/cutlass/include/cute',
     'third-party/cutlass/include/cutlass',
 ]
+if gin_nccl_config is not None:
+    # Only headers are consumed here. The caller owns all NCCL host lifecycle,
+    # so the DeepGEMM extension deliberately does not link libnccl.
+    build_include_dirs.append(str(gin_nccl_config.include_dir))
 
 # Release
 base_wheel_url = 'https://github.com/DeepSeek-AI/DeepGEMM/releases/download/{tag_name}/{wheel_name}'
@@ -172,10 +185,16 @@ class CustomBuildPy(build_py):
             # Copy the directory
             shutil.copytree(src_dir, dst_dir)
 
+        nccl_dst_dir = os.path.join(build_include_dir, 'nccl')
+        if os.path.exists(nccl_dst_dir):
+            shutil.rmtree(nccl_dst_dir)
+        if gin_nccl_config is not None:
+            shutil.copytree(gin_nccl_config.include_dir, nccl_dst_dir)
+
 
 class CachedWheelsCommand(_bdist_wheel):
     def run(self):
-        if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION:
+        if DG_FORCE_BUILD or DG_USE_LOCAL_VERSION or DG_MEGAMOE_GIN:
             return super().run()
 
         wheel_url, wheel_filename = get_wheel_url()
@@ -211,6 +230,7 @@ if __name__ == '__main__':
                 'include/deep_gemm/**/*',
                 'include/cute/**/*',
                 'include/cutlass/**/*',
+                'include/nccl/**/*',
             ]
         },
         ext_modules=get_ext_modules(),
