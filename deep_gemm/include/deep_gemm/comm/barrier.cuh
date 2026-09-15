@@ -50,14 +50,19 @@ CUTLASS_DEVICE void grid_sync(const layout::Workspace& workspace,
     sync_scope();
 }
 
-template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads, uint32_t kGridSyncIndex, uint32_t kTag, typename sync_scope_t>
+template <uint32_t kNumRanks, uint32_t kNumSMs, uint32_t kNumThreads,
+          uint32_t kGridSyncIndex, uint32_t kTag,
+          uint32_t kTeamSize = kNumRanks, typename sync_scope_t>
 CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
                                    const layout::SymBuffer<kNumRanks>& sym_buffer,
                                    const uint32_t& sm_idx, const uint32_t& thread_idx,
                                    const sync_scope_t& sync_scope,
                                    const bool& sync_prologue = true,
                                    const bool& sync_epilogue = true) {
-    DG_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
+    DG_STATIC_ASSERT(kTeamSize > 0 and kTeamSize <= kNumRanks and
+                     kNumRanks % kTeamSize == 0,
+                     "Invalid NVLink barrier team partition");
+    DG_STATIC_ASSERT(kTeamSize <= kNumThreads, "Insufficient threads");
 
     // Grid sync before NVLink signaling
     if (sync_prologue)
@@ -70,18 +75,31 @@ CUTLASS_DEVICE void nvlink_barrier(const layout::Workspace& workspace,
         const auto signal_phase = status & 1, signal_sign = status >> 1;
         auto* signal_ptr = workspace.get_nvl_barrier_signal_ptr(signal_phase);
 
-        // Send signals to remote ranks
-        if (thread_idx < kNumRanks)
-            ptx::red_add_rel_sys(sym_buffer.map(signal_ptr, thread_idx), signal_sign ? -1 : 1);
+        uint32_t team_base = 0;
+        if constexpr (kTeamSize != kNumRanks)
+            team_base = (sym_buffer.rank_idx / kTeamSize) * kTeamSize;
+
+        // Send signals to every rank in this contiguous NVLink team.
+        if (thread_idx < kTeamSize)
+            ptx::red_add_rel_sys(
+                sym_buffer.map(signal_ptr, team_base + thread_idx),
+                signal_sign ? -1 : 1);
         sync_scope();
 
         // Update status and wait arrival
         if (thread_idx == 0) {
             ptx::red_add(counter_ptr, 1);
-            const int target = signal_sign ? 0 : static_cast<int>(kNumRanks);
+            const int target = signal_sign ? 0 : static_cast<int>(kTeamSize);
             wait_until([&]() { return ptx::ld_acq_sys(signal_ptr) == target; }, [&]() {
-                printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
-                       sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                if constexpr (kTeamSize == kNumRanks) {
+                    printf("DeepGEMM NVLink barrier timeout: rank=%d, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                           sym_buffer.rank_idx, *counter_ptr, ptx::ld_acq_sys(signal_ptr), target, signal_phase, signal_sign, kTag);
+                } else {
+                    printf("DeepGEMM NVLink team barrier timeout: rank=%d, team_base=%u, team_size=%u, counter=%d, signal=%d, target=%d, phase=%d, sign=%d, tag=%d\n",
+                           sym_buffer.rank_idx, team_base, kTeamSize, *counter_ptr,
+                           ptx::ld_acq_sys(signal_ptr), target, signal_phase,
+                           signal_sign, kTag);
+                }
             });
         }
     }
