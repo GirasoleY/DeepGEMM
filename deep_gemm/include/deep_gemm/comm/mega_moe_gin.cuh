@@ -6,6 +6,7 @@
 
 #include <deep_gemm/common/exception.cuh>
 #include <deep_gemm/layout/mega_moe_gin.cuh>
+#include <deep_gemm/layout/mega_moe_gin_topology.h>
 
 #ifdef DG_MEGAMOE_GIN
 
@@ -20,46 +21,48 @@ namespace deep_gemm::comm {
 // The caller owns every referenced object and keeps it alive until all kernel
 // launches and captured graphs using this descriptor have completed.  The
 // registered window covers the native MegaMoE allocation and its appended GIN
-// workspace at identical offsets on all eight ranks.
-struct MegaMoeEp8GinTransport {
+// workspace and persistent footer at identical offsets on every rank.
+struct MegaMoeGinTransport {
     ncclDevComm_t dev_comm{};
     ncclWindow_t window = nullptr;
     const void* window_base = nullptr;
     uint64_t window_bytes = 0;
+    void* persistent = nullptr;
 
 #if NCCL_CHECK_CUDACC
+    NCCL_DEVICE_INLINE layout::MegaMoeGinTopology topology() const {
+        return {static_cast<uint32_t>(dev_comm.nRanks),
+                static_cast<uint32_t>(dev_comm.lsaSize)};
+    }
+
     NCCL_DEVICE_INLINE bool is_same_lsa_peer(const uint32_t peer) const {
-        DG_DEVICE_ASSERT(peer < layout::kMegaMoEEp8GinWorldSize);
-        return peer / layout::kMegaMoEEp8GinLsaSize ==
-               static_cast<uint32_t>(dev_comm.rank) /
-                   layout::kMegaMoEEp8GinLsaSize;
+        DG_DEVICE_ASSERT(peer < static_cast<uint32_t>(dev_comm.nRanks));
+        return topology().is_same_lsa(dev_comm.rank, peer);
     }
 
-    NCCL_DEVICE_INLINE uint32_t local_lsa_lane() const {
-        return static_cast<uint32_t>(dev_comm.rank) %
-               layout::kMegaMoEEp8GinLsaSize;
+    // Compact cross-LSA indices are relative to the rank owning the workspace.
+    // A PUT destination must use return_slot(), not the sender's remote slot.
+    NCCL_DEVICE_INLINE uint32_t remote_rank(const uint32_t slot) const {
+        DG_DEVICE_ASSERT(slot < dev_comm.nRanks - dev_comm.lsaSize);
+        return topology().remote_rank(dev_comm.rank, slot);
     }
 
-    NCCL_DEVICE_INLINE uint32_t other_lsa_rank(
-            const uint32_t peer_lsa_lane) const {
-        DG_DEVICE_ASSERT(peer_lsa_lane < layout::kMegaMoEEp8GinLsaSize);
-        const uint32_t remote_lsa =
-            1u - static_cast<uint32_t>(dev_comm.rank) /
-                     layout::kMegaMoEEp8GinLsaSize;
-        return remote_lsa * layout::kMegaMoEEp8GinLsaSize + peer_lsa_lane;
+    NCCL_DEVICE_INLINE uint32_t remote_slot(const uint32_t peer) const {
+        DG_DEVICE_ASSERT(not is_same_lsa_peer(peer));
+        return topology().remote_slot(dev_comm.rank, peer);
     }
 
-    NCCL_DEVICE_INLINE uint32_t data_context(
-            const uint32_t peer_lsa_lane) const {
-        DG_DEVICE_ASSERT(peer_lsa_lane < layout::kMegaMoEEp8GinLsaSize);
-        // Context zero is reserved for collectives and cleanup rendezvous;
-        // contexts one through four carry dispatch traffic.
-        return 1u + peer_lsa_lane;
+    NCCL_DEVICE_INLINE uint32_t return_slot(const uint32_t slot) const {
+        return topology().return_slot(dev_comm.rank, slot);
+    }
+
+    NCCL_DEVICE_INLINE uint32_t data_context(const uint32_t slot) const {
+        // Four issuer warps share contexts across different peer queues.
+        return 1u + remote_rank(slot) % 4u;
     }
 
     NCCL_DEVICE_INLINE uint32_t combine_context() const {
-        // Keep the full combine packet independent of every dispatch QP.
-        return layout::kMegaMoEEp8GinLsaSize + 1u;
+        return 5u;
     }
 
     NCCL_DEVICE_INLINE size_t window_offset(
@@ -75,8 +78,8 @@ struct MegaMoeEp8GinTransport {
 #endif
 };
 
-static_assert(std::is_standard_layout_v<MegaMoeEp8GinTransport>);
-static_assert(std::is_trivially_copyable_v<MegaMoeEp8GinTransport>);
+static_assert(std::is_standard_layout_v<MegaMoeGinTransport>);
+static_assert(std::is_trivially_copyable_v<MegaMoeGinTransport>);
 
 #if NCCL_CHECK_CUDACC
 
@@ -84,25 +87,26 @@ static_assert(std::is_trivially_copyable_v<MegaMoeEp8GinTransport>);
 // terminal authorizes scheduling metadata reconstruction, but never payload
 // reads.  This function intentionally neither flushes nor waits; the caller
 // must preserve the send packet until flush_wait_dispatch_peer returns.
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_publish_dispatch_control_async(
-    const MegaMoeEp8GinTransport& transport,
-    const uint32_t remote_owner_lane,
+template <typename workspace_t>
+NCCL_DEVICE_INLINE void mega_moe_gin_publish_dispatch_control_async(
+    const MegaMoeGinTransport& transport,
+    const uint32_t remote_owner_slot,
     const uint32_t num_expert_assignments,
     const void* local_dispatch_control,
     void* remote_dispatch_control,
     void* remote_control_epoch) {
     DG_DEVICE_ASSERT(
         num_expert_assignments <=
-        layout::kMegaMoEEp8GinMaxExpertAssignments);
+        workspace_t::kMaxExpertAssignments);
     const uint32_t remote_owner_rank =
-        transport.other_lsa_rank(remote_owner_lane);
-    const uint32_t control_bytes =
-        layout::kMegaMoEEp8GinDispatchExpertCountBytes +
+        transport.remote_rank(remote_owner_slot);
+    const uint64_t control_bytes =
+        workspace_t::kDispatchExpertCountBytes +
         num_expert_assignments * sizeof(uint32_t);
 
     ncclGin gin{
         transport.dev_comm,
-        static_cast<int>(transport.data_context(remote_owner_lane)),
+        static_cast<int>(transport.data_context(remote_owner_slot)),
         NCCL_GIN_RESOURCE_SHARING_GPU};
     gin.put(
         ncclTeamWorld(transport.dev_comm),
@@ -123,9 +127,10 @@ NCCL_DEVICE_INLINE void mega_moe_ep8_gin_publish_dispatch_control_async(
 // (context, peer).  A distinct StrongVA terminal authorizes mirror reads.  An
 // empty owner still receives one signal so all cumulative generations remain
 // aligned across eager launches and graph replays.
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_publish_dispatch_payload_async(
-    const MegaMoeEp8GinTransport& transport,
-    const uint32_t remote_owner_lane,
+template <typename workspace_t>
+NCCL_DEVICE_INLINE void mega_moe_gin_publish_dispatch_payload_async(
+    const MegaMoeGinTransport& transport,
+    const uint32_t remote_owner_slot,
     const uint32_t num_tokens,
     const uint32_t num_expert_assignments,
     const void* local_input_activations,
@@ -135,22 +140,22 @@ NCCL_DEVICE_INLINE void mega_moe_ep8_gin_publish_dispatch_payload_async(
     const void* local_topk_weights,
     void* remote_topk_weights,
     void* remote_payload_epoch) {
-    DG_DEVICE_ASSERT(num_tokens <= layout::kMegaMoEEp8GinMaxTokens);
+    DG_DEVICE_ASSERT(num_tokens <= workspace_t::kMaxActiveTokens);
     DG_DEVICE_ASSERT(
         num_expert_assignments <=
-        layout::kMegaMoEEp8GinMaxExpertAssignments);
+        workspace_t::kMaxExpertAssignments);
     const uint32_t remote_owner_rank =
-        transport.other_lsa_rank(remote_owner_lane);
+        transport.remote_rank(remote_owner_slot);
 
-    const uint32_t activation_bytes =
-        num_tokens * layout::kMegaMoEEp8GinInputActivationBytes;
-    const uint32_t scale_bytes =
-        num_tokens * layout::kMegaMoEEp8GinInputScaleBytes;
-    const uint32_t weight_bytes =
-        num_tokens * layout::kMegaMoEEp8GinTopKWeightBytes;
+    const uint64_t activation_bytes =
+        num_tokens * workspace_t::kInputActivationBytes;
+    const uint64_t scale_bytes =
+        num_tokens * workspace_t::kInputScaleBytes;
+    const uint64_t weight_bytes =
+        num_tokens * workspace_t::kTopKWeightBytes;
     ncclGin gin{
         transport.dev_comm,
-        static_cast<int>(transport.data_context(remote_owner_lane)),
+        static_cast<int>(transport.data_context(remote_owner_slot)),
         NCCL_GIN_RESOURCE_SHARING_GPU};
     const auto world = ncclTeamWorld(transport.dev_comm);
     const ncclGin_StrongVASignalInc payload_ready{
@@ -170,15 +175,17 @@ NCCL_DEVICE_INLINE void mega_moe_ep8_gin_publish_dispatch_payload_async(
             ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
             cuda::thread_scope_device, cuda::thread_scope_device,
             ncclGinOptFlagsAggregateRequests);
-        gin.put(
-            world, static_cast<int>(remote_owner_rank), transport.window,
-            transport.window_offset(remote_input_scales, scale_bytes),
-            transport.window,
-            transport.window_offset(local_input_scales, scale_bytes),
-            scale_bytes,
-            ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-            cuda::thread_scope_device, cuda::thread_scope_device,
-            ncclGinOptFlagsAggregateRequests);
+        if constexpr (workspace_t::kInputScaleBytes != 0) {
+            gin.put(
+                world, static_cast<int>(remote_owner_rank), transport.window,
+                transport.window_offset(remote_input_scales, scale_bytes),
+                transport.window,
+                transport.window_offset(local_input_scales, scale_bytes),
+                scale_bytes,
+                ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+                cuda::thread_scope_device, cuda::thread_scope_device,
+                ncclGinOptFlagsAggregateRequests);
+        }
         gin.put(
             world, static_cast<int>(remote_owner_rank), transport.window,
             transport.window_offset(remote_topk_weights, weight_bytes),
@@ -199,14 +206,14 @@ NCCL_DEVICE_INLINE void mega_moe_ep8_gin_publish_dispatch_payload_async(
 // Retire the control and payload chains together once the dispatch source
 // ranges may be reused.  Four peer-owned dispatch warps can call this helper
 // concurrently because each uses a distinct (context, peer) queue.
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_flush_wait_dispatch_peer(
-    const MegaMoeEp8GinTransport& transport,
-    const uint32_t remote_owner_lane) {
+NCCL_DEVICE_INLINE void mega_moe_gin_flush_wait_dispatch_peer(
+    const MegaMoeGinTransport& transport,
+    const uint32_t remote_owner_slot) {
     const uint32_t remote_owner_rank =
-        transport.other_lsa_rank(remote_owner_lane);
+        transport.remote_rank(remote_owner_slot);
     ncclGin gin{
         transport.dev_comm,
-        static_cast<int>(transport.data_context(remote_owner_lane)),
+        static_cast<int>(transport.data_context(remote_owner_slot)),
         NCCL_GIN_RESOURCE_SHARING_GPU};
     const auto world = ncclTeamWorld(transport.dev_comm);
     ncclGinRequest_t request{};
@@ -218,14 +225,14 @@ NCCL_DEVICE_INLINE void mega_moe_ep8_gin_flush_wait_dispatch_peer(
         cuda::memory_order_acquire);
 }
 
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_wait_dispatch(
-    const MegaMoeEp8GinTransport& transport,
+NCCL_DEVICE_INLINE void mega_moe_gin_wait_dispatch(
+    const MegaMoeGinTransport& transport,
     const void* local_ready_epoch,
     const uint64_t expected_epoch) {
     DG_DEVICE_ASSERT(expected_epoch != 0);
     ncclGin gin{
         transport.dev_comm,
-        static_cast<int>(transport.data_context(transport.local_lsa_lane())),
+        1 + transport.dev_comm.rank % 4,
         NCCL_GIN_RESOURCE_SHARING_GPU};
     gin.waitSignal(
         ncclCoopThread{}, transport.window,
@@ -236,20 +243,20 @@ NCCL_DEVICE_INLINE void mega_moe_ep8_gin_wait_dispatch(
 // Every L2 CTA joins all of its epilogue writers before one release increment
 // for the completed expert/N fragment. The source-peer issuer acquires every
 // contributing expert counter before publishing a record span.
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_combine_producer_barrier(
+NCCL_DEVICE_INLINE void mega_moe_gin_combine_producer_barrier(
     const uint32_t num_threads,
     const uint32_t barrier_idx) {
     asm volatile("bar.sync %0, %1;"
                  :: "r"(barrier_idx), "r"(num_threads) : "memory");
 }
 
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_combine_completion_release(
+NCCL_DEVICE_INLINE void mega_moe_gin_combine_completion_release(
     uint32_t* completion) {
     asm volatile("red.release.gpu.global.add.u32 [%0], %1;"
                  :: "l"(completion), "r"(1u) : "memory");
 }
 
-NCCL_DEVICE_INLINE uint32_t mega_moe_ep8_gin_combine_completion_acquire(
+NCCL_DEVICE_INLINE uint32_t mega_moe_gin_combine_completion_acquire(
     const uint32_t* completion) {
     uint32_t value;
     asm volatile("ld.acquire.gpu.global.b32 %0, [%1];"
@@ -258,19 +265,20 @@ NCCL_DEVICE_INLINE uint32_t mega_moe_ep8_gin_combine_completion_acquire(
 }
 
 // Publish a contiguous set of complete fixed-stride records.
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_publish_combine_span_async(
-    const MegaMoeEp8GinTransport& transport,
-    const uint32_t remote_source_lane,
+template <typename workspace_t>
+NCCL_DEVICE_INLINE void mega_moe_gin_publish_combine_span_async(
+    const MegaMoeGinTransport& transport,
+    const uint32_t remote_source_slot,
     const void* local_span,
     void* remote_span,
     const uint32_t num_records) {
     DG_DEVICE_ASSERT(num_records != 0);
     DG_DEVICE_ASSERT(
-        num_records <= layout::kMegaMoEEp8GinMaxExpertAssignments);
+        num_records <= workspace_t::kMaxExpertAssignments);
     const uint32_t remote_source_rank =
-        transport.other_lsa_rank(remote_source_lane);
-    const uint32_t span_bytes =
-        num_records * layout::kMegaMoEEp8GinCombineRecordBytes;
+        transport.remote_rank(remote_source_slot);
+    const uint64_t span_bytes =
+        num_records * workspace_t::kCombineRecordBytes;
     ncclGin gin{
         transport.dev_comm,
         static_cast<int>(transport.combine_context()),
@@ -289,11 +297,11 @@ NCCL_DEVICE_INLINE void mega_moe_ep8_gin_publish_combine_span_async(
 // Complete one peer queue only after all four owner waves have been submitted.
 // Four source-peer lanes may call this concurrently because their peer QPs are
 // independent within the dedicated combine context.
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_flush_wait_combine_peer(
-    const MegaMoeEp8GinTransport& transport,
-    const uint32_t remote_source_lane) {
+NCCL_DEVICE_INLINE void mega_moe_gin_flush_wait_combine_peer(
+    const MegaMoeGinTransport& transport,
+    const uint32_t remote_source_slot) {
     const uint32_t remote_source_rank =
-        transport.other_lsa_rank(remote_source_lane);
+        transport.remote_rank(remote_source_slot);
     ncclGin gin{
         transport.dev_comm,
         static_cast<int>(transport.combine_context()),
@@ -310,8 +318,8 @@ NCCL_DEVICE_INLINE void mega_moe_ep8_gin_flush_wait_combine_peer(
 
 // Fence only the dedicated combine context. Dispatch contexts are retired by
 // their own late per-peer completions and must not delay combine visibility.
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_world_put_barrier(
-    const MegaMoeEp8GinTransport& transport,
+NCCL_DEVICE_INLINE void mega_moe_gin_world_put_barrier(
+    const MegaMoeGinTransport& transport,
     const uint32_t barrier_index) {
     ncclGin gin{
         transport.dev_comm, static_cast<int>(transport.combine_context()),
@@ -324,8 +332,8 @@ NCCL_DEVICE_INLINE void mega_moe_ep8_gin_world_put_barrier(
 // Run after every rank has finished consuming dispatch mirrors and combine
 // receive packets.  Context zero carries only the collective milestone; the
 // earlier StrongVA wait and world PUT barrier supplied data visibility.
-NCCL_DEVICE_INLINE void mega_moe_ep8_gin_world_cleanup_barrier(
-    const MegaMoeEp8GinTransport& transport,
+NCCL_DEVICE_INLINE void mega_moe_gin_world_cleanup_barrier(
+    const MegaMoeGinTransport& transport,
     const uint32_t barrier_index) {
     ncclGin gin{
         transport.dev_comm, 0, NCCL_GIN_RESOURCE_SHARING_GPU};

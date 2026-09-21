@@ -10,6 +10,10 @@
 #include <deep_gemm/comm/barrier.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
 #include <deep_gemm/layout/mega_moe.cuh>
+#ifdef DG_MEGAMOE_GIN
+#include <deep_gemm/comm/mega_moe_gin_kernels.cuh>
+#include <deep_gemm/layout/mega_moe_gin.cuh>
+#endif
 #include <deep_gemm/mma/sm100.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
 #include <deep_gemm/ptx/tcgen05.cuh>
@@ -33,6 +37,9 @@ template <
     uint32_t kNumSMs, uint32_t kNumRanks,
     float kActivationClamp,
     bool kFastMath,
+    bool kUseGin = false,
+    uint32_t kGinMaxActiveTokens = kNumMaxTokensPerRank,
+    uint32_t kGinLsaSize = kNumRanks,
     bool kHasShared = (kNumSharedExperts > 0),
     uint32_t L1_SHAPE_N = kIntermediateHidden * 2,
     uint32_t L1_SHAPE_K = kHidden,
@@ -54,6 +61,9 @@ sm100_bf16_mega_moe_impl(void* y,
                          int* cumulative_local_expert_recv_stats,
                          const uint32_t num_tokens,
                          const __grid_constant__ layout::SymBuffer<kNumRanks> sym_buffer,
+#ifdef DG_MEGAMOE_GIN
+                         const __grid_constant__ comm::MegaMoeGinTransport gin_transport,
+#endif
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_acts,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_weights,
                          const __grid_constant__ cute::TmaDescriptor tensor_map_l1_output,
@@ -68,11 +78,28 @@ sm100_bf16_mega_moe_impl(void* y,
     using Barrier = cutlass::arch::ClusterTransactionBarrier;
     using Allocator = cute::TMEM::Allocator2Sm;
 
+#ifdef DG_MEGAMOE_GIN
+    using GinWorkspace = layout::MegaMoeGinWorkspaceT<
+        kNumExpertsPerRank, kNumTopk, kHidden,
+        kGinMaxActiveTokens, kNumRanks, kGinLsaSize, false>;
+#endif
+
     // Template checks
     DG_STATIC_ASSERT(kNumDispatchThreads % 128 == 0, "Invalid number of dispatch threads");
     DG_STATIC_ASSERT(kNumNonEpilogueThreads == 128, "Invalid number of MMA non-epilogue threads");
     DG_STATIC_ASSERT(kNumEpilogueThreads % 128 == 0, "Invalid number of MMA epilogue and combine threads");
     DG_STATIC_ASSERT(kNumExperts % kNumRanks == 0, "Invalid number of experts or ranks");
+
+#ifndef DG_MEGAMOE_GIN
+    DG_STATIC_ASSERT(not kUseGin, "GIN kernel instantiated without DG_MEGAMOE_GIN");
+#else
+    if constexpr (kUseGin) {
+        DG_STATIC_ASSERT(kGinLsaSize < kNumRanks and kNumRanks % kGinLsaSize == 0,
+                         "GIN requires multiple contiguous equal-size LSA teams");
+        DG_STATIC_ASSERT(kNumDispatchWarps == 4, "GIN MegaMoE requires four dispatch warps");
+        DG_DEVICE_ASSERT(num_tokens <= GinWorkspace::kMaxActiveTokens);
+    }
+#endif
 
     // Thread indices
     const bool is_leader_cta = cute::block_rank_in_cluster() == 0;
@@ -106,6 +133,11 @@ sm100_bf16_mega_moe_impl(void* y,
         kNumSharedExperts
     );
     const auto workspace = buffer.workspace;
+#ifdef DG_MEGAMOE_GIN
+    GinWorkspace gin_workspace;
+    if constexpr (kUseGin)
+        gin_workspace = GinWorkspace::from_native(buffer, gin_transport.persistent);
+#endif
 
     using L2KBlockDependency = sched::L2KBlockDependency<L1_SHAPE_N, BLOCK_N, BLOCK_K>;
 
@@ -272,6 +304,11 @@ sm100_bf16_mega_moe_impl(void* y,
     constexpr uint32_t kBeforeDispatchPullBarrierTag = 1;
     constexpr uint32_t kAfterWorkspaceCleanBarrierTag = 2;
 
+    // GIN world barrier slots. The caller provisions at least two slots and
+    // all ranks execute these in this order on the serialized workspace.
+    constexpr uint32_t kGinCombinePutBarrierIndex = 0;
+    constexpr uint32_t kGinCleanupBarrierIndex = 1;
+
     // Adjust registers
     // NOTES: more experts per rank will cost more schedulers' registers
     constexpr bool kUseMoreEpilogueRegisters = kNumExpertsPerRank <= 64;
@@ -333,9 +370,29 @@ sm100_bf16_mega_moe_impl(void* y,
         read_topk_idx([&](const uint32_t& token_topk_idx, const int& expert_idx) {
             const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
             const auto dst_slot_idx = atomicAdd_block(shared_storage.expert_token_count + expert_idx, 1);
-            const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
-                expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
-            *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            DG_DEVICE_ASSERT(dst_slot_idx < kNumMaxTokensPerRank);
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseGin) {
+                if (gin_transport.is_same_lsa_peer(dst_rank_idx)) {
+                    const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
+                        expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+                    *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+                } else {
+                    const auto remote_owner_slot = gin_transport.remote_slot(dst_rank_idx);
+                    // As in the native layout, one token may assign a given
+                    // expert at most once. Duplicate expert IDs are invalid.
+                    DG_DEVICE_ASSERT(
+                        dst_slot_idx < GinWorkspace::kMaxActiveTokens);
+                    *gin_workspace.get_staged_expert_assignment_ptr(
+                        remote_owner_slot, expert_idx % kNumExpertsPerRank, dst_slot_idx) = token_topk_idx;
+                }
+            } else
+#endif
+            {
+                const auto dst_ptr = workspace.get_src_token_topk_idx_ptr(
+                    expert_idx % kNumExpertsPerRank, sym_buffer.rank_idx, dst_slot_idx);
+                *sym_buffer.map(dst_ptr, dst_rank_idx) = token_topk_idx;
+            }
         });
 
         // Grid sync
@@ -348,8 +405,17 @@ sm100_bf16_mega_moe_impl(void* y,
         if (sm_idx == 0) {
             // Push this launch's grid index to every peer for tagging combine readiness; +1 differs from a zeroed workspace
             DG_STATIC_ASSERT(kNumRanks <= kNumDispatchThreads, "Insufficient threads for the grid index push");
-            if (thread_idx < kNumRanks)
-                *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+            if (thread_idx < kNumRanks) {
+#ifdef DG_MEGAMOE_GIN
+                if constexpr (kUseGin) {
+                    if (gin_transport.is_same_lsa_peer(thread_idx))
+                        *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+                } else
+#endif
+                {
+                    *sym_buffer.map(workspace.get_peer_grid_idx_ptr(sym_buffer.rank_idx), thread_idx) = ptx::get_grid_idx() + 1;
+                }
+            }
             __syncwarp();
 
             #pragma unroll
@@ -357,27 +423,161 @@ sm100_bf16_mega_moe_impl(void* y,
                 const auto dst_rank_idx = i / kNumExpertsPerRank;
                 const auto dst_local_expert_idx = i % kNumExpertsPerRank;
                 const auto expert_status = *workspace.get_expert_send_count_ptr(i);
-                *sym_buffer.map(
-                    workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
-                    dst_rank_idx) = expert_status & 0xffffffff;
-                ptx::atomic_add_sys(
-                    sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
-                    expert_status);
+#ifdef DG_MEGAMOE_GIN
+                if constexpr (kUseGin) {
+                    if (gin_transport.is_same_lsa_peer(dst_rank_idx)) {
+                        *sym_buffer.map(
+                            workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                            dst_rank_idx) = expert_status & 0xffffffff;
+                    }
+                } else
+#endif
+                {
+                    *sym_buffer.map(
+                        workspace.get_expert_recv_count_ptr(sym_buffer.rank_idx, dst_local_expert_idx),
+                        dst_rank_idx) = expert_status & 0xffffffff;
+                    ptx::atomic_add_sys(
+                        sym_buffer.map(workspace.get_expert_recv_count_sum_ptr(dst_local_expert_idx), dst_rank_idx),
+                        expert_status);
+                }
             }
         }
         ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
 
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseGin) {
+            // Each SM0 dispatch warp owns a strided set of cross-LSA destinations.
+            // Publish compact scheduling control before the chained-SoA
+            // payload. Both publications stay in one ordered peer queue, but
+            // local completion is deferred until after this CTA's pull work.
+            if (sm_idx == 0 and lane_idx == 0) {
+                for (uint32_t remote_owner_slot = warp_idx;
+                     remote_owner_slot < GinWorkspace::kNumRemotePeers;
+                     remote_owner_slot += kNumDispatchWarps) {
+                    comm::mega_moe_gin_pack_dispatch(
+                        gin_transport, gin_workspace, buffer,
+                        remote_owner_slot, num_tokens);
+                }
+            }
+
+            if (sm_idx == 0 and warp_idx == 0 and lane_idx == 0) {
+                auto* epoch = gin_workspace.get_dispatch_epoch_ptr();
+                DG_DEVICE_ASSERT(*epoch < static_cast<uint64_t>(-1));
+                *epoch += 1;
+                __threadfence();
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+        }
+#endif
+
         // Barrier before pulling
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
-            /* After the NVLink barrier, there is a grid sync */ true
-        );
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseGin) {
+            // Publish all direct same-LSA assignment/count stores before the
+            // local-domain rendezvous observes them on peer GPUs.
+            __threadfence_system();
+            comm::nvlink_barrier<
+                kNumRanks, kNumSMs, kNumDispatchThreads,
+                kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag,
+                kGinLsaSize>(
+                    workspace, sym_buffer, sm_idx, thread_idx,
+                    [=]() {
+                        ptx::sync_aligned(
+                            kNumDispatchThreads, kDispatchBarrierIdx);
+                    },
+                    /* Include count/control writers from SM0 */ true,
+                    /* Publish same-LSA counts before remote unpack */ true);
+
+            // Four warps acquire and restore all cross-LSA source packets.
+            // The scheduler and pull loop continue to consume the native
+            // per-source/per-expert representation unchanged.
+            if (sm_idx == 0) {
+                for (uint32_t remote_source_slot = warp_idx;
+                     remote_source_slot < GinWorkspace::kNumRemotePeers;
+                     remote_source_slot += kNumDispatchWarps) {
+                    comm::mega_moe_gin_unpack_dispatch(
+                        gin_transport, gin_workspace, workspace,
+                        remote_source_slot, lane_idx);
+                }
+            }
+            ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx);
+
+            if (sm_idx == 0) {
+                for (uint32_t local_expert = thread_idx;
+                     local_expert < kNumExpertsPerRank;
+                     local_expert += kNumDispatchThreads) {
+                    uint32_t total = 0;
+                    #pragma unroll
+                    for (uint32_t source_rank = 0;
+                         source_rank < kNumRanks; ++source_rank) {
+                        total += static_cast<uint32_t>(
+                            *workspace.get_expert_recv_count_ptr(
+                                source_rank, local_expert));
+                    }
+                    // A different allocation alias may have used this tail.
+                    // Reset before the release which makes this expert runnable.
+                    *gin_workspace.get_combine_expert_completion_ptr(
+                        local_expert) = 0;
+                    const uint64_t tagged =
+                        (static_cast<uint64_t>(kNumSMs * kNumRanks) << 32) |
+                        total;
+                    auto* total_ptr =
+                        workspace.get_expert_recv_count_sum_ptr(local_expert);
+                    asm volatile("st.release.gpu.global.u64 [%0], %1;"
+                                 :: "l"(total_ptr), "l"(tagged) : "memory");
+                }
+            }
+            comm::grid_sync<kNumSMs, kDispatchGridSyncIndex>(
+                workspace, sm_idx, thread_idx,
+                [=]() {
+                    ptx::sync_aligned(
+                        kNumDispatchThreads, kDispatchBarrierIdx);
+                });
+        } else
+#endif
+        {
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kBeforeDispatchPullBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* After the grid sync above, there is no more writes by other SMs (except 0) */ false,
+                /* After the NVLink barrier, there is a grid sync */ true
+            );
+        }
 
         // Ensure the epilogue barrier cannot run with the pull barrier
         ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseGin) {
+            // Control has made the scheduler runnable. After releasing the
+            // dispatch/epilogue phase barrier, only SM0 waits for the cross-LSA
+            // payload terminals. Every other CTA can begin useful pull work
+            // and waits on a cheap device-local bridge only when it first
+            // encounters that remote source.
+            if (sm_idx == 0) {
+                for (uint32_t remote_source_slot = warp_idx;
+                     remote_source_slot < GinWorkspace::kNumRemotePeers;
+                     remote_source_slot += kNumDispatchWarps) {
+                    if (lane_idx == 0) {
+                        const uint64_t expected_epoch =
+                            *gin_workspace.get_dispatch_epoch_ptr();
+                        comm::mega_moe_gin_wait_dispatch(
+                            gin_transport,
+                            gin_workspace.get_dispatch_receive_payload_epoch_ptr(
+                                remote_source_slot),
+                            expected_epoch);
+                        ptx::st_rel(
+                            gin_workspace
+                                .get_dispatch_payload_acquired_epoch_ptr(
+                                    remote_source_slot),
+                            expected_epoch);
+                    }
+                    __syncwarp();
+                }
+            }
+        }
+#endif
 
         // Pull token data and SF from remote ranks into local L1 buffer
         uint32_t pull_mbarrier_phase = 0;
@@ -390,6 +590,13 @@ sm100_bf16_mega_moe_impl(void* y,
         uint32_t stored_rank_count[kNumRanksPerLane] = {};
         uint32_t expert_start_idx = 0, expert_end_idx = 0;
         uint32_t expert_pool_block_offset = 0;
+
+#ifdef DG_MEGAMOE_GIN
+        // Cache payload visibility per remote source for this pull warp. The
+        // source mirrors are immutable until the end-of-launch cleanup.
+        uint32_t gin_payload_acquired_source_mask[
+            math::constexpr_ceil_div(kNumRanks, 32u)] = {};
+#endif
 
         // Wait token data arrival
         scheduler.fetch_expert_recv_count();
@@ -499,8 +706,61 @@ sm100_bf16_mega_moe_impl(void* y,
                 while (ptx::ld_acq(empty_ptr) < l1_empty_count_target);
             }
 
-            const auto src_base_ptr = sym_buffer.map(
-                buffer.input_token_buffer.get_data_buffer(src_token_idx).get_base_ptr(), current_rank_in_expert_idx);
+            void* src_base_ptr;
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseGin) {
+                if (not gin_transport.is_same_lsa_peer(
+                        current_rank_in_expert_idx)) {
+                    const uint32_t remote_source_slot =
+                        gin_transport.remote_slot(current_rank_in_expert_idx);
+                    const uint32_t source_bit = 1u << (remote_source_slot % 32);
+                    auto& acquired_mask = gin_payload_acquired_source_mask[
+                        remote_source_slot / 32];
+                    if ((acquired_mask & source_bit) == 0) {
+                        if (cute::elect_one_sync()) {
+                            const uint64_t expected_epoch =
+                                *gin_workspace.get_dispatch_epoch_ptr();
+                            const auto* acquired_epoch = gin_workspace
+                                .get_dispatch_payload_acquired_epoch_ptr(
+                                    remote_source_slot);
+                            comm::wait_until(
+                                [&]() {
+                                    return ptx::ld_acq_gpu(acquired_epoch) ==
+                                           expected_epoch;
+                                },
+                                [&]() {
+                                    printf(
+                                        "DeepGEMM GIN payload bridge timeout: rank=%u, source_slot=%u, expected=%llu, current=%llu\n",
+                                        sym_buffer.rank_idx,
+                                        remote_source_slot,
+                                        static_cast<unsigned long long>(
+                                            expected_epoch),
+                                        static_cast<unsigned long long>(
+                                            ptx::ld_acq_gpu(
+                                                acquired_epoch)));
+                                });
+                        }
+                        __syncwarp();
+                        acquired_mask |= source_bit;
+                    }
+                }
+                src_base_ptr = gin_transport.is_same_lsa_peer(
+                    current_rank_in_expert_idx) ?
+                    sym_buffer.map(
+                        buffer.input_token_buffer
+                            .get_data_buffer(src_token_idx).get_base_ptr(),
+                        current_rank_in_expert_idx) :
+                    gin_workspace.get_remote_input_activation_ptr(
+                        gin_transport.remote_slot(current_rank_in_expert_idx),
+                        src_token_idx);
+            } else
+#endif
+            {
+                src_base_ptr = sym_buffer.map(
+                    buffer.input_token_buffer
+                        .get_data_buffer(src_token_idx).get_base_ptr(),
+                    current_rank_in_expert_idx);
+            }
             const auto dst_base_ptr = buffer.l1_token_buffer.get_data_buffer(pool_token_idx % kNumRingTokens).get_base_ptr();
             const auto issue_and_wait_pull_store = [&](const uint32_t& i) {
                 ptx::mbarrier_wait_and_flip_phase(pull_mbarrier, pull_mbarrier_phase);
@@ -512,9 +772,29 @@ sm100_bf16_mega_moe_impl(void* y,
                 ptx::tma_store_wait<0>();
             };
             // Load the weight first, so that its remote latency overlaps with the token pull below
-            const auto weight = *sym_buffer.map(
-                buffer.input_topk_weights_buffer.get_base_ptr<float>() + src_token_topk_idx,
-                current_rank_in_expert_idx);
+            const float* weight_ptr;
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseGin) {
+                weight_ptr = gin_transport.is_same_lsa_peer(
+                    current_rank_in_expert_idx) ?
+                    sym_buffer.map(
+                        buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                            src_token_topk_idx,
+                        current_rank_in_expert_idx) :
+                    static_cast<const float*>(
+                        gin_workspace.get_remote_topk_weight_ptr(
+                            gin_transport.remote_slot(current_rank_in_expert_idx),
+                            src_token_idx)) + src_topk_idx;
+            } else
+#endif
+            {
+                weight_ptr = sym_buffer.map(
+                    buffer.input_topk_weights_buffer.get_base_ptr<float>() +
+                        src_token_topk_idx,
+                    current_rank_in_expert_idx);
+            }
+            const auto weight = *weight_ptr;
+
             if (cute::elect_one_sync()) {
                 #pragma unroll
                 for (uint32_t i = 0; i < kNumChunks; ++ i) {
@@ -537,6 +817,25 @@ sm100_bf16_mega_moe_impl(void* y,
                 *workspace.get_token_src_metadata_ptr(pool_token_idx) =
                     {current_rank_in_expert_idx, src_token_idx, src_topk_idx};
 
+#ifdef DG_MEGAMOE_GIN
+                if constexpr (kUseGin) {
+                    if (not gin_transport.is_same_lsa_peer(
+                            current_rank_in_expert_idx)) {
+                        const uint32_t remote_source_slot =
+                            gin_transport.remote_slot(current_rank_in_expert_idx);
+                        const uint32_t record_ordinal =
+                            *gin_workspace.get_combine_record_prefix_ptr(
+                                remote_source_slot, current_expert_idx) +
+                            token_idx_in_rank;
+                        DG_DEVICE_ASSERT(
+                            record_ordinal <
+                            GinWorkspace::kMaxExpertAssignments);
+                        *gin_workspace.get_combine_return_ordinal_ptr(
+                            pool_token_idx) = record_ordinal;
+                    }
+                }
+#endif
+
                 // Wait for token TMA store to complete
                 issue_and_wait_pull_store(kNumChunks - 1);
                 const bool is_last_token = (token_idx == expert_end_idx - 1);
@@ -547,6 +846,35 @@ sm100_bf16_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseGin) {
+            // Retire each outbound control+payload queue only after useful
+            // dispatch work has had a chance to cover its completion latency.
+            // The dedicated combine context permits these waits to run
+            // without sharing a QP with the epilogue's traffic.
+            if (sm_idx == 0 and lane_idx == 0) {
+                for (uint32_t remote_owner_slot = warp_idx;
+                     remote_owner_slot < GinWorkspace::kNumRemotePeers;
+                     remote_owner_slot += kNumDispatchWarps)
+                    comm::mega_moe_gin_flush_wait_dispatch_peer(
+                        gin_transport, remote_owner_slot);
+            }
+            __syncwarp();
+        }
+#endif
+
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseGin) {
+            // Reuse one dispatch warp after its pulls to make progress while
+            // the persistent epilogue warps still compute other experts. Each
+            // active lane owns one source peer in the remote LSA teams.
+            if (sm_idx == 0 and warp_idx == 0) {
+                comm::mega_moe_gin_drain_combine<BLOCK_M, BLOCK_N>(
+                    gin_transport, gin_workspace, workspace, lane_idx);
+            }
+        }
+#endif
 
         // Clean workspace for the next usage, and also do cumulative stats
         // NOTES: it is overlapped with combine reduction epilogue
@@ -608,14 +936,33 @@ sm100_bf16_mega_moe_impl(void* y,
             }
         }
 
-        // Wait for all ranks to finish cleaning
-        comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
-                             kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
-            workspace, sym_buffer, sm_idx, thread_idx,
-            [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
-            /* Before the NVLink barrier, there is a grid sync */ true,
-            /* At the end of kernel does not need to sync */ false
-        );
+        // Wait for the peers that share mapped symmetric memory to finish
+        // cleaning. Cross-LSA packet lifetime is retired by the GIN cleanup
+        // rendezvous after combine has consumed every receive slab.
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseGin) {
+            comm::nvlink_barrier<
+                kNumRanks, kNumSMs, kNumDispatchThreads,
+                kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag,
+                kGinLsaSize>(
+                    workspace, sym_buffer, sm_idx, thread_idx,
+                    [=]() {
+                        ptx::sync_aligned(
+                            kNumDispatchThreads, kDispatchBarrierIdx);
+                    },
+                    /* Before the LSA barrier, there is a grid sync */ true,
+                    /* At the end of dispatch does not need to sync */ false);
+        } else
+#endif
+        {
+            comm::nvlink_barrier<kNumRanks, kNumSMs, kNumDispatchThreads,
+                                 kDispatchGridSyncIndex, kAfterWorkspaceCleanBarrierTag>(
+                workspace, sym_buffer, sm_idx, thread_idx,
+                [=]() { ptx::sync_aligned(kNumDispatchThreads, kDispatchBarrierIdx); },
+                /* Before the NVLink barrier, there is a grid sync */ true,
+                /* At the end of kernel does not need to sync */ false
+            );
+        }
     } else if (warp_idx == kNumDispatchWarps) {
         // Adjust registers
         cutlass::arch::warpgroup_reg_dealloc<kNumNonEpilogueRegisters>();
@@ -1120,18 +1467,86 @@ sm100_bf16_mega_moe_impl(void* y,
                             (bank_group_idx ^ row_in_atom) * (kNumBankGroupBytes / sizeof(d_dtype_t));
                         const auto packed = ptx::ld_shared(reinterpret_cast<float4*>(smem_ptr));
 
-                        // Write into remote
-                        const auto dst_token = buffer.combine_token_buffer.get_rank_buffer(dst_topk_idx)
-                                               .get_data_buffer(dst_token_idx);
-                        const auto dst_ptr = math::advance_ptr<float4>(
-                            dst_token.get_base_ptr(),
-                            n_idx * static_cast<uint32_t>(sizeof(nv_bfloat16)) + (lane_idx % 16) * static_cast<uint32_t>(sizeof(float4)));
-                        *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        // Same-LSA results retain the native mapped store. A
+                        // cross-LSA result is written into its deterministic
+                        // source packet record and published after all L2 tiles
+                        // have completed.
+#ifdef DG_MEGAMOE_GIN
+                        if constexpr (kUseGin) {
+                            if (not gin_transport.is_same_lsa_peer(
+                                    dst_rank_idx)) {
+                                const uint32_t remote_source_slot =
+                                    gin_transport.remote_slot(dst_rank_idx);
+                                const uint32_t record_ordinal =
+                                    *gin_workspace
+                                         .get_combine_return_ordinal_ptr(
+                                             pool_m_idx + m_idx_in_block);
+                                DG_DEVICE_ASSERT(
+                                    record_ordinal <
+                                    GinWorkspace::kMaxExpertAssignments);
+                                auto* dst_ptr = math::advance_ptr<float4>(
+                                    gin_workspace
+                                        .get_combine_send_record_ptr(
+                                            remote_source_slot,
+                                            record_ordinal),
+                                    n_idx * static_cast<uint32_t>(
+                                                sizeof(nv_bfloat16)) +
+                                        (lane_idx % 16) *
+                                            static_cast<uint32_t>(
+                                                sizeof(float4)));
+                                *dst_ptr = packed;
+                            } else {
+                                const auto dst_token =
+                                    buffer.combine_token_buffer
+                                        .get_rank_buffer(dst_topk_idx)
+                                        .get_data_buffer(dst_token_idx);
+                                const auto dst_ptr = math::advance_ptr<float4>(
+                                    dst_token.get_base_ptr(),
+                                    n_idx * static_cast<uint32_t>(
+                                                sizeof(nv_bfloat16)) +
+                                        (lane_idx % 16) *
+                                            static_cast<uint32_t>(
+                                                sizeof(float4)));
+                                *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                            }
+                        } else
+#endif
+                        {
+                            const auto dst_token = buffer.combine_token_buffer
+                                .get_rank_buffer(dst_topk_idx)
+                                .get_data_buffer(dst_token_idx);
+                            const auto dst_ptr = math::advance_ptr<float4>(
+                                dst_token.get_base_ptr(),
+                                n_idx * static_cast<uint32_t>(
+                                            sizeof(nv_bfloat16)) +
+                                    (lane_idx % 16) *
+                                        static_cast<uint32_t>(sizeof(float4)));
+                            *sym_buffer.map(dst_ptr, dst_rank_idx) = packed;
+                        }
                     }
                 }
 
-                // Ensure the next epilogue safe to use shared memory
-                ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                // Ensure the next epilogue is safe to reuse shared memory. In
+                // the GIN specialization, the same CTA-wide barrier orders all
+                // record stores before one release increment for this expert's
+                // completed N fragment.
+#ifdef DG_MEGAMOE_GIN
+                if constexpr (kUseGin) {
+                    comm::mega_moe_gin_combine_producer_barrier(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                    if (not task_info.is_shared() and
+                        epilogue_warp_idx == 0 and cute::elect_one_sync()) {
+                        comm::mega_moe_gin_combine_completion_release(
+                            gin_workspace.get_combine_expert_completion_ptr(
+                                task_info.local_expert_idx));
+                    }
+                    __syncwarp();
+                } else
+#endif
+                {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                }
             }
         }
 
@@ -1181,11 +1596,31 @@ sm100_bf16_mega_moe_impl(void* y,
         uint32_t combine_phase = 0;
         uint32_t load_stage_idx = 0;
 
+        const auto grid_idx = ptx::get_grid_idx() + 1;
+
         // Peers' grid indices for tagging their combine readiness; the load overlaps with the grid sync
         DG_STATIC_ASSERT(kNumRanks <= kNumEpilogueThreads, "Insufficient threads for combine readiness");
         uint64_t peer_grid_idx = 0;
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            peer_grid_idx = *workspace.get_peer_grid_idx_ptr(epilogue_thread_idx);
+        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseGin) {
+                if (gin_transport.is_same_lsa_peer(epilogue_thread_idx))
+                    peer_grid_idx = *workspace.get_peer_grid_idx_ptr(
+                        epilogue_thread_idx);
+            } else
+#endif
+            {
+                peer_grid_idx = *workspace.get_peer_grid_idx_ptr(
+                    epilogue_thread_idx);
+            }
+        }
+
+        // Close mapped same-LSA stores and the already released packet-record
+        // stores before the final local/grid visibility handoffs.
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseGin)
+            __threadfence_system();
+#endif
 
         // All local L2 writes are done after this grid sync
         comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
@@ -1193,15 +1628,92 @@ sm100_bf16_mega_moe_impl(void* y,
             [&]() { ptx::sync_aligned(kNumEpilogueThreads, kEpilogueFullBarrierIdx); }
         );
 
-        // Notify remote ranks; ordered before the cleanup barrier by the dispatch/epilogue sync below
-        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks)
-            ptx::st_rel_sys(sym_buffer.map(workspace.get_combine_ready_grid_idx_ptr(sym_buffer.rank_idx), epilogue_thread_idx), peer_grid_idx);
+        // Notify mapped peers. Cross-LSA readiness is published locally after
+        // their received packets have been scattered below.
+        if (sm_idx == 0 and epilogue_thread_idx < kNumRanks) {
+#ifdef DG_MEGAMOE_GIN
+            if constexpr (kUseGin) {
+                if (gin_transport.is_same_lsa_peer(epilogue_thread_idx)) {
+                    ptx::st_rel_sys(
+                        sym_buffer.map(
+                            workspace.get_combine_ready_grid_idx_ptr(
+                                sym_buffer.rank_idx),
+                            epilogue_thread_idx),
+                        peer_grid_idx);
+                }
+            } else
+#endif
+            {
+                ptx::st_rel_sys(
+                    sym_buffer.map(
+                        workspace.get_combine_ready_grid_idx_ptr(
+                            sym_buffer.rank_idx),
+                        epilogue_thread_idx),
+                    peer_grid_idx);
+            }
+        }
+
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseGin) {
+            // On SM0 this local phase joins the dispatch-warp issuer after its
+            // peer queues, including their late completions, are
+            // submitted. Other CTAs wait at the following epilogue grid
+            // sync while one warp executes the existing world visibility fence.
+            ptx::sync_unaligned(
+                kNumDispatchThreads + kNumEpilogueThreads,
+                kDispatchWithEpilogueBarrierIdx);
+            if (sm_idx == 0 and epilogue_warp_idx == 0) {
+                comm::mega_moe_gin_world_put_barrier(
+                    gin_transport, kGinCombinePutBarrierIndex);
+                asm volatile("fence.proxy.async.global;" ::: "memory");
+                __threadfence_system();
+            }
+
+            // Make the converged GIN acquire visible to every local CTA before
+            // they distribute packet records into the native combine layout.
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+
+            comm::mega_moe_gin_scatter_combine<
+                kNumSMs, kNumEpilogueWarps>(
+                gin_workspace, buffer, num_tokens, sm_idx,
+                epilogue_warp_idx, lane_idx);
+            __threadfence();
+
+            // The reduction can be assigned to a different CTA, so close the
+            // scatter locally before marking cross-LSA owners ready.
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+            if (sm_idx == 0 and
+                epilogue_thread_idx <
+                    GinWorkspace::kNumRemotePeers) {
+                const uint32_t remote_owner_rank =
+                    gin_transport.remote_rank(epilogue_thread_idx);
+                ptx::st_rel(
+                    workspace.get_combine_ready_grid_idx_ptr(
+                        remote_owner_rank),
+                    grid_idx);
+            }
+        }
+#endif
 
         // Barrier with dispatch warps, so that they can do clean workspace
-        ptx::sync_unaligned(kNumDispatchThreads + kNumEpilogueThreads, kDispatchWithEpilogueBarrierIdx);
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (not kUseGin)
+#endif
+            ptx::sync_unaligned(
+                kNumDispatchThreads + kNumEpilogueThreads,
+                kDispatchWithEpilogueBarrierIdx);
 
         // Iterate over all token chunks, 1 token 1 topk latency: ~3 us
-        const auto grid_idx = ptx::get_grid_idx() + 1;
         for (uint32_t token_chunk_idx = epilogue_warp_idx * kNumSMs + sm_idx; token_chunk_idx < num_tokens * kNumChunks; token_chunk_idx += kNumSMs * kNumEpilogueWarps) {
             const uint32_t token_idx = token_chunk_idx / kNumChunks;
             const uint32_t chunk_idx = token_chunk_idx % kNumChunks;
@@ -1297,6 +1809,31 @@ sm100_bf16_mega_moe_impl(void* y,
             }
             __syncwarp();
         }
+#ifdef DG_MEGAMOE_GIN
+        if constexpr (kUseGin) {
+            // Use an explicit end-of-launch retirement point. Every
+            // rank has stopped reading both dispatch mirrors and combine
+            // receive packets before the registered slabs can be reused.
+            ptx::tma_store_wait<0>();
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+            if (sm_idx == 0 and epilogue_warp_idx == 0) {
+                comm::mega_moe_gin_world_cleanup_barrier(
+                    gin_transport, kGinCleanupBarrierIndex);
+                __threadfence_system();
+            }
+            comm::grid_sync<kNumSMs, kEpilogueGridSyncIndex>(
+                workspace, sm_idx, epilogue_thread_idx,
+                [&]() {
+                    ptx::sync_aligned(
+                        kNumEpilogueThreads, kEpilogueFullBarrierIdx);
+                });
+        }
+#endif
     }
 #else
     if (blockIdx.x == 0 and threadIdx.x == 0)

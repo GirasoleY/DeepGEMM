@@ -9,213 +9,387 @@
 
 namespace deep_gemm::layout {
 
-// This layout is intentionally a single model specialization.  Runtime token
-// capacity in the native MegaMoE allocation may be larger, but the GIN path
-// accepts at most this many active source tokens.
-static constexpr uint32_t kMegaMoEEp8GinWorldSize = 8;
-static constexpr uint32_t kMegaMoEEp8GinLsaSize = 4;
-static constexpr uint32_t kMegaMoEEp8GinNumRemotePeers = 4;
-static constexpr uint32_t kMegaMoEEp8GinNumExperts = 448;
-static constexpr uint32_t kMegaMoEEp8GinNumExpertsPerRank = 56;
-static constexpr uint32_t kMegaMoEEp8GinCombineOwnerWaves = 4;
-static constexpr uint32_t kMegaMoEEp8GinExpertsPerOwnerWave =
-    kMegaMoEEp8GinNumExpertsPerRank / kMegaMoEEp8GinCombineOwnerWaves;
-static constexpr uint32_t kMegaMoEEp8GinTopK = 16;
-static constexpr uint32_t kMegaMoEEp8GinHidden = 3584;
-static constexpr uint32_t kMegaMoEEp8GinIntermediateHidden = 3072;
-static constexpr uint32_t kMegaMoEEp8GinMaxTokens = 48;
-static constexpr uint32_t kMegaMoEEp8GinMaxExpertAssignments =
-    kMegaMoEEp8GinMaxTokens * kMegaMoEEp8GinTopK;
-static constexpr uint32_t kMegaMoEEp8GinMaxPoolTokens =
-    get_num_max_pool_tokens<uint32_t>(
-        kMegaMoEEp8GinWorldSize,
-        kMegaMoEEp8GinMaxTokens,
-        kMegaMoEEp8GinTopK,
-        kMegaMoEEp8GinNumExpertsPerRank);
-static constexpr uint32_t kMegaMoEEp8GinAlignment = 128;
+// Defaults preserve the original EP8/two-LSA4 specialization. Model geometry,
+// dtype, world size and the contiguous LSA partition are specialization inputs.
+static constexpr uint32_t kMegaMoEGinCombineOwnerWaves = 4;
+static constexpr uint32_t kMegaMoEGinAlignment = 128;
+static constexpr uint32_t kMegaMoEGinDispatchReadyBytes = 16;
 
-static constexpr uint32_t kMegaMoEEp8GinInputActivationBytes =
-    kMegaMoEEp8GinHidden;
-static constexpr uint32_t kMegaMoEEp8GinInputScaleBytes =
-    kMegaMoEEp8GinHidden / 32;
-static constexpr uint32_t kMegaMoEEp8GinTopKWeightBytes =
-    kMegaMoEEp8GinTopK * sizeof(float);
-static constexpr uint32_t kMegaMoEEp8GinOutputActivationBytes =
-    kMegaMoEEp8GinHidden * sizeof(uint16_t);
+// One constexpr calculator is shared by runtime allocation sizing and the
+// compile-time workspace specialization. Every storage boundary is aligned
+// explicitly so arbitrary supported geometries do not rely on the default
+// model's coincidental divisibility.
+struct MegaMoeGinLayout {
+    uint32_t num_experts_per_rank;
+    uint32_t num_topk;
+    uint32_t hidden;
+    uint32_t max_active_tokens;
+    uint32_t world_size;
+    uint32_t lsa_size;
+    bool with_sf;
 
-// A dispatch packet's first 16 bytes are reserved for the cumulative remote
-// ready epoch. The send packet retains its first uint32_t as the matching
-// combine-record count through end-of-launch cleanup; no NIC signals it.
-static constexpr uint32_t kMegaMoEEp8GinDispatchReadyBytes = 16;
-static constexpr uint32_t kMegaMoEEp8GinDispatchExpertCountBytes =
-    kMegaMoEEp8GinNumExpertsPerRank * sizeof(uint32_t);
-static constexpr uint32_t kMegaMoEEp8GinDispatchExpertAssignmentBytes =
-    kMegaMoEEp8GinMaxExpertAssignments * sizeof(uint32_t);
-static constexpr uint32_t kMegaMoEEp8GinDispatchPacketDataBytes =
-    kMegaMoEEp8GinDispatchReadyBytes +
-    kMegaMoEEp8GinDispatchExpertCountBytes +
-    kMegaMoEEp8GinDispatchExpertAssignmentBytes;
-static constexpr uint32_t kMegaMoEEp8GinDispatchPacketBytes =
-    math::constexpr_align(
-        kMegaMoEEp8GinDispatchPacketDataBytes,
-        kMegaMoEEp8GinAlignment);
+    CUTLASS_HOST_DEVICE constexpr MegaMoeGinLayout(
+            const uint32_t num_experts_per_rank,
+            const uint32_t num_topk,
+            const uint32_t hidden,
+            const uint32_t max_active_tokens,
+            const uint32_t world_size = 8,
+            const uint32_t lsa_size = 4,
+            const bool with_sf = true)
+        : num_experts_per_rank(num_experts_per_rank),
+          num_topk(num_topk),
+          hidden(hidden),
+          max_active_tokens(max_active_tokens),
+          world_size(world_size), lsa_size(lsa_size), with_sf(with_sf) {}
 
-// Return records retain the expert-major ordinal of the dispatch assignment.
-// The source therefore derives both the record count and its flattened
-// token/top-k destination from its immutable dispatch-send packet.
-static constexpr uint32_t kMegaMoEEp8GinCombineRecordBytes =
-    math::constexpr_align(
-        kMegaMoEEp8GinOutputActivationBytes,
-        kMegaMoEEp8GinAlignment);
-static constexpr uint32_t kMegaMoEEp8GinCombinePacketBytes =
-    kMegaMoEEp8GinMaxExpertAssignments *
-        kMegaMoEEp8GinCombineRecordBytes;
+    CUTLASS_HOST_DEVICE constexpr uint32_t num_remote_peers() const {
+        return world_size - lsa_size;
+    }
 
-static_assert(kMegaMoEEp8GinWorldSize == 2 * kMegaMoEEp8GinLsaSize);
-static_assert(kMegaMoEEp8GinNumRemotePeers == kMegaMoEEp8GinLsaSize);
-static_assert(kMegaMoEEp8GinNumExperts ==
-              kMegaMoEEp8GinWorldSize *
-                  kMegaMoEEp8GinNumExpertsPerRank);
-static_assert(
-    kMegaMoEEp8GinNumExpertsPerRank %
-        kMegaMoEEp8GinCombineOwnerWaves == 0);
-static_assert(kMegaMoEEp8GinExpertsPerOwnerWave == 14);
-static_assert(kMegaMoEEp8GinDispatchPacketBytes == 3328);
-static_assert(kMegaMoEEp8GinCombineRecordBytes == 7168);
-static_assert(kMegaMoEEp8GinCombinePacketBytes == 5505024);
-static_assert(kMegaMoEEp8GinMaxPoolTokens == 21120);
+    // This footer is located at the end of the underlying allocation, not the
+    // shape-dependent tail. Aliases retain the same cumulative NIC counters.
+    CUTLASS_HOST_DEVICE constexpr uint64_t persistent_bytes() const {
+        return align((1ull + 2ull * num_remote_peers()) * sizeof(uint64_t));
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t align(const uint64_t bytes) const {
+        return math::constexpr_align(
+            bytes, static_cast<uint64_t>(kMegaMoEGinAlignment));
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t max_expert_assignments() const {
+        // A source token can select a local expert at most once. Therefore one
+        // peer packet needs at most min(top-k, experts-per-rank) assignments
+        // per active source token.
+        return static_cast<uint64_t>(max_active_tokens) *
+               math::constexpr_min(
+                   static_cast<uint64_t>(num_topk),
+                   static_cast<uint64_t>(num_experts_per_rank));
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t max_pool_tokens() const {
+        return get_num_max_pool_tokens<uint64_t>(
+            world_size,
+            max_active_tokens,
+            num_topk,
+            num_experts_per_rank);
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t input_activation_bytes() const {
+        return static_cast<uint64_t>(hidden) * (with_sf ? 1u : 2u);
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t input_scale_bytes() const {
+        return with_sf ? hidden / 32 : 0;
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t topk_weight_bytes() const {
+        return static_cast<uint64_t>(num_topk) * sizeof(float);
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t output_activation_bytes() const {
+        return static_cast<uint64_t>(hidden) * sizeof(uint16_t);
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t dispatch_expert_count_bytes() const {
+        return static_cast<uint64_t>(num_experts_per_rank) *
+               sizeof(uint32_t);
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t
+    dispatch_expert_assignment_bytes() const {
+        return max_expert_assignments() * sizeof(uint32_t);
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t dispatch_packet_bytes() const {
+        return align(
+            kMegaMoEGinDispatchReadyBytes +
+            dispatch_expert_count_bytes() +
+            dispatch_expert_assignment_bytes());
+    }
+
+    // Return records retain the expert-major ordinal of the dispatch
+    // assignment. The source derives both the record count and flattened
+    // token/top-k destination from its immutable dispatch-send packet.
+    CUTLASS_HOST_DEVICE constexpr uint64_t combine_record_bytes() const {
+        return align(output_activation_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t combine_packet_bytes() const {
+        return max_expert_assignments() * combine_record_bytes();
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t control_bytes() const {
+        return align(16ull + num_remote_peers() * sizeof(uint64_t));
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t staged_expert_assignment_offset() const {
+        return control_bytes();
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t staged_expert_assignment_bytes() const {
+        return static_cast<uint64_t>(num_remote_peers()) *
+               num_experts_per_rank * max_active_tokens * sizeof(uint32_t);
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t dispatch_packet_offset() const {
+        return align(staged_expert_assignment_offset() +
+                     staged_expert_assignment_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t dispatch_packet_storage_bytes() const {
+        return 2ull * num_remote_peers() * dispatch_packet_bytes();
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t remote_input_activation_offset() const {
+        return align(dispatch_packet_offset() +
+                     dispatch_packet_storage_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t remote_input_activation_storage_bytes() const {
+        return static_cast<uint64_t>(num_remote_peers()) *
+               max_active_tokens * input_activation_bytes();
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t remote_input_scale_offset() const {
+        return align(remote_input_activation_offset() +
+                     remote_input_activation_storage_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t remote_input_scale_storage_bytes() const {
+        return static_cast<uint64_t>(num_remote_peers()) *
+               max_active_tokens * input_scale_bytes();
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t remote_topk_weight_offset() const {
+        return align(remote_input_scale_offset() +
+                     remote_input_scale_storage_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t remote_topk_weight_storage_bytes() const {
+        return static_cast<uint64_t>(num_remote_peers()) *
+               max_active_tokens * topk_weight_bytes();
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t combine_record_prefix_offset() const {
+        return align(remote_topk_weight_offset() +
+                     remote_topk_weight_storage_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t combine_record_prefix_bytes() const {
+        return static_cast<uint64_t>(num_remote_peers()) *
+               num_experts_per_rank * sizeof(uint32_t);
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t combine_packet_offset() const {
+        return align(combine_record_prefix_offset() +
+                     combine_record_prefix_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t combine_packet_storage_bytes() const {
+        return 2ull * num_remote_peers() * combine_packet_bytes();
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t combine_return_ordinal_offset() const {
+        return align(combine_packet_offset() +
+                     combine_packet_storage_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t combine_return_ordinal_bytes() const {
+        return max_pool_tokens() * sizeof(uint32_t);
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t
+    combine_expert_completion_offset() const {
+        return align(combine_return_ordinal_offset() +
+                     combine_return_ordinal_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t
+    combine_expert_completion_bytes() const {
+        return align(
+            static_cast<uint64_t>(num_experts_per_rank) * sizeof(uint32_t));
+    }
+
+    CUTLASS_HOST_DEVICE constexpr uint64_t num_bytes() const {
+        return align(combine_expert_completion_offset() +
+                     combine_expert_completion_bytes());
+    }
+
+    CUTLASS_HOST_DEVICE constexpr bool is_valid() const {
+        constexpr uint64_t kMaxUint32 =
+            static_cast<uint64_t>(~static_cast<uint32_t>(0));
+        return world_size > 0 and world_size <= kNumMaxRanks and
+               lsa_size > 0 and lsa_size <= world_size and
+               world_size % lsa_size == 0 and
+               num_experts_per_rank > 0 and num_topk > 0 and hidden > 0 and
+               hidden % 32 == 0 and max_active_tokens > 0 and
+               max_expert_assignments() <= kMaxUint32 and
+               max_pool_tokens() <= kMaxUint32;
+    }
+};
 
 // Registered transport storage appended after an unmodified MegaMoEBuffer.
-// Persistent NIC-updated epochs are initialized once with the allocation and
-// are never reset between launches.  All other arrays are ordinary per-launch
-// scratch owned by a serialized stream.
-struct MegaMoeEp8GinWorkspace {
+// Persistent NIC-updated epochs live in a separate allocation footer so every
+// geometry alias shares their addresses. The tail contains per-launch scratch
+// owned by serialized launches across all aliases.
+template <uint32_t kNumExpertsPerRank_,
+          uint32_t kNumTopK_,
+          uint32_t kHidden_,
+          uint32_t kMaxActiveTokens_,
+          uint32_t kWorldSize_ = 8,
+          uint32_t kLsaSize_ = 4,
+          bool kWithSf_ = true>
+struct MegaMoeGinWorkspaceT {
     void* base = nullptr;
+    void* persistent = nullptr;
 
-    static constexpr uint64_t kDispatchEpochOffset = 0;
+    static constexpr uint32_t kWorldSize = kWorldSize_;
+    static constexpr uint32_t kLsaSize = kLsaSize_;
+    static constexpr uint32_t kNumRemotePeers = kWorldSize - kLsaSize;
+    static constexpr bool kWithSf = kWithSf_;
+    static constexpr uint32_t kNumExpertsPerRank = kNumExpertsPerRank_;
+    static constexpr uint32_t kNumTopK = kNumTopK_;
+    static constexpr uint32_t kHidden = kHidden_;
+    static constexpr uint32_t kMaxActiveTokens = kMaxActiveTokens_;
+    inline static constexpr MegaMoeGinLayout kLayout{
+        kNumExpertsPerRank, kNumTopK, kHidden, kMaxActiveTokens,
+        kWorldSize, kLsaSize, kWithSf};
+
+    static_assert(kLayout.is_valid(), "Invalid GIN workspace geometry");
+    static constexpr uint32_t kMaxExpertAssignments =
+        static_cast<uint32_t>(kLayout.max_expert_assignments());
+    static constexpr uint32_t kMaxPoolTokens =
+        static_cast<uint32_t>(kLayout.max_pool_tokens());
+    static constexpr uint64_t kInputActivationBytes =
+        kLayout.input_activation_bytes();
+    static constexpr uint64_t kInputScaleBytes =
+        kLayout.input_scale_bytes();
+    static constexpr uint64_t kTopKWeightBytes =
+        kLayout.topk_weight_bytes();
+    static constexpr uint64_t kOutputActivationBytes =
+        kLayout.output_activation_bytes();
+    static constexpr uint64_t kDispatchReadyBytes =
+        kMegaMoEGinDispatchReadyBytes;
+    static constexpr uint64_t kDispatchExpertCountBytes =
+        kLayout.dispatch_expert_count_bytes();
+    static constexpr uint64_t kDispatchExpertAssignmentBytes =
+        kLayout.dispatch_expert_assignment_bytes();
+    static constexpr uint64_t kDispatchPacketBytes =
+        kLayout.dispatch_packet_bytes();
+    static constexpr uint64_t kCombineRecordBytes =
+        kLayout.combine_record_bytes();
+    static constexpr uint64_t kCombinePacketBytes =
+        kLayout.combine_packet_bytes();
+
     // A designated local waiter acquires each source's payload StrongVA
     // terminal once, then publishes that generation here for all pull CTAs.
     // These bridge words are local-only: the NIC never reads or writes them.
     static constexpr uint64_t kDispatchPayloadAcquiredEpochOffset = 16;
     static constexpr uint64_t kDispatchPayloadAcquiredEpochBytes =
-        static_cast<uint64_t>(kMegaMoEEp8GinNumRemotePeers) *
+        static_cast<uint64_t>(kNumRemotePeers) *
         sizeof(uint64_t);
-    static constexpr uint64_t kControlBytes = kMegaMoEEp8GinAlignment;
+    static constexpr uint64_t kControlBytes = kLayout.control_bytes();
 
-    static constexpr uint64_t kStagedExpertAssignmentOffset = kControlBytes;
+    static constexpr uint64_t kStagedExpertAssignmentOffset =
+        kLayout.staged_expert_assignment_offset();
     static constexpr uint64_t kStagedExpertAssignmentBytes =
-        static_cast<uint64_t>(kMegaMoEEp8GinNumRemotePeers) *
-        kMegaMoEEp8GinNumExpertsPerRank * kMegaMoEEp8GinMaxTokens *
-        sizeof(uint32_t);
+        kLayout.staged_expert_assignment_bytes();
 
     static constexpr uint64_t kDispatchPacketOffset =
-        kStagedExpertAssignmentOffset + kStagedExpertAssignmentBytes;
+        kLayout.dispatch_packet_offset();
     static constexpr uint64_t kDispatchPacketStorageBytes =
-        2ull * kMegaMoEEp8GinNumRemotePeers *
-        kMegaMoEEp8GinDispatchPacketBytes;
+        kLayout.dispatch_packet_storage_bytes();
 
     static constexpr uint64_t kRemoteInputActivationOffset =
-        kDispatchPacketOffset + kDispatchPacketStorageBytes;
-    static constexpr uint64_t kRemoteInputActivationBytes =
-        static_cast<uint64_t>(kMegaMoEEp8GinNumRemotePeers) *
-        kMegaMoEEp8GinMaxTokens * kMegaMoEEp8GinInputActivationBytes;
+        kLayout.remote_input_activation_offset();
+    static constexpr uint64_t kRemoteInputActivationStorageBytes =
+        kLayout.remote_input_activation_storage_bytes();
 
     static constexpr uint64_t kRemoteInputScaleOffset =
-        kRemoteInputActivationOffset + kRemoteInputActivationBytes;
+        kLayout.remote_input_scale_offset();
     static constexpr uint64_t kRemoteInputScaleStorageBytes =
-        static_cast<uint64_t>(kMegaMoEEp8GinNumRemotePeers) *
-        kMegaMoEEp8GinMaxTokens * kMegaMoEEp8GinInputScaleBytes;
+        kLayout.remote_input_scale_storage_bytes();
 
     static constexpr uint64_t kRemoteTopKWeightOffset =
-        kRemoteInputScaleOffset + kRemoteInputScaleStorageBytes;
+        kLayout.remote_topk_weight_offset();
     static constexpr uint64_t kRemoteTopKWeightStorageBytes =
-        static_cast<uint64_t>(kMegaMoEEp8GinNumRemotePeers) *
-        kMegaMoEEp8GinMaxTokens * kMegaMoEEp8GinTopKWeightBytes;
+        kLayout.remote_topk_weight_storage_bytes();
 
     static constexpr uint64_t kCombineRecordPrefixOffset =
-        kRemoteTopKWeightOffset + kRemoteTopKWeightStorageBytes;
+        kLayout.combine_record_prefix_offset();
     static constexpr uint64_t kCombineRecordPrefixBytes =
-        static_cast<uint64_t>(kMegaMoEEp8GinNumRemotePeers) *
-        kMegaMoEEp8GinNumExpertsPerRank * sizeof(uint32_t);
+        kLayout.combine_record_prefix_bytes();
 
     static constexpr uint64_t kCombinePacketOffset =
-        kCombineRecordPrefixOffset + kCombineRecordPrefixBytes;
+        kLayout.combine_packet_offset();
     static constexpr uint64_t kCombinePacketStorageBytes =
-        2ull * kMegaMoEEp8GinNumRemotePeers *
-        kMegaMoEEp8GinCombinePacketBytes;
+        kLayout.combine_packet_storage_bytes();
 
     static constexpr uint64_t kCombineReturnOrdinalOffset =
-        kCombinePacketOffset + kCombinePacketStorageBytes;
+        kLayout.combine_return_ordinal_offset();
     static constexpr uint64_t kCombineExpertCompletionOffset =
-        kCombineReturnOrdinalOffset +
-            static_cast<uint64_t>(kMegaMoEEp8GinMaxPoolTokens) *
-                sizeof(uint32_t);
+        kLayout.combine_expert_completion_offset();
     static constexpr uint64_t kCombineExpertCompletionBytes =
-        math::constexpr_align(
-            static_cast<uint64_t>(kMegaMoEEp8GinNumExpertsPerRank) *
-                sizeof(uint32_t),
-            static_cast<uint64_t>(kMegaMoEEp8GinAlignment));
-    static constexpr uint64_t kNumBytes = math::constexpr_align(
-        kCombineExpertCompletionOffset + kCombineExpertCompletionBytes,
-        static_cast<uint64_t>(kMegaMoEEp8GinAlignment));
+        kLayout.combine_expert_completion_bytes();
+    static constexpr uint64_t kNumBytes = kLayout.num_bytes();
+    static constexpr uint64_t kPersistentBytes = kLayout.persistent_bytes();
 
     static_assert(
-        kStagedExpertAssignmentOffset % kMegaMoEEp8GinAlignment == 0);
+        kStagedExpertAssignmentOffset % kMegaMoEGinAlignment == 0);
     static_assert(
         kDispatchPayloadAcquiredEpochOffset +
             kDispatchPayloadAcquiredEpochBytes <=
         kControlBytes);
-    static_assert(kDispatchPacketOffset % kMegaMoEEp8GinAlignment == 0);
+    static_assert(kDispatchPacketOffset % kMegaMoEGinAlignment == 0);
     static_assert(
-        kRemoteInputActivationOffset % kMegaMoEEp8GinAlignment == 0);
-    static_assert(kRemoteInputScaleOffset % kMegaMoEEp8GinAlignment == 0);
-    static_assert(kRemoteTopKWeightOffset % kMegaMoEEp8GinAlignment == 0);
-    static_assert(kCombineRecordPrefixOffset % kMegaMoEEp8GinAlignment == 0);
-    static_assert(kCombinePacketOffset % kMegaMoEEp8GinAlignment == 0);
-    static_assert(kCombineReturnOrdinalOffset % kMegaMoEEp8GinAlignment == 0);
+        kRemoteInputActivationOffset % kMegaMoEGinAlignment == 0);
+    static_assert(kRemoteInputScaleOffset % kMegaMoEGinAlignment == 0);
+    static_assert(kRemoteTopKWeightOffset % kMegaMoEGinAlignment == 0);
+    static_assert(kCombineRecordPrefixOffset % kMegaMoEGinAlignment == 0);
+    static_assert(kCombinePacketOffset % kMegaMoEGinAlignment == 0);
+    static_assert(kCombineReturnOrdinalOffset % kMegaMoEGinAlignment == 0);
     static_assert(
-        kCombineExpertCompletionOffset % kMegaMoEEp8GinAlignment == 0);
-    static_assert(kCombineExpertCompletionBytes == 256);
-    static_assert(kNumBytes == 44917504);
-
-    MegaMoeEp8GinWorkspace() = default;
+        kCombineExpertCompletionOffset % kMegaMoEGinAlignment == 0);
+    MegaMoeGinWorkspaceT() = default;
 
     CUTLASS_HOST_DEVICE
-    explicit MegaMoeEp8GinWorkspace(void* aligned_base): base(aligned_base) {
+    explicit MegaMoeGinWorkspaceT(void* aligned_base, void* persistent_base)
+        : base(aligned_base), persistent(persistent_base) {
         DG_UNIFIED_ASSERT(
             reinterpret_cast<uintptr_t>(base) %
-                kMegaMoEEp8GinAlignment == 0);
+                kMegaMoEGinAlignment == 0);
     }
 
     CUTLASS_HOST_DEVICE
-    static MegaMoeEp8GinWorkspace from_native(
-            const MegaMoEBuffer& native) {
+    static MegaMoeGinWorkspaceT from_native(
+            const MegaMoEBuffer& native, void* persistent_base) {
         const auto native_bytes = static_cast<uint64_t>(native.get_num_bytes());
         auto* aligned_base = math::advance_ptr(
             native.workspace.signals,
-            math::align<uint64_t>(native_bytes, kMegaMoEEp8GinAlignment));
-        return MegaMoeEp8GinWorkspace(aligned_base);
+            math::align<uint64_t>(native_bytes, kMegaMoEGinAlignment));
+        return MegaMoeGinWorkspaceT(aligned_base, persistent_base);
     }
 
     CUTLASS_HOST_DEVICE
     uint64_t* get_dispatch_epoch_ptr() const {
-        return math::advance_ptr<uint64_t>(base, kDispatchEpochOffset);
+        return static_cast<uint64_t*>(persistent);
     }
 
     CUTLASS_HOST_DEVICE
     uint64_t* get_dispatch_payload_acquired_epoch_ptr(
-            const uint32_t remote_source_lane) const {
+            const uint32_t remote_source_slot) const {
         DG_UNIFIED_ASSERT(
-            remote_source_lane < kMegaMoEEp8GinNumRemotePeers);
+            remote_source_slot < kNumRemotePeers);
         return math::advance_ptr<uint64_t>(
                    base, kDispatchPayloadAcquiredEpochOffset) +
-               remote_source_lane;
+               remote_source_slot;
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_combine_expert_completion_ptr(
             const uint32_t local_expert) const {
-        DG_UNIFIED_ASSERT(local_expert < kMegaMoEEp8GinNumExpertsPerRank);
+        DG_UNIFIED_ASSERT(local_expert < kNumExpertsPerRank);
         return math::advance_ptr<uint32_t>(
                    base, kCombineExpertCompletionOffset) +
                local_expert;
@@ -223,17 +397,17 @@ struct MegaMoeEp8GinWorkspace {
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_staged_expert_assignment_ptr(
-            const uint32_t remote_owner_lane,
+            const uint32_t remote_owner_slot,
             const uint32_t local_expert,
             const uint32_t assignment_idx = 0) const {
-        DG_UNIFIED_ASSERT(remote_owner_lane < kMegaMoEEp8GinNumRemotePeers);
-        DG_UNIFIED_ASSERT(local_expert < kMegaMoEEp8GinNumExpertsPerRank);
-        DG_UNIFIED_ASSERT(assignment_idx < kMegaMoEEp8GinMaxTokens);
+        DG_UNIFIED_ASSERT(remote_owner_slot < kNumRemotePeers);
+        DG_UNIFIED_ASSERT(local_expert < kNumExpertsPerRank);
+        DG_UNIFIED_ASSERT(assignment_idx < kMaxActiveTokens);
         const uint64_t index =
-            (static_cast<uint64_t>(remote_owner_lane) *
-                 kMegaMoEEp8GinNumExpertsPerRank +
+            (static_cast<uint64_t>(remote_owner_slot) *
+                 kNumExpertsPerRank +
              local_expert) *
-                kMegaMoEEp8GinMaxTokens +
+                kMaxActiveTokens +
             assignment_idx;
         return math::advance_ptr<uint32_t>(
                    base, kStagedExpertAssignmentOffset) +
@@ -242,119 +416,117 @@ struct MegaMoeEp8GinWorkspace {
 
     CUTLASS_HOST_DEVICE
     void* get_dispatch_send_packet_ptr(
-            const uint32_t remote_owner_lane) const {
-        return get_dispatch_packet_ptr(/*send=*/ true, remote_owner_lane);
+            const uint32_t remote_owner_slot) const {
+        return get_dispatch_packet_ptr(/*send=*/ true, remote_owner_slot);
     }
 
     CUTLASS_HOST_DEVICE
     void* get_dispatch_receive_packet_ptr(
-            const uint32_t remote_source_lane) const {
-        return get_dispatch_packet_ptr(/*send=*/ false, remote_source_lane);
+            const uint32_t remote_source_slot) const {
+        return get_dispatch_packet_ptr(/*send=*/ false, remote_source_slot);
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_dispatch_send_total_assignment_count_ptr(
-            const uint32_t remote_owner_lane) const {
+            const uint32_t remote_owner_slot) const {
         return static_cast<uint32_t*>(
-            get_dispatch_send_packet_ptr(remote_owner_lane));
+            get_dispatch_send_packet_ptr(remote_owner_slot));
     }
 
     CUTLASS_HOST_DEVICE
     uint64_t* get_dispatch_receive_control_epoch_ptr(
-            const uint32_t remote_source_lane) const {
-        return static_cast<uint64_t*>(
-            get_dispatch_receive_packet_ptr(remote_source_lane));
+            const uint32_t remote_source_slot) const {
+        DG_UNIFIED_ASSERT(remote_source_slot < kNumRemotePeers);
+        return static_cast<uint64_t*>(persistent) + 1 + remote_source_slot;
     }
 
     CUTLASS_HOST_DEVICE
     uint64_t* get_dispatch_receive_payload_epoch_ptr(
-            const uint32_t remote_source_lane) const {
+            const uint32_t remote_source_slot) const {
         static_assert(
-            kMegaMoEEp8GinDispatchReadyBytes >= 2 * sizeof(uint64_t));
-        return get_dispatch_receive_control_epoch_ptr(remote_source_lane) + 1;
+            kDispatchReadyBytes >= 2 * sizeof(uint64_t));
+        return get_dispatch_receive_control_epoch_ptr(remote_source_slot) + kNumRemotePeers;
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_dispatch_send_expert_count_ptr(
-            const uint32_t remote_owner_lane) const {
+            const uint32_t remote_owner_slot) const {
         return math::advance_ptr<uint32_t>(
-            get_dispatch_send_packet_ptr(remote_owner_lane),
-            kMegaMoEEp8GinDispatchReadyBytes);
+            get_dispatch_send_packet_ptr(remote_owner_slot),
+            kDispatchReadyBytes);
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_dispatch_receive_expert_count_ptr(
-            const uint32_t remote_source_lane) const {
+            const uint32_t remote_source_slot) const {
         return math::advance_ptr<uint32_t>(
-            get_dispatch_receive_packet_ptr(remote_source_lane),
-            kMegaMoEEp8GinDispatchReadyBytes);
+            get_dispatch_receive_packet_ptr(remote_source_slot),
+            kDispatchReadyBytes);
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_dispatch_send_expert_assignment_ptr(
-            const uint32_t remote_owner_lane,
+            const uint32_t remote_owner_slot,
             const uint32_t assignment_idx = 0) const {
         DG_UNIFIED_ASSERT(
-            assignment_idx <= kMegaMoEEp8GinMaxExpertAssignments);
+            assignment_idx <= kMaxExpertAssignments);
         return math::advance_ptr<uint32_t>(
-                   get_dispatch_send_packet_ptr(remote_owner_lane),
-                   kMegaMoEEp8GinDispatchReadyBytes +
-                       kMegaMoEEp8GinDispatchExpertCountBytes) +
+                   get_dispatch_send_packet_ptr(remote_owner_slot),
+                   kDispatchReadyBytes + kDispatchExpertCountBytes) +
                assignment_idx;
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_dispatch_receive_expert_assignment_ptr(
-            const uint32_t remote_source_lane,
+            const uint32_t remote_source_slot,
             const uint32_t assignment_idx = 0) const {
         DG_UNIFIED_ASSERT(
-            assignment_idx <= kMegaMoEEp8GinMaxExpertAssignments);
+            assignment_idx <= kMaxExpertAssignments);
         return math::advance_ptr<uint32_t>(
-                   get_dispatch_receive_packet_ptr(remote_source_lane),
-                   kMegaMoEEp8GinDispatchReadyBytes +
-                       kMegaMoEEp8GinDispatchExpertCountBytes) +
+                   get_dispatch_receive_packet_ptr(remote_source_slot),
+                   kDispatchReadyBytes + kDispatchExpertCountBytes) +
                assignment_idx;
     }
 
     CUTLASS_HOST_DEVICE
     void* get_remote_input_activation_ptr(
-            const uint32_t remote_source_lane,
+            const uint32_t remote_source_slot,
             const uint32_t token_idx = 0) const {
         return get_remote_input_record_ptr(
             kRemoteInputActivationOffset,
-            kMegaMoEEp8GinInputActivationBytes,
-            remote_source_lane, token_idx);
+            kInputActivationBytes,
+            remote_source_slot, token_idx);
     }
 
     CUTLASS_HOST_DEVICE
     void* get_remote_input_scale_ptr(
-            const uint32_t remote_source_lane,
+            const uint32_t remote_source_slot,
             const uint32_t token_idx = 0) const {
         return get_remote_input_record_ptr(
             kRemoteInputScaleOffset,
-            kMegaMoEEp8GinInputScaleBytes,
-            remote_source_lane, token_idx);
+            kInputScaleBytes,
+            remote_source_slot, token_idx);
     }
 
     CUTLASS_HOST_DEVICE
     void* get_remote_topk_weight_ptr(
-            const uint32_t remote_source_lane,
+            const uint32_t remote_source_slot,
             const uint32_t token_idx = 0) const {
         return get_remote_input_record_ptr(
             kRemoteTopKWeightOffset,
-            kMegaMoEEp8GinTopKWeightBytes,
-            remote_source_lane, token_idx);
+            kTopKWeightBytes,
+            remote_source_slot, token_idx);
     }
 
     CUTLASS_HOST_DEVICE
     uint32_t* get_combine_record_prefix_ptr(
-            const uint32_t remote_source_lane,
+            const uint32_t remote_source_slot,
             const uint32_t local_expert = 0) const {
-        DG_UNIFIED_ASSERT(remote_source_lane < kMegaMoEEp8GinNumRemotePeers);
-        DG_UNIFIED_ASSERT(local_expert < kMegaMoEEp8GinNumExpertsPerRank);
+        DG_UNIFIED_ASSERT(remote_source_slot < kNumRemotePeers);
+        DG_UNIFIED_ASSERT(local_expert < kNumExpertsPerRank);
         const uint64_t index =
-            static_cast<uint64_t>(remote_source_lane) *
-                kMegaMoEEp8GinNumExpertsPerRank +
+            static_cast<uint64_t>(remote_source_slot) *
+                kNumExpertsPerRank +
             local_expert;
         return math::advance_ptr<uint32_t>(
                    base, kCombineRecordPrefixOffset) +
@@ -364,7 +536,7 @@ struct MegaMoeEp8GinWorkspace {
     CUTLASS_HOST_DEVICE
     uint32_t* get_combine_return_ordinal_ptr(
             const uint32_t pool_token_idx) const {
-        DG_UNIFIED_ASSERT(pool_token_idx < kMegaMoEEp8GinMaxPoolTokens);
+        DG_UNIFIED_ASSERT(pool_token_idx < kMaxPoolTokens);
         return math::advance_ptr<uint32_t>(
                    base, kCombineReturnOrdinalOffset) +
                pool_token_idx;
@@ -372,45 +544,45 @@ struct MegaMoeEp8GinWorkspace {
 
     CUTLASS_HOST_DEVICE
     void* get_combine_send_record_ptr(
-            const uint32_t remote_source_lane,
+            const uint32_t remote_source_slot,
             const uint32_t record_ordinal) const {
         return get_combine_record_ptr(
-            /*send=*/ true, remote_source_lane, record_ordinal);
+            /*send=*/ true, remote_source_slot, record_ordinal);
     }
 
     CUTLASS_HOST_DEVICE
     void* get_combine_receive_record_ptr(
-            const uint32_t remote_owner_lane,
+            const uint32_t remote_owner_slot,
             const uint32_t record_ordinal) const {
         return get_combine_record_ptr(
-            /*send=*/ false, remote_owner_lane, record_ordinal);
+            /*send=*/ false, remote_owner_slot, record_ordinal);
     }
 
 private:
     CUTLASS_HOST_DEVICE
     void* get_dispatch_packet_ptr(
-            const bool send, const uint32_t peer_lane) const {
-        DG_UNIFIED_ASSERT(peer_lane < kMegaMoEEp8GinNumRemotePeers);
+            const bool send, const uint32_t peer_slot) const {
+        DG_UNIFIED_ASSERT(peer_slot < kNumRemotePeers);
         const uint32_t packet_idx =
-            (send ? 0u : kMegaMoEEp8GinNumRemotePeers) + peer_lane;
+            (send ? 0u : kNumRemotePeers) + peer_slot;
         return math::advance_ptr(
             base,
             kDispatchPacketOffset +
                 static_cast<uint64_t>(packet_idx) *
-                    kMegaMoEEp8GinDispatchPacketBytes);
+                    kDispatchPacketBytes);
     }
 
     CUTLASS_HOST_DEVICE
     void* get_remote_input_record_ptr(
             const uint64_t storage_offset,
-            const uint32_t record_bytes,
-            const uint32_t remote_source_lane,
+            const uint64_t record_bytes,
+            const uint32_t remote_source_slot,
             const uint32_t token_idx) const {
-        DG_UNIFIED_ASSERT(remote_source_lane < kMegaMoEEp8GinNumRemotePeers);
-        DG_UNIFIED_ASSERT(token_idx < kMegaMoEEp8GinMaxTokens);
+        DG_UNIFIED_ASSERT(remote_source_slot < kNumRemotePeers);
+        DG_UNIFIED_ASSERT(token_idx < kMaxActiveTokens);
         const uint64_t record_idx =
-            static_cast<uint64_t>(remote_source_lane) *
-                kMegaMoEEp8GinMaxTokens +
+            static_cast<uint64_t>(remote_source_slot) *
+                kMaxActiveTokens +
             token_idx;
         return math::advance_ptr(
             base, storage_offset + record_idx * record_bytes);
@@ -418,29 +590,50 @@ private:
 
     CUTLASS_HOST_DEVICE
     void* get_combine_packet_ptr(
-            const bool send, const uint32_t peer_lane) const {
-        DG_UNIFIED_ASSERT(peer_lane < kMegaMoEEp8GinNumRemotePeers);
+            const bool send, const uint32_t peer_slot) const {
+        DG_UNIFIED_ASSERT(peer_slot < kNumRemotePeers);
         const uint32_t packet_idx =
-            (send ? 0u : kMegaMoEEp8GinNumRemotePeers) + peer_lane;
+            (send ? 0u : kNumRemotePeers) + peer_slot;
         return math::advance_ptr(
             base,
             kCombinePacketOffset +
                 static_cast<uint64_t>(packet_idx) *
-                    kMegaMoEEp8GinCombinePacketBytes);
+                    kCombinePacketBytes);
     }
 
     CUTLASS_HOST_DEVICE
     void* get_combine_record_ptr(
             const bool send,
-            const uint32_t peer_lane,
+            const uint32_t peer_slot,
             const uint32_t record_ordinal) const {
         DG_UNIFIED_ASSERT(
-            record_ordinal < kMegaMoEEp8GinMaxExpertAssignments);
+            record_ordinal < kMaxExpertAssignments);
         return math::advance_ptr(
-            get_combine_packet_ptr(send, peer_lane),
+            get_combine_packet_ptr(send, peer_slot),
             static_cast<uint64_t>(record_ordinal) *
-                kMegaMoEEp8GinCombineRecordBytes);
+                kCombineRecordBytes);
     }
 };
+
+// Preserve the prototype's original specialization as the default while the
+// fused kernel selects MegaMoeGinWorkspaceT with its own compile-time
+// geometry. Compile-time checks below pin the established packet ABI and
+// offsets without exposing the old model dimensions as transport constraints.
+using MegaMoeGinWorkspace =
+    MegaMoeGinWorkspaceT<56, 16, 3584, 48>;
+
+static_assert(MegaMoeGinWorkspace::kDispatchPacketBytes == 3328);
+static_assert(MegaMoeGinWorkspace::kCombineRecordBytes == 7168);
+static_assert(MegaMoeGinWorkspace::kCombinePacketBytes == 5505024);
+static_assert(MegaMoeGinWorkspace::kMaxPoolTokens == 21120);
+static_assert(MegaMoeGinWorkspace::kDispatchPacketOffset == 43136);
+static_assert(MegaMoeGinWorkspace::kCombinePacketOffset == 792576);
+static_assert(
+    MegaMoeGinWorkspace::kCombineReturnOrdinalOffset == 44832768);
+static_assert(
+    MegaMoeGinWorkspace::kCombineExpertCompletionOffset == 44917248);
+static_assert(
+    MegaMoeGinWorkspace::kCombineExpertCompletionBytes == 256);
+static_assert(MegaMoeGinWorkspace::kNumBytes == 44917504);
 
 } // namespace deep_gemm::layout

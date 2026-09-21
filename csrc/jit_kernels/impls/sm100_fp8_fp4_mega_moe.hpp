@@ -36,7 +36,8 @@ static void sm100_fp8_fp4_mega_moe(
     const float& activation_clamp,
     const bool& fast_math
 #ifdef DG_MEGAMOE_GIN
-    , const comm::MegaMoeEp8GinTransport* ep8_gin_transport = nullptr
+    , const comm::MegaMoeGinTransport* gin_transport,
+    const int& gin_max_active_tokens
 #endif
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
@@ -167,14 +168,26 @@ static void sm100_fp8_fp4_mega_moe(
     const auto num_sms = runtime->get_num_sms();
 
     // Compile
-    const bool use_ep8_gin =
+    const bool use_gin =
 #ifdef DG_MEGAMOE_GIN
-        ep8_gin_transport != nullptr;
+        gin_transport != nullptr;
 #else
         false;
 #endif
+    const int kernel_gin_max_active_tokens =
+#ifdef DG_MEGAMOE_GIN
+        use_gin ? gin_max_active_tokens : 1;
+#else
+        1;
+#endif
+    const int kernel_gin_lsa_size =
+#ifdef DG_MEGAMOE_GIN
+        use_gin ? gin_transport->dev_comm.lsaSize : num_ranks;
+#else
+        num_ranks;
+#endif
     const auto kernel = jit->compile(
-        use_ep8_gin ? "sm100_fp8_fp4_mega_moe_gin_ep8" : "sm100_fp8_fp4_mega_moe",
+        use_gin ? "sm100_fp8_fp4_mega_moe_gin" : "sm100_fp8_fp4_mega_moe",
         std::format(R"(
 #include <deep_gemm/impls/sm100_fp8_fp4_mega_moe.cuh>
 
@@ -198,6 +211,8 @@ static void __instantiate_kernel() {{
         {},
         {},
         {},
+        {},
+        {},
         {}
     >);
 }};
@@ -217,7 +232,9 @@ static void __instantiate_kernel() {{
         to_string(activation_clamp),
         fast_math ? "true" : "false",
         to_string(l1_weights.scalar_type()),
-        use_ep8_gin ? "true" : "false"));
+        use_gin ? "true" : "false",
+        kernel_gin_max_active_tokens,
+        kernel_gin_lsa_size));
 
     // Launch
     jit->launch(
@@ -232,8 +249,8 @@ static void __instantiate_kernel() {{
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
 #ifdef DG_MEGAMOE_GIN
-        ep8_gin_transport != nullptr ? *ep8_gin_transport :
-                                       comm::MegaMoeEp8GinTransport{},
+        gin_transport != nullptr ? *gin_transport :
+                                       comm::MegaMoeGinTransport{},
 #endif
         tensor_map_l1_acts,
         tensor_map_l1_acts_sf,

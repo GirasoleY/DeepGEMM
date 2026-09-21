@@ -5,6 +5,9 @@
 
 #include <deep_gemm/layout/mega_moe.cuh>
 #include <deep_gemm/layout/sym_buffer.cuh>
+#ifdef DG_MEGAMOE_GIN
+#include <deep_gemm/comm/mega_moe_gin.cuh>
+#endif
 
 #include "../../runtime/runtime.hpp"
 #include "../../utils/exception.hpp"
@@ -28,6 +31,10 @@ static void sm100_bf16_mega_moe(
     const int& hidden, const int& intermediate_hidden,
     const float& activation_clamp,
     const bool& fast_math
+#ifdef DG_MEGAMOE_GIN
+    , const comm::MegaMoeGinTransport* gin_transport,
+    const int& gin_max_active_tokens
+#endif
 ) {
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts = num_experts_per_rank * num_ranks;
@@ -106,7 +113,27 @@ static void sm100_bf16_mega_moe(
     const auto num_sms = runtime->get_num_sms();
 
     // Compile
-    const auto kernel = jit->compile("sm100_bf16_mega_moe", std::format(R"(
+    const bool use_gin =
+#ifdef DG_MEGAMOE_GIN
+        gin_transport != nullptr;
+#else
+        false;
+#endif
+    const int kernel_gin_max_active_tokens =
+#ifdef DG_MEGAMOE_GIN
+        use_gin ? gin_max_active_tokens : 1;
+#else
+        1;
+#endif
+    const int kernel_gin_lsa_size =
+#ifdef DG_MEGAMOE_GIN
+        use_gin ? gin_transport->dev_comm.lsaSize : num_ranks;
+#else
+        num_ranks;
+#endif
+    const auto kernel = jit->compile(
+        use_gin ? "sm100_bf16_mega_moe_gin" : "sm100_bf16_mega_moe",
+        std::format(R"(
 #include <deep_gemm/impls/sm100_bf16_mega_moe.cuh>
 
 using namespace deep_gemm;
@@ -125,7 +152,8 @@ static void __instantiate_kernel() {{
         {}, {}, {},
         {}, {},
         {},
-        {}
+        {},
+        {}, {}, {}
     >);
 }};
 )", num_max_tokens_per_rank,
@@ -140,7 +168,10 @@ static void __instantiate_kernel() {{
         config.num_dispatch_threads, config.num_non_epilogue_threads, config.num_epilogue_threads,
         num_sms, num_ranks,
         to_string(activation_clamp),
-        fast_math ? "true" : "false"));
+        fast_math ? "true" : "false",
+        use_gin ? "true" : "false",
+        kernel_gin_max_active_tokens,
+        kernel_gin_lsa_size));
 
     // Launch
     jit->launch(
@@ -154,6 +185,9 @@ static void __instantiate_kernel() {{
         cumulative_local_expert_recv_stats_ptr,
         num_tokens,
         layout::SymBuffer<>(sym_buffer_ptrs, rank_idx),
+#ifdef DG_MEGAMOE_GIN
+        gin_transport != nullptr ? *gin_transport : comm::MegaMoeGinTransport{},
+#endif
         tensor_map_l1_acts,
         tensor_map_l1_weights,
         tensor_map_l1_output,

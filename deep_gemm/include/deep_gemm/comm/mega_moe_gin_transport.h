@@ -25,7 +25,7 @@
 // structure. DeepGEMM copies it while importing the capsule and never destroys
 // any referenced NCCL resource. The caller provisions full, unrailed,
 // exclusive GDAKI contexts with strong VA signals; registers a strict-order
-// symmetric window; collectively validates the two contiguous LSA4 teams; and
+// symmetric window; collectively validates equal contiguous LSA teams; and
 // keeps every resource alive until all launches and captured graphs complete.
 struct DGMegaMoEGinTransportV1 final {
     uint32_t abi_version = DG_MEGAMOE_GIN_TRANSPORT_ABI_VERSION;

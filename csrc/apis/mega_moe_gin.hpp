@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -29,11 +30,7 @@ static constexpr int kRequiredNcclVersion =
     DG_MEGAMOE_GIN_REQUIRED_NCCL_VERSION_CODE;
 static constexpr int kWorldSize = 8;
 static constexpr int kLsaSize = 4;
-static constexpr int kNumExperts = 448;
-static constexpr int kNumTopk = 16;
-static constexpr int kHidden = 3584;
-static constexpr int kIntermediateHidden = 3072;
-static constexpr int kMaxTokensPerRank = 48;
+static constexpr int kDefaultMaxActiveTokensPerRank = 48;
 static constexpr int kRequiredContextCount = 6;
 static constexpr int kRequiredQueueDepth = 64;
 static constexpr int kRequiredWorldBarrierCount = 2;
@@ -54,21 +51,79 @@ static void require(const bool condition, const std::string& message) {
         throw std::invalid_argument(message);
 }
 
-static auto get_symm_buffer_size_for_mega_moe_gin() {
+static auto validate_workspace_config(
+    const int num_experts,
+    const int num_max_tokens_per_rank,
+    const int num_topk,
+    const int hidden,
+    const int intermediate_hidden,
+    const std::string& mma_type,
+    const std::string& activation,
+    const int num_shared_experts,
+    const int gin_max_active_tokens,
+    const int world_size, const int lsa_size) {
+    require(world_size > 0 and world_size <= layout::kNumMaxRanks and
+                lsa_size > 0 and lsa_size <= world_size and
+                world_size % lsa_size == 0,
+            "MegaMoE GIN requires 1..72 ranks with equal contiguous LSA teams");
+    require(num_experts > 0 and num_experts % world_size == 0,
+            "MegaMoE GIN expert count must be positive and divisible by ranks");
+    require(gin_max_active_tokens > 0,
+            "MegaMoE GIN active-token capacity must be positive");
+    require(num_max_tokens_per_rank >= gin_max_active_tokens,
+            "MegaMoE GIN native token capacity must cover active tokens");
+    require(num_topk > 0 and num_topk <= 32,
+            "MegaMoE GIN top-k must be in [1, 32]");
+    require(num_shared_experts >= 0 and
+                num_topk + (num_shared_experts > 0 ? 1 : 0) <= 32,
+            "MegaMoE GIN top-k plus the shared-expert result must fit one warp");
+    require(hidden > 0 and intermediate_hidden > 0,
+            "MegaMoE GIN hidden dimensions must be positive");
+    require(mma_type == "fp8xfp4" or mma_type == "fp8xfp8" or
+                mma_type == "bf16xbf16",
+            "MegaMoE GIN MMA type must be fp8xfp4, fp8xfp8 or bf16xbf16");
+    require(activation == "swiglu",
+            "MegaMoE GIN supports the native SwiGLU activation path");
+    const auto gin_layout = layout::MegaMoeGinLayout(
+        num_experts / world_size, num_topk, hidden,
+        gin_max_active_tokens, world_size, lsa_size, mma_type != "bf16xbf16");
+    require(gin_layout.is_valid(),
+            "MegaMoE GIN workspace geometry exceeds its index domain");
+    return gin_layout;
+}
+
+static auto get_symm_buffer_size_for_mega_moe_gin(
+    const int num_experts,
+    const int num_max_tokens_per_rank,
+    const int num_topk,
+    const int hidden,
+    const int intermediate_hidden,
+    const std::string& mma_type,
+    const std::string& activation,
+    const int num_shared_experts,
+    const int gin_max_active_tokens,
+    const int world_size, const int lsa_size) {
+    const auto gin_layout = validate_workspace_config(
+        num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, mma_type, activation,
+        num_shared_experts, gin_max_active_tokens, world_size, lsa_size);
     // Keep every native input/ring offset byte-for-byte identical, then append
-    // the fixed EP8 transport workspace at its required alignment.
+    // the shape-derived transport workspace at its required alignment.
     auto [native_num_bytes, slice_input_buffers] =
         ::deep_gemm::mega::get_symm_buffer_size_for_mega_moe(
-            kWorldSize, kNumExperts,
-            layout::kLCMCandidateBlockM, kNumTopk,
-            kHidden, kIntermediateHidden,
-            "fp8xfp4", "swiglu", 0);
+            world_size, num_experts,
+            num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden,
+            mma_type, activation, num_shared_experts);
     const auto gin_offset = math::align<uint64_t>(
         static_cast<uint64_t>(native_num_bytes),
-        layout::kMegaMoEEp8GinAlignment);
+        layout::kMegaMoEGinAlignment);
+    require(gin_offset + gin_layout.num_bytes() + gin_layout.persistent_bytes() <=
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()),
+            "MegaMoE GIN symmetric buffer size exceeds int64_t");
     return std::make_tuple(
         static_cast<int64_t>(
-            gin_offset + layout::MegaMoeEp8GinWorkspace::kNumBytes),
+            gin_offset + gin_layout.num_bytes() + gin_layout.persistent_bytes()),
         std::move(slice_input_buffers));
 }
 
@@ -142,12 +197,18 @@ public:
                 "MegaMoE GIN transport rank changed after import");
     }
 
-    comm::MegaMoeEp8GinTransport launch_descriptor() const {
-        return comm::MegaMoeEp8GinTransport{
+    comm::MegaMoeGinTransport launch_descriptor() const {
+        return comm::MegaMoeGinTransport{
             descriptor_.dev_comm,
             descriptor_.window,
             descriptor_.window_base,
             descriptor_.window_bytes,
+            math::advance_ptr(buffer_.data_ptr(), buffer_.nbytes() -
+                math::align<uint64_t>(
+                    (1ull + 2ull * (descriptor_.dev_comm.nRanks -
+                                   descriptor_.dev_comm.lsaSize)) *
+                        sizeof(uint64_t),
+                    layout::kMegaMoEGinAlignment)),
         };
     }
 
@@ -194,20 +255,18 @@ private:
                     buffer.dim() == 1 and buffer.is_contiguous() and
                     buffer.nbytes() > 0,
                 "MegaMoE GIN buffer must be a nonempty contiguous CUDA int8 tensor");
-        require(
-            buffer.nbytes() >= static_cast<size_t>(
-                std::get<0>(get_symm_buffer_size_for_mega_moe_gin())),
-            "MegaMoE GIN symmetric buffer is smaller than the fixed EP8 workspace");
         require(descriptor.cuda_device == buffer.get_device(),
                 "MegaMoE GIN descriptor CUDA device does not match the buffer");
-        require(rank >= 0 and rank < kWorldSize,
-                "MegaMoE GIN rank must be in [0, 8)");
-        require(descriptor.dev_comm.rank == rank and
-                    descriptor.dev_comm.nRanks == kWorldSize,
-                "MegaMoE GIN device communicator must match the EP8 rank ordering");
-        require(descriptor.dev_comm.lsaSize == kLsaSize and
-                    descriptor.dev_comm.lsaRank == rank % kLsaSize,
-                "MegaMoE GIN requires contiguous two-by-LSA4 rank ordering");
+        const int world_size = descriptor.dev_comm.nRanks;
+        const int lsa_size = descriptor.dev_comm.lsaSize;
+        require(world_size > 0 and world_size <= layout::kNumMaxRanks and
+                    rank >= 0 and rank < world_size and
+                    descriptor.dev_comm.rank == rank,
+                "MegaMoE GIN device communicator has an invalid rank or size");
+        require(lsa_size > 0 and lsa_size < world_size and
+                    world_size % lsa_size == 0 and
+                    descriptor.dev_comm.lsaRank == rank % lsa_size,
+                "MegaMoE GIN requires equal contiguous LSA teams");
         require(descriptor.dev_comm.ginContextCount >=
                     kRequiredContextCount,
                 "MegaMoE GIN requires at least 6 GIN contexts");
@@ -216,6 +275,11 @@ private:
         require(not descriptor.dev_comm.ginConnectionsRailed and
                     not descriptor.dev_comm.ginContextsRailed,
                 "MegaMoE GIN requires unrailed connections and contexts");
+
+        require(buffer.nbytes() >= math::align<uint64_t>(
+                    (1ull + 2ull * (world_size - lsa_size)) * sizeof(uint64_t),
+                    layout::kMegaMoEGinAlignment),
+                "MegaMoE GIN buffer is smaller than its persistent footer");
 
         const auto tensor_begin =
             reinterpret_cast<uintptr_t>(buffer.data_ptr());
@@ -238,38 +302,17 @@ private:
     const int rank_;
 };
 
-static void fp8_fp4_mega_moe_gin(
-    const torch::Tensor& y,
-    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
-    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
-    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
-    const torch::Tensor& sym_buffer,
-    const std::vector<int64_t>& sym_buffer_ptrs,
-    const int rank_idx,
-    const int num_max_tokens_per_rank,
-    const int gin_num_max_tokens_per_rank,
-    const int num_experts,
-    const int num_topk,
-    const std::tuple<int, int, int>& recipe,
-    const std::string& activation,
-    const std::optional<float>& activation_clamp_opt,
-    const bool fast_math,
-    const std::shared_ptr<MegaMoeGinTransportHandle>& gin_transport) {
-    require(gin_transport != nullptr,
-            "MegaMoE GIN transport handle must not be null");
-    gin_transport->validate_binding(sym_buffer, rank_idx);
-
-    require(num_experts == kNumExperts and num_topk == kNumTopk,
-            "MegaMoE GIN requires E448 and top-k 16");
-    require(gin_num_max_tokens_per_rank >= 1 and
-                gin_num_max_tokens_per_rank <= kMaxTokensPerRank,
-            "MegaMoE GIN token capacity must be in [1, 48]");
-    require(num_max_tokens_per_rank == layout::kLCMCandidateBlockM,
-            "MegaMoE GIN native token capacity must use the 1920-token alignment");
-    require(sym_buffer_ptrs.size() == kWorldSize,
-            "MegaMoE GIN requires exactly 8 symmetric buffer pointers");
-    for (int peer = 0; peer < kWorldSize; ++peer) {
-        const bool same_lsa = peer / kLsaSize == rank_idx / kLsaSize;
+static void validate_launch_binding(
+    const torch::Tensor& y, const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs, const int rank_idx,
+    const int hidden, const int gin_max_active_tokens,
+    const comm::MegaMoeGinTransport& transport) {
+    const int world_size = transport.dev_comm.nRanks;
+    const int lsa_size = transport.dev_comm.lsaSize;
+    require(sym_buffer_ptrs.size() == world_size,
+            "MegaMoE GIN symmetric pointer count must match the communicator");
+    for (int peer = 0; peer < world_size; ++peer) {
+        const bool same_lsa = peer / lsa_size == rank_idx / lsa_size;
         require((sym_buffer_ptrs[peer] != 0) == same_lsa,
                 "MegaMoE GIN requires local-LSA pointers and null cross-LSA pointers");
     }
@@ -280,12 +323,61 @@ static void fp8_fp4_mega_moe_gin(
 
     require(y.defined() and y.is_cuda() and
                 y.scalar_type() == torch::kBFloat16 and
-                y.dim() == 2 and y.size(1) == kHidden and
+                y.dim() == 2 and y.size(1) == hidden and
                 y.is_contiguous() and y.device() == sym_buffer.device(),
-            "MegaMoE GIN output must be contiguous CUDA BF16 [tokens, 3584] on the buffer device");
+            "MegaMoE GIN output must be contiguous CUDA BF16 [tokens, hidden] on the buffer device");
     const auto num_tokens = static_cast<int>(y.size(0));
-    require(num_tokens <= gin_num_max_tokens_per_rank,
+    require(num_tokens <= gin_max_active_tokens,
             "MegaMoE GIN launch exceeds the requested token capacity");
+}
+
+static void fp8_fp4_mega_moe_gin(
+    const torch::Tensor& y,
+    const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
+    const std::tuple<torch::Tensor, torch::Tensor>& l2_weights_tuple,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l1_weights_tuple_opt,
+    const std::optional<std::tuple<torch::Tensor, torch::Tensor>>& shared_l2_weights_tuple_opt,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const int rank_idx,
+    const int num_max_tokens_per_rank,
+    const int gin_max_active_tokens,
+    const int num_experts,
+    const int num_topk,
+    const int hidden,
+    const int intermediate_hidden,
+    const int num_shared_experts,
+    const std::string& mma_type,
+    const std::tuple<int, int, int>& recipe,
+    const std::string& allocated_activation,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool fast_math,
+    const std::shared_ptr<MegaMoeGinTransportHandle>& gin_transport) {
+    require(gin_transport != nullptr,
+            "MegaMoE GIN transport handle must not be null");
+    gin_transport->validate_binding(sym_buffer, rank_idx);
+    const auto launch_transport = gin_transport->launch_descriptor();
+    const int world_size = launch_transport.dev_comm.nRanks;
+    const int lsa_size = launch_transport.dev_comm.lsaSize;
+
+    (void)validate_workspace_config(
+        num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, mma_type, allocated_activation,
+        num_shared_experts, gin_max_active_tokens, world_size, lsa_size);
+    require(mma_type == "fp8xfp4" or mma_type == "fp8xfp8",
+            "FP8/FP4 MegaMoE requires an FP8 activation allocation");
+    require(activation == allocated_activation,
+            "MegaMoE GIN launch activation must match its allocation");
+    require(shared_l1_weights_tuple_opt.has_value() ==
+                shared_l2_weights_tuple_opt.has_value(),
+            "MegaMoE GIN shared L1 and L2 weights must be provided together");
+    require(shared_l1_weights_tuple_opt.has_value() ==
+                (num_shared_experts > 0),
+            "MegaMoE GIN shared weights must match the allocated shared-expert count");
+    validate_launch_binding(y, sym_buffer, sym_buffer_ptrs, rank_idx,
+                            hidden, gin_max_active_tokens, launch_transport);
 
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
@@ -294,6 +386,17 @@ static void fp8_fp4_mega_moe_gin(
                 l1_weights_sf.device() == sym_buffer.device() and
                 l2_weights_sf.device() == sym_buffer.device(),
             "MegaMoE GIN weights and scales must be on the buffer device");
+    if (shared_l1_weights_tuple_opt.has_value()) {
+        const auto& [shared_l1_weights, shared_l1_weights_sf] =
+            shared_l1_weights_tuple_opt.value();
+        const auto& [shared_l2_weights, shared_l2_weights_sf] =
+            shared_l2_weights_tuple_opt.value();
+        require(shared_l1_weights.device() == sym_buffer.device() and
+                    shared_l2_weights.device() == sym_buffer.device() and
+                    shared_l1_weights_sf.device() == sym_buffer.device() and
+                    shared_l2_weights_sf.device() == sym_buffer.device(),
+                "MegaMoE GIN shared weights and scales must be on the buffer device");
+    }
 
     if (cumulative_local_expert_recv_stats.has_value()) {
         require(cumulative_local_expert_recv_stats->is_cuda() and
@@ -302,15 +405,101 @@ static void fp8_fp4_mega_moe_gin(
                 "MegaMoE GIN cumulative expert stats must be a CUDA tensor on the buffer device");
     }
 
-    const auto launch_transport = gin_transport->launch_descriptor();
+    const auto launch_config = ::deep_gemm::mega::MegaMoeGinLaunchConfig{
+        gin_max_active_tokens,
+        hidden,
+        intermediate_hidden,
+        num_shared_experts,
+        mma_type == "fp8xfp8" ? torch::kFloat8_e4m3fn : kPackedFP4,
+    };
     ::deep_gemm::mega::fp8_fp4_mega_moe_impl(
         y, l1_weights_tuple, l2_weights_tuple,
-        std::nullopt, std::nullopt,
+        shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
         cumulative_local_expert_recv_stats,
         sym_buffer, sym_buffer_ptrs, rank_idx,
         num_max_tokens_per_rank, num_experts, num_topk,
         recipe, activation, activation_clamp_opt, fast_math,
-        &launch_transport);
+        &launch_transport, &launch_config);
+}
+
+static void bf16_mega_moe_gin(
+    const torch::Tensor& y,
+    const torch::Tensor& l1_weights,
+    const torch::Tensor& l2_weights,
+    const std::optional<torch::Tensor>& shared_l1_weights_opt,
+    const std::optional<torch::Tensor>& shared_l2_weights_opt,
+    const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+    const torch::Tensor& sym_buffer,
+    const std::vector<int64_t>& sym_buffer_ptrs,
+    const int rank_idx,
+    const int num_max_tokens_per_rank,
+    const int gin_max_active_tokens,
+    const int num_experts,
+    const int num_topk,
+    const int hidden,
+    const int intermediate_hidden,
+    const int num_shared_experts,
+    const std::string& mma_type,
+    const std::string& allocated_activation,
+    const std::string& activation,
+    const std::optional<float>& activation_clamp_opt,
+    const bool fast_math,
+    const std::shared_ptr<MegaMoeGinTransportHandle>& gin_transport) {
+    require(gin_transport != nullptr,
+            "MegaMoE GIN transport handle must not be null");
+    gin_transport->validate_binding(sym_buffer, rank_idx);
+    const auto launch_transport = gin_transport->launch_descriptor();
+    const int world_size = launch_transport.dev_comm.nRanks;
+    const int lsa_size = launch_transport.dev_comm.lsaSize;
+
+    (void)validate_workspace_config(
+        num_experts, num_max_tokens_per_rank, num_topk,
+        hidden, intermediate_hidden, mma_type, allocated_activation,
+        num_shared_experts, gin_max_active_tokens, world_size, lsa_size);
+    require(mma_type == "bf16xbf16",
+            "BF16 MegaMoE requires a BF16 activation allocation");
+    require(activation == allocated_activation,
+            "MegaMoE GIN launch activation must match its allocation");
+    require(shared_l1_weights_opt.has_value() ==
+                shared_l2_weights_opt.has_value(),
+            "MegaMoE GIN shared L1 and L2 weights must be provided together");
+    require(shared_l1_weights_opt.has_value() ==
+                (num_shared_experts > 0),
+            "MegaMoE GIN shared weights must match the allocated shared-expert count");
+    validate_launch_binding(y, sym_buffer, sym_buffer_ptrs, rank_idx,
+                            hidden, gin_max_active_tokens, launch_transport);
+
+    require(l1_weights.device() == sym_buffer.device() and
+                l2_weights.device() == sym_buffer.device(),
+            "MegaMoE GIN weights must be on the buffer device");
+    if (shared_l1_weights_opt.has_value()) {
+        require(shared_l1_weights_opt->device() == sym_buffer.device() and
+                    shared_l2_weights_opt->device() == sym_buffer.device(),
+                "MegaMoE GIN shared weights must be on the buffer device");
+    }
+
+    if (cumulative_local_expert_recv_stats.has_value()) {
+        require(cumulative_local_expert_recv_stats->is_cuda() and
+                    cumulative_local_expert_recv_stats->device() ==
+                        sym_buffer.device(),
+                "MegaMoE GIN cumulative expert stats must be a CUDA tensor on the buffer device");
+    }
+
+    const auto launch_config = ::deep_gemm::mega::MegaMoeGinLaunchConfig{
+        gin_max_active_tokens,
+        hidden,
+        intermediate_hidden,
+        num_shared_experts,
+        torch::kBFloat16,
+    };
+    ::deep_gemm::mega::bf16_mega_moe_impl(
+        y, l1_weights, l2_weights,
+        shared_l1_weights_opt, shared_l2_weights_opt,
+        cumulative_local_expert_recv_stats,
+        sym_buffer, sym_buffer_ptrs, rank_idx,
+        num_max_tokens_per_rank, num_experts, num_topk,
+        activation, activation_clamp_opt, fast_math,
+        &launch_transport, &launch_config);
 
 }
 
@@ -339,9 +528,17 @@ static void register_apis(py::module_& m) {
             DG_MEGAMOE_GIN_TRANSPORT_ABI_VERSION;
         result["transport_capsule_name"] =
             DG_MEGAMOE_GIN_TRANSPORT_CAPSULE_NAME;
+        // Legacy fields remain defaults for the EP8 compatibility factory.
         result["world_size"] = kWorldSize;
+        result["max_world_size"] = layout::kNumMaxRanks;
+        result["mma_types"] = py::make_tuple("fp8xfp4", "fp8xfp8", "bf16xbf16");
         result["lsa_size"] = kLsaSize;
-        result["max_tokens_per_rank"] = kMaxTokensPerRank;
+        // Retain the fixed prototype's field as a compatibility alias. It is
+        // now a default, not a transport limit.
+        result["max_tokens_per_rank"] =
+            kDefaultMaxActiveTokensPerRank;
+        result["default_max_active_tokens_per_rank"] =
+            kDefaultMaxActiveTokensPerRank;
         result["minimum_context_count"] = kRequiredContextCount;
         result["minimum_queue_depth"] = kRequiredQueueDepth;
         result["minimum_world_barrier_count"] =
@@ -361,6 +558,7 @@ static void register_apis(py::module_& m) {
     m.def("get_symm_buffer_size_for_mega_moe_gin",
           &get_symm_buffer_size_for_mega_moe_gin);
     m.def("fp8_fp4_mega_moe_gin", &fp8_fp4_mega_moe_gin);
+    m.def("bf16_mega_moe_gin", &bf16_mega_moe_gin);
 #else
     const auto build_disabled = [](py::args, py::kwargs) -> py::object {
         throw unsupported(
@@ -371,6 +569,7 @@ static void register_apis(py::module_& m) {
           build_disabled);
     m.def("get_symm_buffer_size_for_mega_moe_gin", build_disabled);
     m.def("fp8_fp4_mega_moe_gin", build_disabled);
+    m.def("bf16_mega_moe_gin", build_disabled);
 #endif
 }
 

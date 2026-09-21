@@ -32,8 +32,10 @@ static void check_cuda(cudaError_t result, const char* operation) {
 class TestGinOwner final {
 public:
     TestGinOwner(torch::Tensor buffer, py::bytes unique_id, int rank,
-                 uint64_t window_base, uint64_t window_bytes)
+                 uint64_t window_base, uint64_t window_bytes,
+                 int world_size, int lsa_size)
         : buffer_(std::move(buffer)), rank_(rank),
+          world_size_(world_size), lsa_size_(lsa_size),
           window_base_(reinterpret_cast<void*>(window_base)),
           window_bytes_(window_bytes) {
         try {
@@ -112,7 +114,9 @@ private:
         const auto buffer_begin =
             reinterpret_cast<uintptr_t>(buffer_.data_ptr());
         const auto window_begin = reinterpret_cast<uintptr_t>(window_base_);
-        if (rank_ < 0 || rank_ >= 8 || window_begin > buffer_begin ||
+        if (rank_ < 0 || rank_ >= world_size_ || world_size_ > 72 ||
+            lsa_size_ <= 0 || lsa_size_ >= world_size_ ||
+            world_size_ % lsa_size_ != 0 || window_begin > buffer_begin ||
             window_begin %
                     NCCL_WIN_REQUIRED_ALIGNMENT != 0) {
             throw std::invalid_argument("invalid rank or window alignment");
@@ -134,7 +138,7 @@ private:
         std::memcpy(id.internal, unique_id.data(), NCCL_UNIQUE_ID_BYTES);
         ncclConfig_t config = NCCL_CONFIG_INITIALIZER;
         config.blocking = 1;
-        check_nccl(ncclCommInitRankConfig(&comm_, 8, id, rank_, &config),
+        check_nccl(ncclCommInitRankConfig(&comm_, world_size_, id, rank_, &config),
                    "ncclCommInitRankConfig");
 
         ncclCommProperties_t properties = NCCL_COMM_PROPERTIES_INITIALIZER;
@@ -142,10 +146,10 @@ private:
                    "ncclCommQueryProperties");
         if (!properties.deviceApiSupport ||
             properties.ginType != NCCL_GIN_TYPE_GDAKI ||
-            properties.nLsaTeams != 2 || properties.rank != rank_ ||
-            properties.nRanks != 8 ||
+            properties.nLsaTeams != world_size_ / lsa_size_ || properties.rank != rank_ ||
+            properties.nRanks != world_size_ ||
             properties.cudaDev != current_device) {
-            throw std::runtime_error("NCCL communicator lacks EP8 GDAKI support");
+            throw std::runtime_error("NCCL communicator lacks the requested GDAKI topology");
         }
 
         check_nccl(ncclCommWindowRegister(
@@ -166,8 +170,8 @@ private:
                    "ncclDevCommCreate");
         dev_comm_created_ = true;
 
-        if (dev_comm_.rank != rank_ || dev_comm_.nRanks != 8 ||
-            dev_comm_.lsaRank != rank_ % 4 || dev_comm_.lsaSize != 4 ||
+        if (dev_comm_.rank != rank_ || dev_comm_.nRanks != world_size_ ||
+            dev_comm_.lsaRank != rank_ % lsa_size_ || dev_comm_.lsaSize != lsa_size_ ||
             dev_comm_.ginContextCount < 6 ||
             dev_comm_.ginConnectionCount == 0 ||
             dev_comm_.ginConnectionsRailed || dev_comm_.ginContextsRailed) {
@@ -190,6 +194,8 @@ private:
 
     torch::Tensor buffer_;
     int rank_ = -1;
+    int world_size_;
+    int lsa_size_;
     void* window_base_ = nullptr;
     uint64_t window_bytes_ = 0;
     ncclComm_t comm_ = nullptr;
@@ -208,7 +214,10 @@ static py::bytes get_unique_id() {
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("get_unique_id", &get_unique_id);
     py::class_<TestGinOwner>(module, "TestGinOwner")
-        .def(py::init<torch::Tensor, py::bytes, int, uint64_t, uint64_t>())
+        .def(py::init<torch::Tensor, py::bytes, int, uint64_t, uint64_t, int, int>(),
+             py::arg("buffer"), py::arg("unique_id"), py::arg("rank"),
+             py::arg("window_base"), py::arg("window_bytes"),
+             py::arg("world_size") = 8, py::arg("lsa_size") = 4)
         .def("facts", &TestGinOwner::facts)
         .def("capsule", &TestGinOwner::capsule)
         .def("close", &TestGinOwner::close)
