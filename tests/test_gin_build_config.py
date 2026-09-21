@@ -89,6 +89,16 @@ class GinBuildConfigTest(unittest.TestCase):
                 ),
             )
 
+    def test_setup_passes_nccl_include_as_a_cpp_string_literal(self):
+        setup_source = (Path(__file__).resolve().parents[1] / "setup.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "f'-DDG_NCCL_BUILD_INCLUDE_DIR=\"{gin_nccl_config.include_dir}\"'",
+            setup_source,
+        )
+        self.assertNotIn("DG_NCCL_BUILD_INCLUDE_DIR=\\\\\"", setup_source)
+
 
 if __name__ == "__main__":
     unittest.main()

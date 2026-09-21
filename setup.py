@@ -34,7 +34,7 @@ if gin_nccl_config is not None:
     # Installed wheels use the private header copy below. This fallback keeps
     # source-tree development builds usable without modifying tracked files.
     cxx_flags.append(
-        f'-DDG_NCCL_BUILD_INCLUDE_DIR=\\"{gin_nccl_config.include_dir}\\"')
+        f'-DDG_NCCL_BUILD_INCLUDE_DIR="{gin_nccl_config.include_dir}"')
 
 # Sources
 current_dir = os.path.dirname(os.path.realpath(__file__))
