@@ -7,6 +7,7 @@
 #include <deep_gemm/common/types.cuh>
 #include <deep_gemm/scheduler/mega_moe.cuh>
 
+#include "mega_moe_config.hpp"
 #include "../runtime/runtime.hpp"
 #include "../jit_kernels/impls/sm100_bf16_mega_moe.hpp"
 #include "../jit_kernels/impls/sm100_fp8_fp4_mega_moe.hpp"
@@ -16,16 +17,6 @@ namespace deep_gemm::mega {
 static int get_token_alignment_for_mega_moe() {
     return layout::kLCMCandidateBlockM;
 }
-
-#ifdef DG_MEGAMOE_GIN
-struct MegaMoeGinLaunchConfig final {
-    int max_active_tokens;
-    int hidden;
-    int intermediate_hidden;
-    int num_shared_experts;
-    torch::ScalarType routed_weight_dtype;
-};
-#endif
 
 static int get_block_m_for_mega_moe(
     const int& num_ranks, const int& num_experts,
@@ -42,14 +33,15 @@ static std::tuple<int64_t, std::function<std::tuple<torch::Tensor, torch::Tensor
                                                     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                                                     torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>(const torch::Tensor&)>>
 get_symm_buffer_size_for_mega_moe(
-    const int& num_ranks, const int& num_experts,
-    const int& num_max_tokens_per_rank, const int& num_topk,
-    const int& hidden, const int& intermediate_hidden,
-    const std::string& mma_type, const std::string& activation,
-    const int& num_shared_experts = 0) {
-    DG_HOST_ASSERT(num_experts % num_ranks == 0);
-    DG_HOST_ASSERT(activation == "swiglu");
-    DG_HOST_ASSERT(num_shared_experts >= 0);
+    const int num_ranks, const MegaMoeWorkspaceConfig& config) {
+    config.validate(num_ranks);
+    const auto num_experts = config.num_experts;
+    const auto num_max_tokens_per_rank = config.num_max_tokens_per_rank;
+    const auto num_topk = config.num_topk;
+    const auto hidden = config.hidden;
+    const auto intermediate_hidden = config.intermediate_hidden;
+    const auto num_shared_experts = config.num_shared_experts;
+    const auto& mma_type = config.mma_type;
 
     // Ring capacity: worst-case live pool blocks over all candidate BLOCK_M; mirrors the kernel assert.
     // TODO: we temporarily assume the SM count is consistent with the runtime value
@@ -161,6 +153,27 @@ get_symm_buffer_size_for_mega_moe(
     return {mega_buffer.get_num_bytes(), slice_input_buffers};
 }
 
+static void validate_mega_moe_workspace(
+    const torch::Tensor& y, const torch::Tensor& buffer,
+    const std::vector<int64_t>& buffer_ptrs, const int rank,
+    const MegaMoeWorkspaceConfig& config) {
+    config.validate(static_cast<int>(buffer_ptrs.size()));
+    DG_HOST_ASSERT(rank >= 0 and rank < static_cast<int>(buffer_ptrs.size()));
+    DG_HOST_ASSERT(buffer.defined() and buffer.is_cuda() and
+                   buffer.scalar_type() == torch::kInt8 and
+                   buffer.dim() == 1 and buffer.is_contiguous());
+    DG_HOST_ASSERT(y.defined() and y.is_cuda() and
+                   y.scalar_type() == torch::kBFloat16 and y.dim() == 2 and
+                   y.size(1) == config.hidden and y.is_contiguous() and
+                   y.device() == buffer.device());
+}
+
+static void validate_mega_moe_tensor_device(
+    const torch::Tensor& tensor, const torch::Tensor& buffer) {
+    DG_HOST_ASSERT(tensor.defined() and tensor.is_cuda() and
+                   tensor.device() == buffer.device());
+}
+
 static void fp8_fp4_mega_moe_impl(
     const torch::Tensor& y,
     const std::tuple<torch::Tensor, torch::Tensor>& l1_weights_tuple,
@@ -170,17 +183,19 @@ static void fp8_fp4_mega_moe_impl(
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
-    const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk,
+    const MegaMoeWorkspaceConfig& config,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
 #ifdef DG_MEGAMOE_GIN
-    , const comm::MegaMoeGinTransport* gin_transport,
-    const MegaMoeGinLaunchConfig* gin_config
+    , const comm::MegaMoeGinTransport* gin_transport
 #endif
 ) {
+    validate_mega_moe_workspace(y, sym_buffer, sym_buffer_ptrs, rank_idx, config);
+    const auto num_max_tokens_per_rank = config.num_max_tokens_per_rank;
+    const auto num_experts = config.num_experts;
+    const auto num_topk = config.num_topk;
     const auto [l1_weights, l1_weights_sf] = l1_weights_tuple;
     const auto [l2_weights, l2_weights_sf] = l2_weights_tuple;
 
@@ -197,6 +212,8 @@ static void fp8_fp4_mega_moe_impl(
     DG_HOST_ASSERT(activation_clamp >= 0);
 
     // Tensor checks
+    validate_mega_moe_tensor_device(l1_weights, sym_buffer);
+    validate_mega_moe_tensor_device(l2_weights, sym_buffer);
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
     const auto arch_major = jit->device.get_arch_major();
@@ -212,19 +229,9 @@ static void fp8_fp4_mega_moe_impl(
     DG_HOST_ASSERT(hidden == hidden_);
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
-#ifdef DG_MEGAMOE_GIN
-    if (gin_config != nullptr) {
-        DG_HOST_ASSERT(gin_transport != nullptr);
-        DG_HOST_ASSERT(gin_config->max_active_tokens > 0);
-        DG_HOST_ASSERT(num_tokens <= gin_config->max_active_tokens);
-        DG_HOST_ASSERT(hidden == gin_config->hidden);
-        DG_HOST_ASSERT(intermediate_hidden ==
-                       gin_config->intermediate_hidden);
-        DG_HOST_ASSERT(weight_dtype == gin_config->routed_weight_dtype);
-    } else {
-        DG_HOST_ASSERT(gin_transport == nullptr);
-    }
-#endif
+
+    validate_mega_moe_tensor_device(l1_weights_sf, sym_buffer);
+    validate_mega_moe_tensor_device(l2_weights_sf, sym_buffer);
 
     // Check weight SF layout for UE8M0 packing, MN-major, and TMA alignment
     constexpr int kGranMN = 1, kGranK = 32;
@@ -241,6 +248,8 @@ static void fp8_fp4_mega_moe_impl(
         shared_intermediate_hidden = static_cast<int>(shared_l2_weights.size(1));
         num_shared_experts = shared_intermediate_hidden / intermediate_hidden;
 
+        validate_mega_moe_tensor_device(shared_l1_weights, sym_buffer);
+        validate_mega_moe_tensor_device(shared_l2_weights, sym_buffer);
         DG_HOST_ASSERT(shared_intermediate_hidden % intermediate_hidden == 0);
         DG_HOST_ASSERT(shared_l1_weights.dim() == 2 and shared_l2_weights.dim() == 2);
         DG_HOST_ASSERT(shared_l1_weights.size(0) == shared_intermediate_hidden * 2);
@@ -251,18 +260,21 @@ static void fp8_fp4_mega_moe_impl(
         DG_HOST_ASSERT(shared_l1_weights.is_contiguous() and shared_l2_weights.is_contiguous());
         DG_HOST_ASSERT(get_major_type_ab(shared_l1_weights) == cute::UMMA::Major::K);
         DG_HOST_ASSERT(get_major_type_ab(shared_l2_weights) == cute::UMMA::Major::K);
+        validate_mega_moe_tensor_device(shared_l1_weights_sf, sym_buffer);
+        validate_mega_moe_tensor_device(shared_l2_weights_sf, sym_buffer);
         check_sf_layout(shared_l1_weights_sf, shared_intermediate_hidden * 2, hidden, kGranMN, kGranK,
                         std::nullopt, true, false, torch::kInt);
         check_sf_layout(shared_l2_weights_sf, hidden, shared_intermediate_hidden, kGranMN, kGranK,
                         std::nullopt, true, false, torch::kInt);
     }
-#ifdef DG_MEGAMOE_GIN
-    if (gin_config != nullptr)
-        DG_HOST_ASSERT(num_shared_experts == gin_config->num_shared_experts);
-#endif
+
+    config.validate_launch(
+        num_tokens, hidden, intermediate_hidden, num_shared_experts,
+        weight_dtype == torch::kFloat8_e4m3fn ? "fp8xfp8" : "fp8xfp4", activation);
 
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
+        validate_mega_moe_tensor_device(*cumulative_local_expert_recv_stats, sym_buffer);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
@@ -271,21 +283,15 @@ static void fp8_fp4_mega_moe_impl(
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
-        num_ranks, num_experts,
-        num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden,
-        weight_dtype == torch::kFloat8_e4m3fn ? "fp8xfp8" : "fp8xfp4",
-        activation, num_shared_experts
-    );
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(num_ranks, config);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 #ifdef DG_MEGAMOE_GIN
-    if (gin_config != nullptr) {
+    if (gin_transport != nullptr) {
         DG_HOST_ASSERT(num_ranks == gin_transport->dev_comm.nRanks);
         const auto gin_layout = layout::MegaMoeGinLayout(
             num_experts_per_rank, num_topk, hidden,
-            gin_config->max_active_tokens, num_ranks,
+            config.max_active_tokens, num_ranks,
             gin_transport->dev_comm.lsaSize, true);
         DG_HOST_ASSERT(gin_layout.is_valid());
         const auto gin_offset = math::align<uint64_t>(
@@ -323,9 +329,7 @@ static void fp8_fp4_mega_moe_impl(
                                activation_clamp, fast_math
 #ifdef DG_MEGAMOE_GIN
                                , gin_transport,
-                               gin_config != nullptr ?
-                                   gin_config->max_active_tokens :
-                                   num_max_tokens_per_rank
+                               config.max_active_tokens
 #endif
         );
     } else {
@@ -351,8 +355,7 @@ static void fp8_fp4_mega_moe(
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
-    const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk,
+    const MegaMoeWorkspaceConfigTuple& workspace_config,
     const std::tuple<int, int, int>& recipe,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
@@ -363,10 +366,10 @@ static void fp8_fp4_mega_moe(
         shared_l1_weights_tuple_opt, shared_l2_weights_tuple_opt,
         cumulative_local_expert_recv_stats,
         sym_buffer, sym_buffer_ptrs, rank_idx,
-        num_max_tokens_per_rank, num_experts, num_topk,
+        MegaMoeWorkspaceConfig(workspace_config),
         recipe, activation, activation_clamp_opt, fast_math
 #ifdef DG_MEGAMOE_GIN
-        , nullptr, nullptr
+        , nullptr
 #endif
     );
 }
@@ -380,16 +383,18 @@ static void bf16_mega_moe_impl(
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
-    const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk,
+    const MegaMoeWorkspaceConfig& config,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
 #ifdef DG_MEGAMOE_GIN
-    , const comm::MegaMoeGinTransport* gin_transport,
-    const MegaMoeGinLaunchConfig* gin_config
+    , const comm::MegaMoeGinTransport* gin_transport
 #endif
 ) {
+    validate_mega_moe_workspace(y, sym_buffer, sym_buffer_ptrs, rank_idx, config);
+    const auto num_max_tokens_per_rank = config.num_max_tokens_per_rank;
+    const auto num_experts = config.num_experts;
+    const auto num_topk = config.num_topk;
     // Config checks
     const auto num_tokens = static_cast<int>(y.size(0));
     DG_HOST_ASSERT(activation == "swiglu");
@@ -401,6 +406,8 @@ static void bf16_mega_moe_impl(
     DG_HOST_ASSERT(activation_clamp >= 0);
 
     // Tensor checks
+    validate_mega_moe_tensor_device(l1_weights, sym_buffer);
+    validate_mega_moe_tensor_device(l2_weights, sym_buffer);
     DG_HOST_ASSERT(get_major_type_ab(l1_weights) == cute::UMMA::Major::K);
     DG_HOST_ASSERT(get_major_type_ab(l2_weights) == cute::UMMA::Major::K);
     const auto arch_major = jit->device.get_arch_major();
@@ -414,20 +421,6 @@ static void bf16_mega_moe_impl(
     DG_HOST_ASSERT(intermediate_hidden_2 == 2 * intermediate_hidden);
     DG_HOST_ASSERT(l1_weights.is_contiguous() and l2_weights.is_contiguous());
 
-#ifdef DG_MEGAMOE_GIN
-    if (gin_config != nullptr) {
-        DG_HOST_ASSERT(gin_transport != nullptr);
-        DG_HOST_ASSERT(gin_config->max_active_tokens > 0);
-        DG_HOST_ASSERT(num_tokens <= gin_config->max_active_tokens);
-        DG_HOST_ASSERT(hidden == gin_config->hidden);
-        DG_HOST_ASSERT(intermediate_hidden ==
-                       gin_config->intermediate_hidden);
-        DG_HOST_ASSERT(torch::kBFloat16 == gin_config->routed_weight_dtype);
-    } else {
-        DG_HOST_ASSERT(gin_transport == nullptr);
-    }
-#endif
-
     int num_shared_experts = 0, shared_intermediate_hidden = 0;
     torch::Tensor shared_l1_weights, shared_l2_weights;
     if (shared_l1_weights_opt.has_value()) {
@@ -436,6 +429,8 @@ static void bf16_mega_moe_impl(
         shared_intermediate_hidden = static_cast<int>(shared_l2_weights.size(1));
         num_shared_experts = shared_intermediate_hidden / intermediate_hidden;
 
+        validate_mega_moe_tensor_device(shared_l1_weights, sym_buffer);
+        validate_mega_moe_tensor_device(shared_l2_weights, sym_buffer);
         DG_HOST_ASSERT(shared_intermediate_hidden % intermediate_hidden == 0);
         DG_HOST_ASSERT(shared_l1_weights.dim() == 2 and shared_l2_weights.dim() == 2);
         DG_HOST_ASSERT(shared_l1_weights.size(0) == shared_intermediate_hidden * 2);
@@ -448,13 +443,13 @@ static void bf16_mega_moe_impl(
         DG_HOST_ASSERT(get_major_type_ab(shared_l2_weights) == cute::UMMA::Major::K);
     }
 
-#ifdef DG_MEGAMOE_GIN
-    if (gin_config != nullptr)
-        DG_HOST_ASSERT(num_shared_experts == gin_config->num_shared_experts);
-#endif
+    config.validate_launch(
+        num_tokens, hidden, intermediate_hidden, num_shared_experts,
+        "bf16xbf16", activation);
 
     // Check stats counter
     if (cumulative_local_expert_recv_stats.has_value()) {
+        validate_mega_moe_tensor_device(*cumulative_local_expert_recv_stats, sym_buffer);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->scalar_type() == torch::kInt);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->numel() == num_experts_per_rank);
         DG_HOST_ASSERT(cumulative_local_expert_recv_stats->is_contiguous());
@@ -463,21 +458,16 @@ static void bf16_mega_moe_impl(
     // Check buffer bytes
     const auto num_ranks = static_cast<int>(sym_buffer_ptrs.size());
     const auto num_experts_ = num_experts_per_rank * num_ranks;
-    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(
-        num_ranks, num_experts,
-        num_max_tokens_per_rank, num_topk,
-        hidden, intermediate_hidden,
-        "bf16xbf16", activation, num_shared_experts
-    );
+    const auto [num_required_bytes, slice] = get_symm_buffer_size_for_mega_moe(num_ranks, config);
     DG_HOST_ASSERT(sym_buffer.nbytes() >= static_cast<size_t>(num_required_bytes));
     DG_HOST_ASSERT(num_experts == num_experts_);
 
 #ifdef DG_MEGAMOE_GIN
-    if (gin_config != nullptr) {
+    if (gin_transport != nullptr) {
         DG_HOST_ASSERT(num_ranks == gin_transport->dev_comm.nRanks);
         const auto gin_layout = layout::MegaMoeGinLayout(
             num_experts_per_rank, num_topk, hidden,
-            gin_config->max_active_tokens, num_ranks,
+            config.max_active_tokens, num_ranks,
             gin_transport->dev_comm.lsaSize, false);
         DG_HOST_ASSERT(gin_layout.is_valid());
         const auto gin_offset = math::align<uint64_t>(
@@ -511,9 +501,7 @@ static void bf16_mega_moe_impl(
                             activation_clamp, fast_math
 #ifdef DG_MEGAMOE_GIN
                             , gin_transport,
-                            gin_config != nullptr ?
-                                gin_config->max_active_tokens :
-                                num_max_tokens_per_rank
+                            config.max_active_tokens
 #endif
         );
     } else {
@@ -539,8 +527,7 @@ static void bf16_mega_moe(
     const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
     const torch::Tensor& sym_buffer,
     const std::vector<int64_t>& sym_buffer_ptrs, const int& rank_idx,
-    const int& num_max_tokens_per_rank,
-    const int& num_experts, const int& num_topk,
+    const MegaMoeWorkspaceConfigTuple& workspace_config,
     const std::string& activation,
     const std::optional<float>& activation_clamp_opt,
     const bool& fast_math
@@ -550,10 +537,10 @@ static void bf16_mega_moe(
         shared_l1_weights_opt, shared_l2_weights_opt,
         cumulative_local_expert_recv_stats,
         sym_buffer, sym_buffer_ptrs, rank_idx,
-        num_max_tokens_per_rank, num_experts, num_topk,
+        MegaMoeWorkspaceConfig(workspace_config),
         activation, activation_clamp_opt, fast_math
 #ifdef DG_MEGAMOE_GIN
-        , nullptr, nullptr
+        , nullptr
 #endif
     );
 }
@@ -561,7 +548,19 @@ static void bf16_mega_moe(
 static void register_apis(pybind11::module_& m) {
     m.def("get_token_alignment_for_mega_moe", &get_token_alignment_for_mega_moe);
     m.def("get_block_m_for_mega_moe", &get_block_m_for_mega_moe);
-    m.def("get_symm_buffer_size_for_mega_moe", &get_symm_buffer_size_for_mega_moe);
+    m.def("get_symm_buffer_size_for_mega_moe",
+          [](const int num_ranks, const MegaMoeWorkspaceConfigTuple& config) {
+              return get_symm_buffer_size_for_mega_moe(
+                  num_ranks, MegaMoeWorkspaceConfig(config));
+          });
+    m.def("get_symm_buffer_size_for_mega_moe",
+          [](int ranks, int experts, int capacity, int topk, int hidden,
+             int intermediate, const std::string& mma, const std::string& activation,
+             int shared) {
+              return get_symm_buffer_size_for_mega_moe(ranks,
+                  MegaMoeWorkspaceConfig({experts, capacity, topk, hidden,
+                      intermediate, shared, mma, activation, capacity}));
+          });
     m.def("fp8_fp4_mega_moe", &fp8_fp4_mega_moe);
     m.def("bf16_mega_moe", &bf16_mega_moe);
 }

@@ -25,6 +25,14 @@ _MEGAMOE_GIN_DEFAULT_MAX_ACTIVE_TOKENS = 48
 
 
 class SymmBuffer:
+    """A model workspace shared by the native NVLink and optional GIN paths.
+
+    The requested token limit is retained as max_active_tokens; the public
+    num_max_tokens_per_rank is the aligned storage capacity. Launches on both
+    backends honor the requested limit. To change geometry, create another
+    SymmBuffer (optionally with base=...) instead of mutating its attributes.
+    """
+
     def __init__(self, group: dist.ProcessGroup,
                  num_experts: int,
                  num_max_tokens_per_rank: int, num_topk: int,
@@ -32,71 +40,115 @@ class SymmBuffer:
                  num_shared_experts: int = 0,
                  mma_type: str = 'fp8xfp4',
                  activation: str = 'swiglu',
-                 base: Optional['SymmBuffer'] = None):
-        if base is not None and getattr(base, '_gin_max_active_tokens', None) is not None:
-            alias = type(self).for_gin(
-                group, max_active_tokens=num_max_tokens_per_rank,
-                lsa_size=base._gin_lsa_size, base=base,
-                num_experts=num_experts, num_topk=num_topk,
-                hidden=hidden, intermediate_hidden=intermediate_hidden,
-                num_shared_experts=num_shared_experts,
-                mma_type=mma_type, activation=activation)
-            self.__dict__.update(alias.__dict__)
-            return
-        self._gin_state = None
-        self._gin_max_active_tokens = None
-        self._gin_transport = None
+                 base: Optional['SymmBuffer'] = None,
+                 *, gin_lsa_size: Optional[int] = None):
+        world_size = group.size()
+        if base is not None and getattr(base, '_gin_lsa_size', None) is not None:
+            if gin_lsa_size is not None and gin_lsa_size != base._gin_lsa_size:
+                raise ValueError('GIN aliases must use the same LSA partition')
+            gin_lsa_size = base._gin_lsa_size
+        if gin_lsa_size is not None:
+            if not (1 <= world_size <= 72 and 1 <= gin_lsa_size <= world_size
+                    and world_size % gin_lsa_size == 0):
+                raise ValueError(
+                    'MegaMoE GIN requires 1..72 ranks and equal contiguous LSA teams')
+            if gin_lsa_size == world_size:
+                gin_lsa_size = None
+            elif not _C.megamoe_gin_build_info()['enabled']:
+                raise RuntimeError(
+                    'MegaMoE GIN unsupported [reason=build_disabled]: rebuild with '
+                    'DG_MEGAMOE_GIN=1 and matching NCCL 2.30.7 Device API headers')
 
-        # Align token count
-        num_max_tokens_per_rank = align(num_max_tokens_per_rank, _C.get_token_alignment_for_mega_moe())
-
-        # Init
-        assert activation == 'swiglu', f'Only `swiglu` activation is supported, got `{activation}`'
+        # One allocation configuration for both communication backends. Keep
+        # the requested capacity separately from the native storage alignment.
+        if num_max_tokens_per_rank < 1:
+            raise ValueError('MegaMoE requires token capacity >= 1')
+        max_active_tokens = num_max_tokens_per_rank
+        num_max_tokens_per_rank = align(
+            max_active_tokens, _C.get_token_alignment_for_mega_moe())
+        self._allocation_config = (
+            num_experts, num_max_tokens_per_rank, num_topk,
+            hidden, intermediate_hidden, num_shared_experts,
+            mma_type, activation, max_active_tokens,
+        )
+        # Retain the public attributes for compatibility; both launch paths
+        # consume the immutable allocation snapshot above.
         self.group = group
         self.num_experts = num_experts
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
+        self.max_active_tokens = max_active_tokens
         self.num_topk = num_topk
         self.hidden = hidden
         self.intermediate_hidden = intermediate_hidden
         self.num_shared_experts = num_shared_experts
         self.mma_type = mma_type
         self.activation = activation
+        self._gin_lsa_size = gin_lsa_size
+        self._gin_state = None
+        self._gin_transport = None
 
-        # Allocate or reuse a symmetric buffer
-        num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
-            group.size(), num_experts,
-            num_max_tokens_per_rank, num_topk,
-            hidden, intermediate_hidden,
-            mma_type, activation,
-            num_shared_experts
-        )
+        if gin_lsa_size is None:
+            num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe(
+                world_size, self._allocation_config)
+        else:
+            num_bytes, slice_input_buffers = _C.get_symm_buffer_size_for_mega_moe_gin(
+                world_size, self._allocation_config, gin_lsa_size)
         if base is None:
-            allocator = torch if group.size() == 1 else symm_mem
-            self.buffer = allocator.empty(num_bytes, dtype=torch.int8, device='cuda')
+            allocator = torch if world_size == 1 else symm_mem
+            self.buffer = allocator.empty(
+                num_bytes, dtype=torch.int8,
+                device=torch.device('cuda', torch.cuda.current_device()))
             self.handle = (
                 types.SimpleNamespace(buffer_ptrs=[self.buffer.data_ptr()])
-                if group.size() == 1
+                if world_size == 1
                 else symm_mem.rendezvous(self.buffer, group=group)
             )
+            self.buffer_ptrs = (
+                self.handle.buffer_ptrs if gin_lsa_size is None else
+                _make_gin_buffer_ptrs(
+                    self.buffer, self.handle, group.rank(), world_size, gin_lsa_size)
+            )
+            if gin_lsa_size is not None:
+                self._gin_state = types.SimpleNamespace(
+                    transport=None, buffer=self.buffer, handle=self.handle,
+                    buffer_ptrs=self.buffer_ptrs)
             self.buffer.zero_()
-            self.group.barrier()
             torch.cuda.synchronize()
+            self.group.barrier()
         else:
-            assert base.buffer is not None and base.handle is not None and base.group is group, \
-                'Cannot reuse an invalid symmetric buffer'
-            assert num_bytes <= base.buffer.nbytes, \
-                (f'The reused Mega MoE config requires {num_bytes} bytes, '
-                 f'but the symmetric buffer only has {base.buffer.nbytes} bytes')
+            if (base.buffer is None or base.handle is None or base.group is not group
+                    or gin_lsa_size != getattr(base, '_gin_lsa_size', None)):
+                raise ValueError('Cannot reuse an invalid or incompatible symmetric buffer')
+            if num_bytes > base.buffer.nbytes:
+                raise ValueError(
+                    f'The reused MegaMoE config requires {num_bytes} bytes, '
+                    f'but the buffer only has {base.buffer.nbytes} bytes')
             self.buffer = base.buffer
             self.handle = base.handle
+            self.buffer_ptrs = base.buffer_ptrs
+            self._gin_state = base._gin_state
 
-        # Create input buffer views
         (self.x, self.x_sf,
          self.topk_idx, self.topk_weights,
          self.shared_l1_acts, self.shared_l1_acts_sf,
          self.shared_l2_acts, self.shared_l2_acts_sf,
          self.l1_acts, self.l1_acts_sf,
          self.l2_acts, self.l2_acts_sf) = slice_input_buffers(self.buffer)
+
+    def _launch_args(self):
+        if self.buffer is None or self.handle is None or self.group is None:
+            raise RuntimeError('MegaMoE symmetric buffer has been released')
+        return (self.buffer, self.buffer_ptrs, self.group.rank(),
+                self._allocation_config)
+
+    def _transport_args(self):
+        if self._gin_lsa_size is None:
+            return ()
+        if self._gin_transport is None:
+            raise RuntimeError(
+                'MegaMoE GIN workspace has no bound transport; call '
+                'bind_gin_transport(capsule, owner) first')
+        return (self._gin_transport,)
 
     @property
     def _gin_transport(self):
@@ -152,95 +204,10 @@ class SymmBuffer:
         a base must be serialized, including captured graphs; StrongVA
         generations persist across aliases.
         """
-        world_size = group.size()
-        if not (1 <= world_size <= 72 and 1 <= lsa_size <= world_size
-                and world_size % lsa_size == 0):
-            raise ValueError(
-                'MegaMoE GIN requires 1..72 ranks and equal contiguous LSA teams')
-        if max_active_tokens < 1:
-            raise ValueError('MegaMoE GIN requires max_active_tokens >= 1')
-        if (base is not None and
-                getattr(base, '_gin_max_active_tokens', None) is not None and
-                lsa_size != base._gin_lsa_size):
-            raise ValueError('GIN aliases must use the same LSA partition')
-        if world_size == lsa_size:
-            return cls(group, num_experts, max_active_tokens, num_topk,
-                       hidden, intermediate_hidden, num_shared_experts,
-                       mma_type, activation, base)
-        if not _C.megamoe_gin_build_info()['enabled']:
-            raise RuntimeError(
-                'MegaMoE GIN unsupported [reason=build_disabled]: rebuild with '
-                'DG_MEGAMOE_GIN=1 and matching NCCL 2.30.7 Device API headers')
-
-        token_alignment = _C.get_token_alignment_for_mega_moe()
-        num_max_tokens_per_rank = align(max_active_tokens, token_alignment)
-
-        result = cls.__new__(cls)
-        result._gin_state = None
-        result._gin_lsa_size = lsa_size
-        result._gin_max_active_tokens = max_active_tokens
-        result._gin_transport = None
-        result.group = group
-        result.num_experts = num_experts
-        result.num_max_tokens_per_rank = num_max_tokens_per_rank
-        result.num_topk = num_topk
-        result.hidden = hidden
-        result.intermediate_hidden = intermediate_hidden
-        result.num_shared_experts = num_shared_experts
-        result.mma_type = mma_type
-        result.activation = activation
-        # Keep an immutable copy of the allocation geometry. The public fields
-        # are retained for API compatibility, while the launch contract must
-        # keep the native buffer and appended GIN tail at identical offsets.
-        result._gin_allocation_config = (
-            num_experts, num_max_tokens_per_rank, num_topk,
+        return cls(
+            group, num_experts, max_active_tokens, num_topk,
             hidden, intermediate_hidden, num_shared_experts,
-            mma_type, activation, max_active_tokens,
-        )
-
-        num_bytes, slice_input_buffers = \
-            _C.get_symm_buffer_size_for_mega_moe_gin(
-                num_experts, num_max_tokens_per_rank, num_topk,
-                hidden, intermediate_hidden, mma_type, activation,
-                num_shared_experts, max_active_tokens, world_size, lsa_size)
-        if base is None:
-            device = torch.device('cuda', torch.cuda.current_device())
-            result.buffer = symm_mem.empty(
-                num_bytes, dtype=torch.int8, device=device)
-            result.handle = symm_mem.rendezvous(result.buffer, group=group)
-            result.buffer_ptrs = _make_gin_buffer_ptrs(
-                result.buffer, result.handle, group.rank(), world_size, lsa_size)
-            result._gin_state = types.SimpleNamespace(
-                transport=None, buffer=result.buffer, handle=result.handle,
-                buffer_ptrs=result.buffer_ptrs)
-        else:
-            if (base.buffer is None or base.handle is None or
-                    base.group is not group or
-                    getattr(base, '_gin_state', None) is None):
-                raise ValueError('Cannot reuse an invalid or non-GIN symmetric buffer')
-            if num_bytes > base.buffer.nbytes:
-                raise ValueError(
-                    f'The reused MegaMoE config requires {num_bytes} bytes, '
-                    f'but the buffer only has {base.buffer.nbytes} bytes')
-            result._gin_state = base._gin_state
-            result.buffer = base.buffer
-            result.handle = base.handle
-            result.buffer_ptrs = base.buffer_ptrs
-
-        (result.x, result.x_sf,
-         result.topk_idx, result.topk_weights,
-         result.shared_l1_acts, result.shared_l1_acts_sf,
-         result.shared_l2_acts, result.shared_l2_acts_sf,
-         result.l1_acts, result.l1_acts_sf,
-         result.l2_acts, result.l2_acts_sf) = slice_input_buffers(result.buffer)
-
-        # Persistent NIC-updated epochs start at zero and are subsequently
-        # advanced only by serialized launches on this workspace.
-        if base is None:
-            result.buffer.zero_()
-            torch.cuda.synchronize()
-            group.barrier()
-        return result
+            mma_type, activation, base, gin_lsa_size=lsa_size)
 
     @classmethod
     def for_ep8_gin(cls, group: dist.ProcessGroup,
@@ -258,7 +225,7 @@ class SymmBuffer:
         The owner remains responsible for synchronizing launches and captured
         graphs before explicitly closing its NCCL communicator or window.
         """
-        if self._gin_max_active_tokens is None:
+        if self._gin_lsa_size is None:
             raise TypeError('MegaMoE GIN transport requires a GIN workspace')
         if owner is None:
             raise ValueError('MegaMoE GIN requires a non-None external owner')
@@ -400,45 +367,15 @@ def fp8_fp4_mega_moe(y: torch.Tensor,
                      activation: str = 'swiglu',
                      activation_clamp: Optional[float] = None,
                      fast_math: bool = True):
-    if getattr(sym_buffer, '_gin_max_active_tokens', None) is not None:
-        if sym_buffer._gin_transport is None:
-            raise RuntimeError(
-                'MegaMoE GIN workspace has no bound transport; call '
-                'bind_gin_transport(capsule, owner) first')
-        (num_experts, num_max_tokens_per_rank, num_topk,
-         hidden, intermediate_hidden, num_shared_experts,
-         mma_type, allocated_activation, max_active_tokens) = \
-            sym_buffer._gin_allocation_config
-        _C.fp8_fp4_mega_moe_gin(
-            y,
-            l1_weights, l2_weights,
-            shared_l1_weights, shared_l2_weights,
-            cumulative_local_expert_recv_stats,
-            sym_buffer.buffer,
-            sym_buffer.buffer_ptrs, sym_buffer.group.rank(),
-            num_max_tokens_per_rank, max_active_tokens,
-            num_experts, num_topk,
-            hidden, intermediate_hidden, num_shared_experts, mma_type,
-            recipe,
-            allocated_activation, activation, activation_clamp,
-            fast_math,
-            sym_buffer._gin_transport,
-        )
-        return
-
-    _C.fp8_fp4_mega_moe(
-        y,
-        l1_weights, l2_weights,
+    workspace_args = sym_buffer._launch_args()
+    transport_args = sym_buffer._transport_args()
+    launch = _C.fp8_fp4_mega_moe_gin if transport_args else _C.fp8_fp4_mega_moe
+    launch(
+        y, l1_weights, l2_weights,
         shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats,
-        sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs, sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_experts, sym_buffer.num_topk,
-        recipe,
-        activation, activation_clamp,
-        fast_math
-    )
+        *workspace_args, recipe, activation, activation_clamp, fast_math,
+        *transport_args)
 
 
 def bf16_mega_moe(y: torch.Tensor,
@@ -451,44 +388,12 @@ def bf16_mega_moe(y: torch.Tensor,
                   activation: str = 'swiglu',
                   activation_clamp: Optional[float] = None,
                   fast_math: bool = True):
-    if getattr(sym_buffer, '_gin_max_active_tokens', None) is not None:
-        if sym_buffer._gin_transport is None:
-            raise RuntimeError(
-                'MegaMoE GIN workspace has no bound transport; call '
-                'bind_gin_transport(capsule, owner) first')
-        (num_experts, num_max_tokens_per_rank, num_topk,
-         hidden, intermediate_hidden, num_shared_experts,
-         mma_type, allocated_activation, max_active_tokens) = \
-            sym_buffer._gin_allocation_config
-        _C.bf16_mega_moe_gin(
-            y,
-            l1_weights, l2_weights,
-            shared_l1_weights, shared_l2_weights,
-            cumulative_local_expert_recv_stats,
-            sym_buffer.buffer,
-            sym_buffer.buffer_ptrs, sym_buffer.group.rank(),
-            num_max_tokens_per_rank, max_active_tokens,
-            num_experts, num_topk,
-            hidden, intermediate_hidden, num_shared_experts, mma_type,
-            allocated_activation, activation, activation_clamp,
-            fast_math,
-            sym_buffer._gin_transport,
-        )
-        return
-
-    _C.bf16_mega_moe(
-        y,
-        l1_weights,
-        l2_weights,
-        shared_l1_weights,
-        shared_l2_weights,
+    workspace_args = sym_buffer._launch_args()
+    transport_args = sym_buffer._transport_args()
+    launch = _C.bf16_mega_moe_gin if transport_args else _C.bf16_mega_moe
+    launch(
+        y, l1_weights, l2_weights,
+        shared_l1_weights, shared_l2_weights,
         cumulative_local_expert_recv_stats,
-        sym_buffer.buffer,
-        sym_buffer.handle.buffer_ptrs,
-        sym_buffer.group.rank(),
-        sym_buffer.num_max_tokens_per_rank,
-        sym_buffer.num_experts,
-        sym_buffer.num_topk,
-        activation, activation_clamp,
-        fast_math
-    )
+        *workspace_args, activation, activation_clamp, fast_math,
+        *transport_args)

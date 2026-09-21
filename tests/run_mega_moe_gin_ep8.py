@@ -481,10 +481,11 @@ def _run_reuse_case(torch, dist, deep_gemm, provider, rank):
         native_capacity = (
             (config.max_active_tokens + alignment - 1) // alignment * alignment)
         size, _ = deep_gemm._C.get_symm_buffer_size_for_mega_moe_gin(
-            config.num_experts, native_capacity, config.topk,
-            config.hidden, config.intermediate_hidden, config.mma_type,
-            "swiglu", config.num_shared_experts, config.max_active_tokens,
-            WORLD_SIZE, LSA_SIZE)
+            WORLD_SIZE,
+            (config.num_experts, native_capacity, config.topk,
+             config.hidden, config.intermediate_hidden, config.num_shared_experts,
+             config.mma_type, "swiglu", config.max_active_tokens),
+            LSA_SIZE)
         required.append(size)
     base_index = max(range(len(configs)), key=required.__getitem__)
     base, owner = _open_gin(

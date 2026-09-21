@@ -129,7 +129,7 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
         )
         for group, max_active_tokens in invalid:
             with self.subTest(size=group.size(), tokens=max_active_tokens):
-                with self.assertRaisesRegex(ValueError, 'MegaMoE GIN requires'):
+                with self.assertRaisesRegex(ValueError, 'MegaMoE.*requires'):
                     self.mega.SymmBuffer.for_ep8_gin(
                         group, max_active_tokens=max_active_tokens)
 
@@ -151,7 +151,7 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
         result = self.mega.SymmBuffer.for_ep8_gin(
             group, max_active_tokens=12)
 
-        self.assertEqual(result._gin_max_active_tokens, 12)
+        self.assertEqual(result.max_active_tokens, 12)
         self.assertEqual(result.num_max_tokens_per_rank, 1920)
         self.assertEqual(
             (result.num_experts, result.num_topk,
@@ -163,8 +163,7 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
         self.assertEqual(result.buffer_ptrs[6], 0x70000 + 0x180)
         self.assertEqual(result.buffer_ptrs[7], 0x80000 + 0x180)
         self.extension.get_symm_buffer_size_for_mega_moe_gin.assert_called_once_with(
-            448, 1920, 16, 3584, 3072,
-            'fp8xfp4', 'swiglu', 0, 12, 8, 4)
+            8, (448, 1920, 16, 3584, 3072, 0, 'fp8xfp4', 'swiglu', 12), 4)
         self.assertEqual(group.barrier_calls, 1)
         self.assertEqual(events, ['zero', 'synchronize', 'barrier'])
 
@@ -177,12 +176,11 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
 
         self.assertEqual(result.num_max_tokens_per_rank, 3840)
         self.assertEqual(
-            result._gin_allocation_config,
+            result._allocation_config,
             (264, 3840, 6, 4096, 2048, 1,
              'fp8xfp8', 'swiglu', 1921))
         self.extension.get_symm_buffer_size_for_mega_moe_gin.assert_called_once_with(
-            264, 3840, 6, 4096, 2048,
-            'fp8xfp8', 'swiglu', 1, 1921, 8, 4)
+            8, (264, 3840, 6, 4096, 2048, 1, 'fp8xfp8', 'swiglu', 1921), 4)
 
     def test_generic_factory_forwards_geometry_dtype_and_topology(self):
         # These are wrapper tests, not GPU correctness tests. Verify that the
@@ -204,9 +202,9 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
                     hidden=hidden, intermediate_hidden=intermediate,
                     num_shared_experts=shared, mma_type=mma)
                 self.extension.get_symm_buffer_size_for_mega_moe_gin.assert_called_once_with(
-                    experts, 1920, topk, hidden, intermediate,
-                    mma, 'swiglu', shared, capacity, world, lsa)
-                self.assertEqual(result._gin_allocation_config,
+                    world, (experts, 1920, topk, hidden, intermediate,
+                            shared, mma, 'swiglu', capacity), lsa)
+                self.assertEqual(result._allocation_config,
                                  (experts, 1920, topk, hidden, intermediate,
                                   shared, mma, 'swiglu', capacity))
                 self.assertEqual(len(result.buffer_ptrs), world)
@@ -228,7 +226,7 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
         sym_buffer.group = group
         sym_buffer.buffer = _FakeBuffer()
         sym_buffer.handle = object()
-        sym_buffer._gin_max_active_tokens = 48
+        sym_buffer._gin_lsa_size = 4
         sym_buffer._gin_transport = None
 
         with self.assertRaisesRegex(ValueError, 'non-None external owner'):
@@ -262,7 +260,7 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
         sym_buffer.handle = object()
         sym_buffer.buffer_ptrs = [0, 0, 0, 0, 1, 2, 3, 4]
         sym_buffer.num_max_tokens_per_rank = 1920
-        sym_buffer._gin_max_active_tokens = 48
+        sym_buffer._gin_lsa_size = 4
         sym_buffer.num_experts = 448
         sym_buffer.num_topk = 16
         sym_buffer.hidden = 3584
@@ -270,7 +268,7 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
         sym_buffer.num_shared_experts = 0
         sym_buffer.mma_type = 'fp8xfp4'
         sym_buffer.activation = 'swiglu'
-        sym_buffer._gin_allocation_config = (
+        sym_buffer._allocation_config = (
             448, 1920, 16, 3584, 3072, 0,
             'fp8xfp4', 'swiglu', 48)
         sym_buffer._gin_transport = object()
@@ -285,13 +283,12 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
             args[:7],
             (y, l1, l2, None, None, stats, sym_buffer.buffer))
         self.assertEqual(
-            args[7:17],
-            (sym_buffer.buffer_ptrs, 6, 1920, 48, 448, 16,
-             3584, 3072, 0, 'fp8xfp4'))
+            args[7:10],
+            (sym_buffer.buffer_ptrs, 6, sym_buffer._allocation_config))
         self.assertEqual(
-            args[17:22],
-            ((1, 1, 32), 'swiglu', 'swiglu', None, True))
-        self.assertIs(args[22], sym_buffer._gin_transport)
+            args[10:14],
+            ((1, 1, 32), 'swiglu', None, True))
+        self.assertIs(args[14], sym_buffer._gin_transport)
         self.extension.fp8_fp4_mega_moe.assert_not_called()
 
     def test_gin_launch_forwards_shared_weights(self):
@@ -300,8 +297,8 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
         sym_buffer.buffer = _FakeBuffer()
         sym_buffer.handle = object()
         sym_buffer.buffer_ptrs = [1, 2, 3, 4, 0, 0, 0, 0]
-        sym_buffer._gin_max_active_tokens = 37
-        sym_buffer._gin_allocation_config = (
+        sym_buffer._gin_lsa_size = 4
+        sym_buffer._allocation_config = (
             264, 1920, 6, 4096, 2048, 1,
             'fp8xfp8', 'swiglu', 37)
         sym_buffer._gin_transport = object()
@@ -315,25 +312,26 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
         args = self.extension.fp8_fp4_mega_moe_gin.call_args.args
         self.assertIs(args[3], shared_l1)
         self.assertIs(args[4], shared_l2)
-        self.assertEqual(args[11:17], (264, 6, 4096, 2048, 1, 'fp8xfp8'))
+        self.assertEqual(args[9], sym_buffer._allocation_config)
 
     def test_gin_launch_requires_bound_transport(self):
-        sym_buffer = self.mega.SymmBuffer.__new__(self.mega.SymmBuffer)
-        sym_buffer._gin_max_active_tokens = 48
-        sym_buffer._gin_transport = None
+        sym_buffer = self.mega.SymmBuffer.for_ep8_gin(_FakeGroup())
         with self.assertRaisesRegex(RuntimeError, 'no bound transport'):
             self.mega.fp8_fp4_mega_moe(
                 object(), object(), object(), sym_buffer)
 
     def test_normal_launch_api_preserves_native_path(self):
         sym_buffer = self.mega.SymmBuffer.__new__(self.mega.SymmBuffer)
-        sym_buffer._gin_max_active_tokens = None
+        sym_buffer._gin_lsa_size = None
         sym_buffer.buffer = _FakeBuffer()
         sym_buffer.handle = types.SimpleNamespace(buffer_ptrs=[0x9000])
         sym_buffer.group = _FakeGroup(rank=0, size=1)
         sym_buffer.num_max_tokens_per_rank = 1920
         sym_buffer.num_experts = 56
         sym_buffer.num_topk = 16
+        sym_buffer.buffer_ptrs = sym_buffer.handle.buffer_ptrs
+        sym_buffer._allocation_config = (
+            56, 1920, 16, 3584, 3072, 0, 'fp8xfp4', 'swiglu', 48)
         y, l1, l2 = object(), object(), object()
 
         self.mega.fp8_fp4_mega_moe(y, l1, l2, sym_buffer)
@@ -345,7 +343,7 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
 
     def test_transport_binding_rejects_native_workspace(self):
         sym_buffer = self.mega.SymmBuffer.__new__(self.mega.SymmBuffer)
-        sym_buffer._gin_max_active_tokens = None
+        sym_buffer._gin_lsa_size = None
         with self.assertRaisesRegex(TypeError, 'GIN workspace'):
             sym_buffer.bind_gin_transport(object(), object())
 
@@ -363,10 +361,10 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
             activation_clamp=1.0, fast_math=False)
         args = self.extension.bf16_mega_moe_gin.call_args.args
         self.assertEqual(args[:7], (y, l1, l2, s1, s2, stats, buffer.buffer))
-        self.assertEqual(args[9:17],
-                         (1920, 24, 136, 6, 2048, 1024, 2, 'bf16xbf16'))
-        self.assertEqual(args[17:21], ('swiglu', 'swiglu', 1.0, False))
-        self.assertIs(args[21], handle)
+        self.assertEqual(args[9],
+                         (136, 1920, 6, 2048, 1024, 2, 'bf16xbf16', 'swiglu', 24))
+        self.assertEqual(args[10:13], ('swiglu', 1.0, False))
+        self.assertIs(args[13], handle)
         self.extension.bf16_mega_moe.assert_not_called()
 
     def test_alias_shares_allocation_binding_and_survives_base_destroy(self):
@@ -407,7 +405,7 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
             group, 136, 24, 6, 2048, 1024,
             mma_type='bf16xbf16', base=base)
         self.assertIs(alias._gin_state, base._gin_state)
-        self.assertEqual(alias._gin_max_active_tokens, 24)
+        self.assertEqual(alias.max_active_tokens, 24)
         self.assertEqual(alias.mma_type, 'bf16xbf16')
 
     def test_alias_validates_group_capacity_partition_and_lifetime(self):
@@ -449,7 +447,7 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
             _FakeGroup(size=1), 16, lsa_size=1, num_experts=8,
             num_topk=2, hidden=2048, intermediate_hidden=1024,
             mma_type='bf16xbf16')
-        self.assertIsNone(result._gin_max_active_tokens)
+        self.assertIsNone(result._gin_lsa_size)
         self.extension.get_symm_buffer_size_for_mega_moe_gin.assert_not_called()
         self.mega.bf16_mega_moe(object(), object(), object(), result)
         self.extension.bf16_mega_moe.assert_called_once()
@@ -459,8 +457,80 @@ class TestMegaMoeGinPythonApi(unittest.TestCase):
         self.assertFalse(hasattr(self.mega, 'GinTransport'))
         self.assertFalse(hasattr(self.mega, 'fp8_fp4_mega_moe_gin'))
 
+    def test_both_backends_share_allocation_and_launch_configuration(self):
+        for mma in ('fp8xfp4', 'fp8xfp8', 'bf16xbf16'):
+            with self.subTest(mma=mma):
+                group = _FakeGroup()
+                native = self.mega.SymmBuffer(
+                    group, 136, 37, 6, 2048, 1024,
+                    num_shared_experts=2, mma_type=mma)
+                gin = self.mega.SymmBuffer(
+                    group, 136, 37, 6, 2048, 1024,
+                    num_shared_experts=2, mma_type=mma, gin_lsa_size=4)
+                config = (136, 1920, 6, 2048, 1024, 2, mma, 'swiglu', 37)
+                self.assertEqual(native._allocation_config, config)
+                self.assertEqual(gin._allocation_config, config)
+                self.extension.get_symm_buffer_size_for_mega_moe.assert_called_with(
+                    8, config)
+                self.extension.get_symm_buffer_size_for_mega_moe_gin.assert_called_with(
+                    8, config, 4)
+                self.assertFalse(hasattr(gin, '_gin_allocation_config'))
+                self.assertFalse(hasattr(gin, '_gin_max_active_tokens'))
+                gin.bind_gin_transport(object(), object())
+                name = 'bf16_mega_moe' if mma == 'bf16xbf16' else 'fp8_fp4_mega_moe'
+                launch = getattr(self.mega, name)
+                y, l1, l2, shared1, shared2, stats = (object() for _ in range(6))
+                for buffer in (native, gin):
+                    # Public compatibility attributes cannot change already
+                    # allocated input views or silently change launch geometry.
+                    buffer.hidden = 8192
+                    buffer.mma_type = 'changed'
+                    buffer.num_max_tokens_per_rank = 9999
+                    launch(y, l1, l2, buffer, shared1, shared2, stats,
+                           activation_clamp=1.0, fast_math=False)
+                native_args = getattr(self.extension, name).call_args.args
+                gin_args = getattr(self.extension, name + '_gin').call_args.args
+                self.assertEqual(native_args[:6], gin_args[:6])
+                self.assertEqual(native_args[8:], gin_args[8:-1])
+                self.assertEqual(native_args[9], config)
+                self.assertIs(gin_args[-1], gin._gin_transport)
+
+    def test_native_alias_uses_common_allocation_and_survives_base_destroy(self):
+        group = _FakeGroup()
+        base = self.mega.SymmBuffer(group, 448, 48, 16, 3584, 3072)
+        self.mega.symm_mem.empty.reset_mock()
+        self.mega.symm_mem.rendezvous.reset_mock()
+        alias = self.mega.SymmBuffer(
+            group, 136, 24, 6, 2048, 1024, mma_type='bf16xbf16', base=base)
+        self.assertIs(alias.buffer, base.buffer)
+        self.mega.symm_mem.empty.assert_not_called()
+        self.mega.symm_mem.rendezvous.assert_not_called()
+        base.destroy()
+        self.mega.bf16_mega_moe(object(), object(), object(), alias)
+        args = self.extension.bf16_mega_moe.call_args.args
+        self.assertEqual(args[9], alias._allocation_config)
+        alias.destroy()
+        with self.assertRaisesRegex(RuntimeError, 'released'):
+            self.mega.bf16_mega_moe(object(), object(), object(), alias)
+
 
 class TestMegaMoeGinCppContract(unittest.TestCase):
+    def test_model_validation_is_shared_and_transport_wrapper_has_no_model_checks(self):
+        common = (_REPO_ROOT / 'csrc/apis/mega_moe.hpp').read_text()
+        transport = (_REPO_ROOT / 'csrc/apis/mega_moe_gin.hpp').read_text()
+        self.assertNotIn('MegaMoeGinLaunchConfig', common + transport)
+        self.assertNotIn('gin_config', common + transport)
+        self.assertEqual(common.count('config.validate_launch('), 2)
+        self.assertIn('const MegaMoeWorkspaceConfig& config', common)
+        # Both numerical paths enter the same native implementation; the GIN
+        # adapters only bind transport and forward the identical snapshot.
+        wrappers = transport[transport.index('static void fp8_fp4_mega_moe_gin('):
+                             transport.index('#endif  // DG_MEGAMOE_GIN')]
+        for duplicated_check in ('weight_dtype', 'hidden ==', 'validate_workspace_config',
+                                 'max_active_tokens', 'y.size(', '.device()'):
+            self.assertNotIn(duplicated_check, wrappers)
+        self.assertEqual(wrappers.count('MegaMoeWorkspaceConfig(workspace_config)'), 2)
+
     def test_public_descriptor_uses_named_capsule_abi(self):
         header = (_REPO_ROOT / 'deep_gemm' / 'include' / 'deep_gemm' /
                   'comm' / 'mega_moe_gin_transport.h').read_text()
